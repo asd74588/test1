@@ -19,6 +19,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "dma.h"
+#include "spi.h"
 #include "usart.h"
 #include "gpio.h"
 
@@ -29,6 +30,7 @@
 #include "global.h"
 #include "uart_bootloader.h"
 #include "flash_bootloader.h"
+#include "w25qxx.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -93,27 +95,31 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_USART1_UART_Init();
+  MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
   Init_Flash();
   Init_Uart();
-  uint32_t startadddr = FlashAddress;
-  uint8_t jump_once = 0U;
+  // uint32_t startadddr = FlashAddress;
+  // uint8_t jump_once = 0U;
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    Write_Buffer_To_Flash(&startadddr);
+    // Write_Buffer_To_Flash(&startadddr);
 
-    if ((jump_once == 0U) && (ota_upgrade_done == 1U))
-    {
-      jump_once = 1U;
-      if (Jump_To_App_Flash(FlashAddress) == 0)
-      {
-        jump_once = 0U;
-      }
-    }
+    // if ((jump_once == 0U) && (ota_upgrade_done == 1U))
+    // {
+    //   jump_once = 1U;
+    //   if (Jump_To_App_Flash(FlashAddress) == 0)
+    //   {
+    //     jump_once = 0U;
+    //   }
+    // }
+    spinor_test();
+    //HAL_SPI_Transmit(&hspi1, (uint8_t*)"Hello W25QXX!", 14, 0xFFFF);
+    HAL_Delay(5000);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */

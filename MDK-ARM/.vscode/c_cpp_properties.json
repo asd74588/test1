@@ -11,6 +11,7 @@
                 "c:\\Users\\zyw\\Desktop\\OTA\\test\\MDK-ARM\\interface\\UART",
                 "c:\\Users\\zyw\\Desktop\\OTA\\test\\MDK-ARM\\interface\\FLASH",
                 "c:\\Users\\zyw\\Desktop\\OTA\\test\\MDK-ARM\\interface",
+                "c:\\Users\\zyw\\Desktop\\OTA\\test\\MDK-ARM\\interface\\SPI",
                 "c:\\Users\\zyw\\Desktop\\OTA\\test\\MDK-ARM",
                 "c:\\Users\\zyw\\Desktop\\OTA\\test\\Core\\Src",
                 "c:\\Users\\zyw\\Desktop\\OTA\\test\\Drivers\\STM32L4xx_HAL_Driver\\Src"
