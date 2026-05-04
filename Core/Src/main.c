@@ -26,11 +26,12 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 
-
+#include "stdio.h"
 #include "global.h"
 #include "uart_bootloader.h"
 #include "flash_bootloader.h"
 #include "w25qxx.h"
+#include "eeprom_emul.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -99,6 +100,10 @@ int main(void)
   /* USER CODE BEGIN 2 */
   Init_Flash();
   Init_Uart();
+  EE_Init();
+  uint32_t ota_flag = 0;
+  EE_Write(EE_VAR_OTA_FLAG, 1U);
+  EE_Read(EE_VAR_OTA_FLAG, &ota_flag);
   // uint32_t startadddr = FlashAddress;
   // uint8_t jump_once = 0U;
   /* USER CODE END 2 */
@@ -107,6 +112,8 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    printf("OTA Flag: %lu\n", ota_flag);
+    HAL_Delay(2000);
     // Write_Buffer_To_Flash(&startadddr);
 
     // if ((jump_once == 0U) && (ota_upgrade_done == 1U))

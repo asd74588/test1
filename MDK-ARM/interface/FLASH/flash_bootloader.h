@@ -6,6 +6,9 @@
 #include "main.h"
 #include "global.h"
 #include "usart.h"
+#include "eeprom_emul.h"
+
+
 //将bin文件写到flash之前的进行的初始化
 void Init_Flash(void);
 
@@ -17,7 +20,6 @@ HAL_StatusTypeDef Flush_Tail_To_Flash(uint32_t* startaddr);
 
 //跳转到指定位置执行烧录的bin文件
 int Jump_To_App_Flash(uint32_t appaddr);
-
 
 #endif
 

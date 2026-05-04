@@ -1,4 +1,5 @@
 #include "flash_bootloader.h"
+#include "eeprom_emul.h"
 
 #define UART_RX_IDLE_FLUSH_MS 50U
 
@@ -7,36 +8,16 @@ volatile uint8_t ota_upgrade_done = 0;
 static uint8_t s_tail_bytes[8] = {0};
 static uint32_t s_tail_len = 0;
 
-static HAL_StatusTypeDef Write_Upgrade_Flag(uint64_t flag_value)
+static HAL_StatusTypeDef Write_Upgrade_Flag(uint32_t flag_value)
 {
-    FLASH_EraseInitTypeDef eraseInitStruct;
-    uint32_t page_error = 0U;
-    uint64_t current_flag = *(__IO uint64_t*)OTA_FLAG_ADDR;
+    return EE_Write(EE_VAR_OTA_FLAG, flag_value);
+}
 
-    HAL_FLASH_Unlock();
-
-    if (current_flag != OTA_FLAG_ERASED)
-    {
-        eraseInitStruct.TypeErase = FLASH_TYPEERASE_PAGES;
-        eraseInitStruct.Banks = FLASH_BANK_1;
-        eraseInitStruct.Page = (PARAM_START_ADDR - FLASH_BASE) / FLASH_PAGE_SIZE;
-        eraseInitStruct.NbPages = 1U;
-
-        if (HAL_FLASHEx_Erase(&eraseInitStruct, &page_error) != HAL_OK)
-        {
-            HAL_FLASH_Lock();
-            return HAL_ERROR;
-        }
-    }
-
-    if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, OTA_FLAG_ADDR, flag_value) != HAL_OK)
-    {
-        HAL_FLASH_Lock();
-        return HAL_ERROR;
-    }
-
-    HAL_FLASH_Lock();
-    return HAL_OK;
+static uint32_t Read_Upgrade_Flag(void)
+{
+    uint32_t flag = 0xFFFFFFFFU;
+    EE_Read(EE_VAR_OTA_FLAG, &flag);
+    return flag;
 }
 
 //将bin文件写到flash之前的进行的初始化:擦除A区起始位置之后可能用到的FLASH页
@@ -89,7 +70,7 @@ HAL_StatusTypeDef Write_Buffer_To_Flash(uint32_t* startaddr)
                 uart_stream_active = 0U;
                 if (rev_len > 0U)
                 {
-                    if (Write_Upgrade_Flag(OTA_FLAG_UPGRADE_DONE) != HAL_OK)
+                    if (Write_Upgrade_Flag(OTA_FLAG_UPGRADE_DONE) != HAL_OK)  /* OTA_FLAG_UPGRADE_DONE 已改为 uint32_t */
                     {
                         return HAL_ERROR;
                     }
