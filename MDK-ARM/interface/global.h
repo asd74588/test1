@@ -13,14 +13,10 @@
 #define APP_A_START_ADDR         0x08009000U
 #define APP_A_SIZE               (96U * 1024U)
 
-#define UPGRADE_START_ADDR       0x08021000U
-#define UPGRADE_SIZE             (120U * 1024U)    /* 原 124KB，末尾 4KB 划给 EEPROM */
+#define APP_B_START_ADDR         0x08021000U      /* B区：原 UPGRADE 区，直接执行，不搬运 */
+#define APP_B_SIZE               (120U * 1024U)   /* 原 124KB，末尾 4KB 划给 EEPROM */
 
 #define EEPROM_START_ADDR        0x0803F000U       /* EEPROM 模拟区，占用最后 2 页共 4KB */
-
-#define OTA_FLAG_ADDR            EEPROM_START_ADDR /* 已迁移至 EEPROM 模块管理 */
-#define OTA_FLAG_ERASED          0xFFFFFFFFU       /* 32 位，与 EEPROM 数据宽度一致 */
-#define OTA_FLAG_UPGRADE_DONE    0x5A5AA5A5U
 
 /* 保留旧名字，兼容现有调用点 */
 #define FlashAddress             APP_A_START_ADDR
