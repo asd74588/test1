@@ -41,7 +41,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define XMODEM_MAX_RETRY  3
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -101,9 +101,28 @@ int main(void)
 
   EE_Init();
 
+  /* 在 EE_Init() 后统一声明将要使用的局部变量（避免在循环/块中间再声明） */
+  uint32_t ota_state = 0;
+  uint32_t active_slot = 0;
+  uint32_t app_addr = 0;
+  uint8_t rx_byte = 0;
+  uint32_t start_tick = 0;
+  uint32_t other_slot = 0;
+  uint32_t other_addr = 0;
+  uint32_t target_slot = 0;
+  uint32_t write_addr = 0;
+  uint32_t active_addr = 0;
+  uint8_t active_valid = 0;
+  uint8_t xmodem_retry = 0;
+  int received = 0;
+  uint32_t first_word = 0;
+  uint32_t new_addr = 0;
+  uint32_t old_active = 0;
+  uint32_t reason = 0;
+
   /* ========== A/B双区OTA Bootloader 状态机 ========== */
-  uint32_t ota_state = Read_Flag(EE_VAR_OTA_STATE);
-  uint32_t active_slot = Read_Flag(EE_VAR_ACTIVE_SLOT);
+  ota_state = Read_Flag(EE_VAR_OTA_STATE);
+  active_slot = Read_Flag(EE_VAR_ACTIVE_SLOT);
 
   /* 首次上电EEPROM无数据时，EE_Read返回失败，Read_Flag返回0xFFFFFFFF */
   if (active_slot != SLOT_A && active_slot != SLOT_B)
@@ -134,7 +153,7 @@ int main(void)
     {
       case OTA_STATE_BOOT:
       {
-        uint32_t app_addr = (active_slot == SLOT_B) ? APP_B_START_ADDR : APP_A_START_ADDR;
+        app_addr = (active_slot == SLOT_B) ? APP_B_START_ADDR : APP_A_START_ADDR;
 
         /* 当前活跃分区无效，转REVERT处理降级启动 */
         if (Verify_APP_Integrity_Flash(app_addr) == 0)
@@ -142,8 +161,8 @@ int main(void)
           printf("Slot %s invalid, entering revert for fallback.\r\n",
                  (active_slot == SLOT_B) ? "B" : "A");
           /* 预检查另一分区，设置回退原因，REVERT内零Flash校验 */
-          uint32_t other_slot = (active_slot == SLOT_A) ? SLOT_B : SLOT_A;
-          uint32_t other_addr = (other_slot == SLOT_B) ? APP_B_START_ADDR : APP_A_START_ADDR;
+          other_slot = (active_slot == SLOT_A) ? SLOT_B : SLOT_A;
+          other_addr = (other_slot == SLOT_B) ? APP_B_START_ADDR : APP_A_START_ADDR;
           if (Verify_APP_Integrity_Flash(other_addr) != 0)
           {
             Write_Flag(EE_VAR_REVERT_REASON, REVERT_OTHER_VALID);
@@ -159,8 +178,7 @@ int main(void)
 
         /* APP有效：3秒等待窗口，收到'U'进升级，否则跳转 */
         printf("Press 'U' within 3s to enter upgrade mode...\r\n");
-        uint8_t rx_byte;
-        uint32_t start_tick = HAL_GetTick();
+        start_tick = HAL_GetTick();
         while ((HAL_GetTick() - start_tick) < 3000U)
         {
           if (HAL_UART_Receive(&huart1, &rx_byte, 1, 100) == HAL_OK)
@@ -184,49 +202,41 @@ int main(void)
         /* 超时无升级请求，跳转APP */
         Jump_To_App_Flash(app_addr);
 
-        
-        /* 跳转失败（不应到达此处），进升级模式 */
-        printf("Jump failed, entering upgrade mode.\r\n");
-        ota_state = OTA_STATE_UPGRADING;
-        Write_Flag(EE_VAR_OTA_STATE, OTA_STATE_UPGRADING);
-        Write_Flag(EE_VAR_TARGET_SLOT, (active_slot == SLOT_A) ? SLOT_B : SLOT_A);
-        continue;
       }
 
       case OTA_STATE_UPGRADING:
       {
-        uint32_t target_slot = Read_Flag(EE_VAR_TARGET_SLOT);
+        target_slot = Read_Flag(EE_VAR_TARGET_SLOT);
         /* 防御：target非法或等于active时，强制修正为active的对侧 */
         if (target_slot != SLOT_A && target_slot != SLOT_B)
         {
-          target_slot = (active_slot == SLOT_A) ? SLOT_B : SLOT_A;
+          target_slot = SLOT_B;
           Write_Flag(EE_VAR_TARGET_SLOT, target_slot);
         }
-        else if (target_slot == active_slot)
+        else if (target_slot == active_slot && reason != REVERT_BOTH_INVALID)
         {
           target_slot = (active_slot == SLOT_A) ? SLOT_B : SLOT_A;
           Write_Flag(EE_VAR_TARGET_SLOT, target_slot);
         }
 
-        uint32_t write_addr = (target_slot == SLOT_B) ? APP_B_START_ADDR : APP_A_START_ADDR;
-        uint32_t active_addr = (active_slot == SLOT_B) ? APP_B_START_ADDR : APP_A_START_ADDR;
+        write_addr = (target_slot == SLOT_B) ? APP_B_START_ADDR : APP_A_START_ADDR;
+        active_addr = (active_slot == SLOT_B) ? APP_B_START_ADDR : APP_A_START_ADDR;
 
         /* 一次性校验活跃分区有效性，存入RAM标志，避免每次重试都校验 */
-        uint8_t active_valid = (Verify_APP_Integrity_Flash(active_addr) != 0) ? 1 : 0;
+        active_valid = (Verify_APP_Integrity_Flash(active_addr) != 0) ? 1 : 0;
 
         printf("OTA upgrading to slot %s, addr 0x%08lX (active %s %s)\r\n",
                (target_slot == SLOT_B) ? "B" : "A", write_addr,
                (active_slot == SLOT_B) ? "B" : "A",
                active_valid ? "valid" : "invalid");
 
-        uint8_t xmodem_retry = 0;
-        #define XMODEM_MAX_RETRY  3
+        xmodem_retry = 0;
 
         Erase_App_Flash(target_slot);
 
         while (1)
         {
-          int received = Xmodem_Start_Transfer(write_addr);
+          received = Xmodem_Start_Transfer(write_addr);
 
           if (received > 0)
           {
@@ -254,7 +264,7 @@ int main(void)
             /* 活跃分区无效：必须留在升级模式等待固件，但避免无意义擦除 */
             printf("OTA receive failed, active slot invalid, staying in UPGRADING.\r\n");
             /* 检测目标分区是否有部分写入：首字非0xFF说明有残留数据，需重新擦除 */
-            uint32_t first_word = *(volatile uint32_t *)write_addr;
+            first_word = *(volatile uint32_t *)write_addr;
             if (first_word != 0xFFFFFFFFU)
             {
               printf("Partial write detected, re-erasing slot %s\r\n",
@@ -271,22 +281,21 @@ int main(void)
 
         continue;
       }
-
-         
+     
       case OTA_STATE_VERIFYING:
       {
-        uint32_t target_slot = Read_Flag(EE_VAR_TARGET_SLOT);
+        target_slot = Read_Flag(EE_VAR_TARGET_SLOT);
         if (target_slot != SLOT_A && target_slot != SLOT_B)
         {
           target_slot = (active_slot == SLOT_A) ? SLOT_B : SLOT_A;
         }
-        uint32_t new_addr = (target_slot == SLOT_B) ? APP_B_START_ADDR : APP_A_START_ADDR;
+        new_addr = (target_slot == SLOT_B) ? APP_B_START_ADDR : APP_A_START_ADDR;
 
         /* 校验新写入的分区 */
         if (Verify_APP_Integrity_Flash(new_addr) != 0)
         {
           /* 校验通过：先保存旧active，再切活跃分区，跳转新分区 */
-          uint32_t old_active = active_slot;
+          old_active = active_slot;
           active_slot = target_slot;
           Write_Flag(EE_VAR_ACTIVE_SLOT, target_slot);
           Write_Flag(EE_VAR_OTA_STATE, OTA_STATE_BOOT);
@@ -295,16 +304,6 @@ int main(void)
                  (target_slot == SLOT_B) ? "B" : "A");
           Jump_To_App_Flash(new_addr);
 
-          /* 跳转失败：新固件校验通过但无法运行，切回旧分区回退 */
-          printf("Jump to slot %s failed, reverting to old slot %s.\r\n",
-                 (target_slot == SLOT_B) ? "B" : "A",
-                 (old_active == SLOT_B) ? "B" : "A");
-          active_slot = old_active;
-          Write_Flag(EE_VAR_ACTIVE_SLOT, old_active);
-          Write_Flag(EE_VAR_REVERT_REASON, REVERT_ACTIVE_VALID);
-          ota_state = OTA_STATE_REVERT;
-          Write_Flag(EE_VAR_OTA_STATE, OTA_STATE_REVERT);
-          continue;
         }
 
         /* 校验失败 → 升级回退 */
@@ -318,7 +317,7 @@ int main(void)
 
       case OTA_STATE_REVERT:
       {
-        uint32_t reason = Read_Flag(EE_VAR_REVERT_REASON);
+        reason = Read_Flag(EE_VAR_REVERT_REASON);
 
         /*
          * REVERT纯标志驱动，零Flash校验（进入前已预写原因）：
@@ -336,7 +335,7 @@ int main(void)
         }
         else if (reason == REVERT_OTHER_VALID)
         {
-          uint32_t other_slot = (active_slot == SLOT_A) ? SLOT_B : SLOT_A;
+          other_slot = (active_slot == SLOT_A) ? SLOT_B : SLOT_A;
           printf("Boot fallback: switching from slot %s to slot %s.\r\n",
                  (active_slot == SLOT_B) ? "B" : "A",
                  (other_slot == SLOT_B) ? "B" : "A");
@@ -353,7 +352,7 @@ int main(void)
           printf("No valid app in any slot, entering upgrade mode.\r\n");
           ota_state = OTA_STATE_UPGRADING;
           Write_Flag(EE_VAR_OTA_STATE, OTA_STATE_UPGRADING);
-          Write_Flag(EE_VAR_TARGET_SLOT, SLOT_A);
+          Write_Flag(EE_VAR_TARGET_SLOT, SLOT_B);
           continue;
         }
       }

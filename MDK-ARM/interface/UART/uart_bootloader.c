@@ -27,6 +27,26 @@ void Init_Uart()
     
 }
 
+// 清空硬件与软件缓冲区（中止传输/接收、清空寄存器、清零软件缓冲）
+void UART_FlushBuffers(UART_HandleTypeDef *huart)
+{
+    // 中止 HAL 层的正在进行的发送/接收
+    HAL_UART_AbortTransmit(huart);
+    HAL_UART_AbortReceive(huart);
+
+    // 如果使用 DMA，需要禁用相关 DMA 通道（如声明了 hdma_usart1_rx/tx）
+#ifdef hdma_usart1_rx
+    __HAL_DMA_DISABLE(&hdma_usart1_rx);
+#endif
+#ifdef hdma_usart1_tx
+    __HAL_DMA_DISABLE(&hdma_usart1_tx);
+#endif
+
+    // 清掉外设数据寄存器残留（读出 RDR）
+    __HAL_UART_FLUSH_DRREGISTER(huart);
+
+}
+
 // void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 // {
 //     if(huart == &huart1)
@@ -66,6 +86,27 @@ int Xmodem_Crc_Check(char *buf, int len)
     return (crc == recv_crc) ? 1 : 0;
 }
 
+//握手阶段：只负责发送'C'并等待发送方返回SOH
+//返回值：1=收到SOH，-1=握手失败
+static int Xmodem_Handshake(uint8_t *start_byte, uint8_t *first_byte)
+{
+    int retries = 3;
+
+    while(retries--)
+    {
+        HAL_UART_Transmit(&huart1, start_byte, 1, 0xFFFF);
+        if(HAL_UART_Receive(&huart1, first_byte, 1, 5000) == HAL_OK)
+        {
+            if(first_byte[0] == Xmodem_SOH)
+            {
+                return 1;
+            }
+        }
+    }
+
+    return -1;
+}
+
 
 
 //接收方发送启动包，启动Xmodem传输，返回接收总字节数，失败返回-1
@@ -81,37 +122,25 @@ int Xmodem_Start_Transfer(uint32_t startadddr)
     char prev_buf[128];    // 前一个包的数据缓冲（看前一个包策略）
     int has_prev = 0;      // 是否已缓冲了前一个包
     int retries;
+    uint8_t tmp;
 
-    // 阶段1：发送'C'启动传输，等待发送方回应SOH
-    retries = 3;
-    while(retries--)
-    {
-        HAL_UART_Transmit(&huart1, &start_byte, 1, 0xFFFF);
-        if(HAL_UART_Receive(&huart1, pkt, 1, 3000) == HAL_OK)
-        {
-            if(pkt[0] == Xmodem_SOH)
-            {
-                // 收到SOH，接收剩余132字节(块号+补码+128数据+2CRC)
-                // 超时500ms：115200baud下132字节约12ms，留足余量
-                if(HAL_UART_Receive(&huart1, &pkt[1], 132, 500) == HAL_OK)
-                    break;
-                else
-                {
-                    HAL_UART_AbortReceive(&huart1); // 清除接收状态和RDR残留数据
-                    HAL_UART_Transmit(&huart1, &nak, 1, 0xFFFF); // 通知发送方重传
-                }
-            }
-            else if(pkt[0] == Xmodem_EOT)
-            {
-                HAL_UART_Transmit(&huart1, &ack, 1, 0xFFFF);
-                return 0;  // 空传输
-            }
-        }
-    }
 
+    UART_FlushBuffers(&huart1);  // 确保接收缓冲区干净，避免残留数据干扰握手和后续接收
+
+    // 阶段1：握手，仅负责发送'C'并拿到首包控制字节
+    retries = Xmodem_Handshake(&start_byte, pkt);
     if(retries < 0)
     {
         printf("Failed to start Xmodem transfer.\r\n");
+        return -1;
+    }
+
+    // 收到SOH后，再进入完整包接收阶段
+    if(HAL_UART_Receive(&huart1, &pkt[1], 132, 5000) != HAL_OK)
+    {
+        UART_FlushBuffers(&huart1);
+        HAL_UART_Transmit(&huart1, &nak, 1, 0xFFFF);
+        printf("Timeout waiting for first packet.\r\n");
         return -1;
     }
 
@@ -159,8 +188,9 @@ int Xmodem_Start_Transfer(uint32_t startadddr)
         retries = 10;
         while(retries--)
         {
-            if(HAL_UART_Receive(&huart1, pkt, 1, 5000) != HAL_OK)
+            if(HAL_UART_Receive(&huart1, pkt, 1, 500) != HAL_OK)
             {
+                UART_FlushBuffers(&huart1);
                 HAL_UART_Transmit(&huart1, &nak, 1, 0xFFFF);
                 continue;
             }
@@ -187,7 +217,7 @@ int Xmodem_Start_Transfer(uint32_t startadddr)
                 }
 
                 // 确保发送方收到ACK：短暂等待，如果收到重发的EOT就再ACK一次
-                uint8_t tmp;
+                
                 if(HAL_UART_Receive(&huart1, &tmp, 1, 1000) == HAL_OK && tmp == Xmodem_EOT)
                 {
                     HAL_UART_Transmit(&huart1, &ack, 1, 0xFFFF);
@@ -218,7 +248,7 @@ int Xmodem_Start_Transfer(uint32_t startadddr)
                     break;  // 收到完整包，回到外层循环处理
                 else
                 {
-                    HAL_UART_AbortReceive(&huart1); // 清除接收状态和RDR残留数据
+                    UART_FlushBuffers(&huart1);
                     HAL_UART_Transmit(&huart1, &nak, 1, 0xFFFF); // 通知发送方重传
                 }
             }
