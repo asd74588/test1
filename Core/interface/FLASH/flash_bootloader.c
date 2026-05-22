@@ -1,22 +1,10 @@
 #include "flash_bootloader.h"
 #include "eeprom_emul.h"
 
-#define UART_RX_IDLE_FLUSH_MS 50U
-
-volatile uint8_t ota_upgrade_done = 0;
 static uint8_t s_tail_bytes[8] = {0};
+static uint8_t s_tail_len = 0U;
 
-HAL_StatusTypeDef Write_Flag(uint16_t virt_addr, uint32_t flag_value)
-{
-    return EE_Write(virt_addr, flag_value);
-}
 
-uint32_t Read_Flag(uint16_t virt_addr)
-{
-    uint32_t flag = 0xFFFFFFFFU;
-    EE_Read(virt_addr, &flag);
-    return flag;
-}
 
 //将bin文件写到flash之前的进行的初始化:擦除指定分区的FLASH页
 //slot: SLOT_A 擦除APP_A区, SLOT_B 擦除APP_B区
@@ -26,7 +14,8 @@ void Erase_App_Flash(uint8_t slot)
     uint32_t PageError = 0;
     uint32_t pageSize = FLASH_PAGE_SIZE;
     
-    uint32_t startAddr, appSize;
+    uint32_t startAddr;
+    uint32_t appSize;
     if (slot == SLOT_B)
     {
         startAddr = APP_B_START_ADDR;
@@ -66,12 +55,11 @@ HAL_StatusTypeDef Write_Buffer_To_Flash(uint32_t* startaddr, char* buffer)
         return HAL_ERROR;
     }
 
-    uint32_t chunk_len = 128U;  // 每次处理128字节，确保足够大以减少写入次数，同时又不至于过大导致RAM压力。
-    uint8_t write_cache[128] = {0};
-    uint32_t cache_idx = 0U;
-    uint64_t value = 0;
-    HAL_StatusTypeDef status = HAL_OK;
-    uint8_t s_tail_len = 0U;  // 上次遗留的尾巴长度，范围0~7字节
+    uint32_t            chunk_len = 128U;  // 每次处理128字节，确保足够大以减少写入次数，同时又不至于过大导致RAM压力。
+    uint8_t             write_cache[128] = {0};
+    uint32_t            cache_idx = 0U;
+    uint64_t            value = 0;
+    HAL_StatusTypeDef   status = HAL_OK;
 
     // 先拷贝快照，避免DMA在写Flash过程中改写原buffer。
     memcpy(write_cache, buffer, chunk_len);
@@ -131,6 +119,7 @@ HAL_StatusTypeDef Write_Buffer_To_Flash(uint32_t* startaddr, char* buffer)
 int Verify_APP_Integrity_Flash(uint32_t appaddr)
 {
     uint32_t msp_value = *(__IO uint32_t*)appaddr;
+    uint32_t reset_handler = *(__IO uint32_t*)(appaddr + 4U);
     // STM32L431 RAM范围: 0x20000000 ~ 0x20010000 (64KB)
     // 有效固件的MSP必定指向RAM区域
     if (msp_value < 0x20000000U || msp_value > 0x20010000U)
@@ -138,7 +127,6 @@ int Verify_APP_Integrity_Flash(uint32_t appaddr)
         return 0;  // 无有效固件
     }
 
-    uint32_t reset_handler = *(__IO uint32_t*)(appaddr + 4U);
     // Reset_Handler必须在Flash范围内且Thumb位为1
     if ((reset_handler & 0x1U) == 0U)
     {
@@ -195,10 +183,7 @@ int Jump_To_App_Flash(uint32_t appaddr)
 
     // 读取App复位向量并转换为函数入口。
     jump_addr = *(__IO uint32_t*)(appaddr + 4U);
-    if ((jump_addr & 0x1U) == 0U)
-    {
-        return 0;
-    }
+
     jump_to_app = (void (*)(void))jump_addr;
 
     // 设置App主堆栈指针，恢复线程特权模式并重新打开中断后跳转。

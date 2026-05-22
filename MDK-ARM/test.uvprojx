@@ -341,7 +341,7 @@
               <MiscControls></MiscControls>
               <Define>USE_HAL_DRIVER,STM32L431xx</Define>
               <Undefine></Undefine>
-              <IncludePath>../Core/Inc;../Drivers/STM32L4xx_HAL_Driver/Inc;../Drivers/STM32L4xx_HAL_Driver/Inc/Legacy;../Drivers/CMSIS/Device/ST/STM32L4xx/Include;../Drivers/CMSIS/Include;./interface/UART;./interface/FLASH;./interface;./interface/SPI</IncludePath>
+              <IncludePath>../Core/Inc;../Drivers/STM32L4xx_HAL_Driver/Inc;../Drivers/STM32L4xx_HAL_Driver/Inc/Legacy;../Drivers/CMSIS/Device/ST/STM32L4xx/Include;../Drivers/CMSIS/Include;..\Core\interface;..\Core\interface\FLASH;..\Core\interface\SPI;..\Core\interface\UART;..\Core\interface\Xmodem</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -900,52 +900,62 @@
           </Files>
         </Group>
         <Group>
-          <GroupName>interface</GroupName>
+          <GroupName>Application/User/Core/Interface</GroupName>
           <Files>
-            <File>
-              <FileName>uart_bootloader.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\interface\UART\uart_bootloader.c</FilePath>
-            </File>
-            <File>
-              <FileName>uart_bootloader.h</FileName>
-              <FileType>5</FileType>
-              <FilePath>.\interface\UART\uart_bootloader.h</FilePath>
-            </File>
-            <File>
-              <FileName>flash_bootloader.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\interface\FLASH\flash_bootloader.c</FilePath>
-            </File>
-            <File>
-              <FileName>flash_bootloader.h</FileName>
-              <FileType>5</FileType>
-              <FilePath>.\interface\FLASH\flash_bootloader.h</FilePath>
-            </File>
-            <File>
-              <FileName>global.h</FileName>
-              <FileType>5</FileType>
-              <FilePath>.\interface\global.h</FilePath>
-            </File>
-            <File>
-              <FileName>w25qxx.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\interface\SPI\w25qxx.c</FilePath>
-            </File>
-            <File>
-              <FileName>w25qxx.h</FileName>
-              <FileType>5</FileType>
-              <FilePath>.\interface\SPI\w25qxx.h</FilePath>
-            </File>
             <File>
               <FileName>eeprom_emul.c</FileName>
               <FileType>1</FileType>
-              <FilePath>.\interface\FLASH\eeprom_emul.c</FilePath>
+              <FilePath>..\Core\interface\FLASH\eeprom_emul.c</FilePath>
             </File>
             <File>
               <FileName>eeprom_emul.h</FileName>
               <FileType>5</FileType>
-              <FilePath>.\interface\FLASH\eeprom_emul.h</FilePath>
+              <FilePath>..\Core\interface\FLASH\eeprom_emul.h</FilePath>
+            </File>
+            <File>
+              <FileName>flash_bootloader.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\interface\FLASH\flash_bootloader.c</FilePath>
+            </File>
+            <File>
+              <FileName>flash_bootloader.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Core\interface\FLASH\flash_bootloader.h</FilePath>
+            </File>
+            <File>
+              <FileName>w25qxx.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\interface\SPI\w25qxx.c</FilePath>
+            </File>
+            <File>
+              <FileName>w25qxx.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Core\interface\SPI\w25qxx.h</FilePath>
+            </File>
+            <File>
+              <FileName>uart_bootloader.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\interface\UART\uart_bootloader.c</FilePath>
+            </File>
+            <File>
+              <FileName>uart_bootloader.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Core\interface\UART\uart_bootloader.h</FilePath>
+            </File>
+            <File>
+              <FileName>global.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Core\interface\global.h</FilePath>
+            </File>
+            <File>
+              <FileName>xmodem.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\interface\Xmodem\xmodem.c</FilePath>
+            </File>
+            <File>
+              <FileName>xmodem.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Core\interface\Xmodem\xmodem.h</FilePath>
             </File>
           </Files>
         </Group>
@@ -962,7 +972,6 @@
       <component Cclass="CMSIS" Cgroup="CORE" Cvendor="ARM" Cversion="5.6.0" condition="ARMv6_7_8-M Device">
         <package name="CMSIS" schemaVersion="1.7.7" url="http://www.keil.com/pack/" vendor="ARM" version="5.9.0"/>
         <targetInfos>
-          <targetInfo name="A"/>
           <targetInfo name="test"/>
         </targetInfos>
       </component>

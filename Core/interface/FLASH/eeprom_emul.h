@@ -10,10 +10,10 @@
 #define EE_PAGE1_BASE       0x0803F800U
 
 /* Flash 页大小（STM32L4 单 Bank = 2KB） */
-#define EE_FLASH_PAGE_SIZE  0x800U
+#define EE_FLASH_PAGE_SIZE  FLASH_PAGE_SIZE
 
 /* Flash 基地址 & Bank */
-#define EE_FLASH_BASE       0x08000000U
+#define EE_FLASH_BASE       FLASH_BASE
 #define EE_FLASH_BANK       FLASH_BANK_1
 
 /* ======================== 页状态定义 ======================== */
@@ -49,27 +49,42 @@
 
 /* OTA 状态机 — 驱动整个 Bootloader 流程，一个变量搞定 */
 #define EE_VAR_OTA_STATE            0x0001U
-#define OTA_STATE_BOOT              0x00U   // 正常启动：检查分区完整性，降级回退，等待升级指令，跳转APP
-#define OTA_STATE_UPGRADING         0x01U   // 升级中：Bootloader等待Xmodem接收固件
-#define OTA_STATE_VERIFYING         0x02U   // 校验中：新固件已写入，校验通过则切换分区，失败则回退
-#define OTA_STATE_REVERT            0x03U   // 升级回退：新分区校验失败，回到旧分区执行
+
+enum ota_state_t
+{ 
+    OTA_STATE_BOOT = 0,       // 正常启动：检查分区完整性，降级回退，等待升级指令，跳转APP
+    OTA_STATE_UPGRADING,      // 升级中：Bootloader等待Xmodem接收固件
+    OTA_STATE_VERIFYING,      // 校验中：新固件已写入，校验通过则切换分区，失败则回退
+    OTA_STATE_REVERT,         // 回退中：Bootloader等待Xmodem接收回退固件
+};
 
 /* 当前活跃分区 — 决定Bootloader跳转哪个分区 */
 #define EE_VAR_ACTIVE_SLOT          0x0002U
-#define SLOT_A                      0x00U   // 当前运行APP_A
-#define SLOT_B                      0x01U   // 当前运行APP_B
 
 /* 升级目标分区 — 记录正在往哪个分区写（掉电恢复用，= !ACTIVE_SLOT） */
 #define EE_VAR_TARGET_SLOT          0x0003U
+
+enum slot_t
+{
+    SLOT_A,             // 0:A分区
+    SLOT_B,             // 1:B分区
+    SLOT_COUNT,
+};
 
 /* 固件大小（字节）— 由App端在请求升级时写入，用于完整性校验 */
 #define EE_VAR_FIRMWARE_SIZE        0x0004U
 
 /* 回退原因 — 进入REVERT前写入，REVERT内零Flash校验 */
 #define EE_VAR_REVERT_REASON        0x0005U
-#define REVERT_ACTIVE_VALID         0x00U   // 升级回退：active有效，直接回BOOT
-#define REVERT_OTHER_VALID          0x01U   // 启动降级：active无效，other有效，切分区
-#define REVERT_BOTH_INVALID         0x02U   // 两分区都无效，进UPGRADING
+
+enum revert_reason_t
+{
+    REVERT_ACTIVE_VALID,// 升级回退：active有效，直接回退到active
+    REVERT_OTHER_VALID,// 启动降级：active无效，other有效，切分区
+    REVERT_BOTH_INVALID, // 两分区都无效，进UPGRADING
+
+};
+
 
 /* ======================== 函数声明 ======================== */
 
@@ -80,25 +95,19 @@
 HAL_StatusTypeDef EE_Init(void);
 
 /**
- * @brief  格式化 EEPROM（擦除两页并将 Page0 设为 ACTIVE）
+ * @brief  写入变量
+ * @param  virt_addr    虚拟地址 (0x0001 ~ 0xFFFE)
+ * @param  flag_value   标志值  
  * @retval HAL_OK / HAL_ERROR
  */
-HAL_StatusTypeDef EE_Format(void);
+HAL_StatusTypeDef Write_Flag(uint16_t virt_addr, uint32_t flag_value);
 
 /**
  * @brief  读取变量
- * @param  virt_addr  虚拟地址 (0x0001 ~ 0xFFFE)
- * @param  p_data     数据输出指针
- * @retval HAL_OK 成功，HAL_ERROR 未找到或参数错误
- */
-HAL_StatusTypeDef EE_Read(uint16_t virt_addr, uint32_t *p_data);
-
-/**
- * @brief  写入变量（页满时自动执行页转移）
- * @param  virt_addr  虚拟地址 (0x0001 ~ 0xFFFE)
- * @param  data       数据
+ * @param  virt_addr    虚拟地址 (0x0001 ~ 0xFFFE)
+ * @param  flag_value   标志值  
  * @retval HAL_OK / HAL_ERROR
  */
-HAL_StatusTypeDef EE_Write(uint16_t virt_addr, uint32_t data);
+uint32_t Read_Flag(uint16_t virt_addr);
 
 #endif /* __EEPROM_EMUL_H */
