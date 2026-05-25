@@ -1,0 +1,11 @@
+#ifndef __LFS_CONFIG_H
+#define __LFS_CONFIG_H
+
+#define LFS_READ_SIZE 1
+#define LFS_PROG_SIZE 256
+#define LFS_BLOCK_SIZE 4096
+#define LFS_BLOCK_COUNT 64
+#define LFS_CACHE_SIZE 512
+#define LFS_LOOKAHEAD_SIZE 8
+#define LFS_BLOCK_CYCLES 500
+#endif /* __LFS_CONFIG_H */

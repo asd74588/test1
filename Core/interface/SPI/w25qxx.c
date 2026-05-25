@@ -6,7 +6,7 @@
 #include "w25qxx.h"
 #include "spi.h"
 
-#define CONFIG_DEBUG_W25Q /* Enable W25Q norflash debug */
+//#define CONFIG_DEBUG_W25Q /* Enable W25Q norflash debug */
 
 #ifdef CONFIG_DEBUG_W25Q
 #define spinor_print(format,args...) printf(format, ##args)
@@ -46,6 +46,9 @@ __attribute__((unused)) static void dump_buf(const char *prompt, uint8_t *buf, u
 #define W25Q_CS_PIN             GPIO_PIN_4
 
 #define SPI_DUMMY_BYTE          0xA5
+
+spinor_info_t          spinor;
+
 
 void spinor_gpio_init(struct spi_info *spi)
 {

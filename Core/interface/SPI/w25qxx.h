@@ -77,6 +77,10 @@ enum
     REG_STATUS_MAX,
 };
 
+
+extern spinor_info_t          spinor;
+
+
 /*+-------------------------------+
  *|   SPI Norflash HighLevel API  |
  *+-------------------------------+*/

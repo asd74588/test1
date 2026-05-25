@@ -55,7 +55,7 @@ enum ota_state_t
     OTA_STATE_BOOT = 0,       // 正常启动：检查分区完整性，降级回退，等待升级指令，跳转APP
     OTA_STATE_UPGRADING,      // 升级中：Bootloader等待Xmodem接收固件
     OTA_STATE_VERIFYING,      // 校验中：新固件已写入，校验通过则切换分区，失败则回退
-    OTA_STATE_REVERT,         // 回退中：Bootloader等待Xmodem接收回退固件
+    OTA_STATE_REVERT      // 回退中：Bootloader等待Xmodem接收回退固件
 };
 
 /* 当前活跃分区 — 决定Bootloader跳转哪个分区 */
