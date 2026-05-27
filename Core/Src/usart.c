@@ -247,7 +247,7 @@ void HAL_UART_MspDeInit(UART_HandleTypeDef* uartHandle)
 PUTCHAR_PROTOTYPE
 {
     /* 调用STM32 HAL库的串口发送函数，将printf要打印的这个字符通过串口发送出去 */
-    HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, 0xFFFF);
+    HAL_UART_Transmit(&huart3, (uint8_t *)&ch, 1, 0xFFFF);
     return ch;
 }
 /* USER CODE END 1 */

@@ -61,53 +61,40 @@
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-#define HEAP_WATERMARK 0xCD
-extern char __heap_base[];
-extern char __heap_limit[];
 
-void Heap_InitWatermark(void) {
-    uint8_t *p = (uint8_t *)__heap_base;
-    uint8_t *end = (uint8_t *)__heap_limit;
-    while (p < end) *p++ = HEAP_WATERMARK;
-}
-
-// 🔑 全堆扫描版：无视碎片，统计所有非 0xCD 字节
-uint32_t Heap_GetUsage(uint32_t *p_used, uint32_t *p_percent, uint32_t *p_total) {
-    // volatile 防止编译器优化掉内存读取
-    volatile uint8_t *base  = (volatile uint8_t *)__heap_base;
-    volatile uint8_t *limit = (volatile uint8_t *)__heap_limit;
-    
-    uint32_t total = (uint32_t)(limit - base);
-    uint32_t free_bytes = 0;
-    
-    // 遍历整个堆区，统计未被覆盖的水印字节
-    for (volatile uint8_t *p = base; p < limit; p++) {
-        if (*p == HEAP_WATERMARK) {
-            free_bytes++;
-        }
-    }
-    
-    uint32_t used = total - free_bytes;
-    
-    if (p_used)   *p_used   = used;
-    if (p_total)  *p_total  = total;
-    if (p_percent && total > 0) {
-        *p_percent = (used * 100UL + total/2) / total; // 四舍五入
-    }
-    return used;
-}
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-int is_heap_available(size_t size) {
-    void *ptr = malloc(size);
-    if (ptr != NULL) {
-        free(ptr);
-        return 1;  // 有空间
-    }
-    return 0;      // 空间不足
+  lfs_t lfs;  
+  lfs_file_t file;
+
+
+int Write_Buffer_To_NorFlash(const char *buf, size_t len)
+{
+    lfs_file_write(&lfs, &file, (const void *)buf, (lfs_size_t)len);
+    //lfs_file_sync(&lfs, &file);
+
+    return 0;
 }
+uint32_t crc32_update(uint32_t crc, uint8_t *data, uint32_t len)
+{
+    for(uint32_t i = 0; i < len; i++)
+    {
+        crc ^= data[i];
+
+        for(uint32_t j = 0; j < 8; j++)
+        {
+            if(crc & 1)
+                crc = (crc >> 1) ^ 0xEDB88320;
+            else
+                crc >>= 1;
+        }
+    }
+
+    return crc;
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -118,7 +105,6 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-  Heap_InitWatermark();
 
   /* USER CODE END 1 */
 
@@ -145,94 +131,101 @@ int main(void)
   MX_SPI1_Init();
   MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
-uint32_t p_max_used;
-uint32_t p_percent;
-uint32_t p_total;
-
-  // 🔍 打印堆边界验证符号解析
-    printf("=== Heap Debug ===\r\n");
-    printf("Base: 0x%08X, Limit: 0x%08X\r\n", 
-           (uint32_t)__heap_base, (uint32_t)__heap_limit);
-    printf("Total: %lu bytes\r\n", (uint32_t)(__heap_limit - __heap_base));
-    
-    // 🔍 验证水印是否写入成功（打印前 16 字节）
-    printf("Watermark check: ");
-    for (int i = 0; i < 16; i++) {
-        printf("%02X ", ((uint8_t *)__heap_base)[i]);
-    }
-    printf("\r\n");  // 期望输出: CD CD CD CD ...
-
   EE_Init();
+  Proto_Register_Write_Callback(Write_Buffer_To_NorFlash);
 
-  void *r_buf = malloc(LFS_CACHE_SIZE);
-  void *p_buf = malloc(LFS_CACHE_SIZE);
-  void *l_buf = malloc(LFS_LOOKAHEAD_SIZE);
-
-  printf("read_buf  : %p (usable: )\n", r_buf);
-  printf("prog_buf  : %p (usable: )\n", p_buf);
-  printf("look_buf  : %p (usable: )\n", l_buf);
-
-  // 计算实际物理跨度
-  uint32_t span = (uint32_t)l_buf - (uint32_t)r_buf + LFS_LOOKAHEAD_SIZE;
-  printf("Heap physical span: %lu bytes\n", span);
-
-
-  Heap_GetUsage(&p_max_used, &p_percent, &p_total); // 预热堆栈，获取初始使用情况
-  printf("Initial Heap Usage: %lu bytes (%.2f%%)\r\n", p_max_used, (float)p_percent);
-  lfs_t lfs;
   extern const struct lfs_config my_lfs_config;
-
-  //is_heap_available(10) ? printf("Heap is available for 512 bytes.\r\n") : printf("Heap is NOT available for 512 bytes.\r\n");
+  extern const struct lfs_file_config lfs_file_cfg;
 
   if( spinor_init(&spinor) < 0 )
     return 1;
 
-  //is_heap_available(512) ? printf("Heap is available for 512 bytes.\r\n") : printf("Heap is NOT available for 512 bytes.\r\n");
-
-  Heap_GetUsage(&p_max_used, &p_percent, &p_total); // 预热堆栈，获取初始使用情况
-  printf("Initial Heap Usage: %lu bytes (%.2f%%)\r\n", p_max_used, (float)p_percent);
-
   int err = lfs_mount(&lfs, &my_lfs_config);
   printf("lfs_mount: %d\r\n", err);
-
-  Heap_GetUsage(&p_max_used, &p_percent, &p_total ); // 预热堆栈，获取初始使用情况
-  printf("Initial Heap Usage: %lu bytes (%.2f%%)\r\n", p_max_used, (float)p_percent);
-
-
-  if (err) {
-    int fmt_err = lfs_format(&lfs, &my_lfs_config);
-    printf("lfs_format: %d\r\n", fmt_err);
-    if (fmt_err == 0) {
-      err = lfs_mount(&lfs, &my_lfs_config);
-      printf("lfs_mount after format: %d\r\n", err);
-    }
-  }
-
   if (err) {
     printf("LittleFS init failed, stop here.\r\n");
     return 1;
   }
 
-  // 4. 测试文件操作 (读写文件)
-  lfs_file_t file;
-  static uint8_t file_buffer[512];
+  // uint8_t rx_byte = 0;
+  // printf("Press 'f' or 'F' to format external flash...\r\n");
 
-  int file_err = lfs_file_open(&lfs, &file, "test.txt", LFS_O_WRONLY | LFS_O_CREAT);
-  printf("lfs_file_open(write): %d\r\n", file_err);
-  if (file_err == 0) {
-    lfs_file_write(&lfs, &file, "Hello LittleFS", 15);
-    lfs_file_sync(&lfs, &file);
-    lfs_file_close(&lfs, &file);
-  }
+  
+  // if (HAL_UART_Receive(&huart1, &rx_byte, 1, 5000) == HAL_OK) {
+  //     if (rx_byte == 'f' || rx_byte == 'F') {
+  //       if (err == 0) {
+  //         lfs_unmount(&lfs);
+  //       }
 
-  char read_buf[20] = {0};
-  file_err = lfs_file_open(&lfs, &file, "test.txt", LFS_O_RDONLY);
-  printf("lfs_file_open(read): %d\r\n", file_err);
-  if (file_err == 0) {
-    lfs_ssize_t bytes_read = lfs_file_read(&lfs, &file, read_buf, 15);
-    lfs_file_close(&lfs, &file);
-    printf("Read from LittleFS: %s (bytes read: %d)\r\n", read_buf, (int)bytes_read);
-  }
+  //       int fmt_err = lfs_format(&lfs, &my_lfs_config);
+  //       printf("lfs_format: %d\r\n", fmt_err);
+  //       if (fmt_err == 0) {
+  //         err = lfs_mount(&lfs, &my_lfs_config);
+  //        printf("lfs_mount after format: %d\r\n", err);
+  //      }  
+  //   }
+  // }
+  
+
+
+  // // 4. 测试文件操作 (读写文件)
+
+  // static uint8_t file_buffer[512];
+  
+  // int file_err = lfs_file_opencfg(&lfs, &file, "a.elf", LFS_O_WRONLY | LFS_O_CREAT, &lfs_file_cfg);
+  // printf("lfs_file_open(write): %d\r\n", file_err);
+
+  // if (file_err != 0) {
+  //   lfs_file_close(&lfs, &file);
+  // }
+
+  // int rv = Proto_Start_Receive(APP_B_START_ADDR, NULL);
+  // if(rv > 0)
+  // {
+  //   printf("Xmodem transfer complete, %d bytes received.\r\n", rv);
+  // }
+  // else
+  // {
+  //   printf("Xmodem transfer failed.\r\n");
+  // }
+  
+
+// uint32_t crc = 0xFFFFFFFF;
+// crc = crc32_update(crc, test, 9);
+// crc ^= 0xFFFFFFFF;
+// printf("CRC32 = 0x%08X\r\n", crc);
+
+  // uint8_t buf[16];
+  // lfs_file_seek(&lfs, &file, 0, LFS_SEEK_SET);
+  // lfs_file_read(&lfs, &file, buf, 16);
+  // for(int i = 0; i < 16; i++) {
+  //     printf("%02X ", buf[i]);
+  // }
+
+  // 使用串口接收时记录的真实大小，而不是lfs_file_size
+  // uint32_t real_size = rv; // 从Xmodem传输结果获取，存在某个变量里
+  // uint8_t buf[1024];
+  // uint32_t remaining = real_size;  // ← 关键：用真实大小，不用lfs文件大小
+  // uint32_t crc = 0xFFFFFFFF;
+
+  // while (remaining > 0) {
+  //     int to_read = (remaining > sizeof(buf)) ? sizeof(buf) : remaining;
+  //     int read_len = lfs_file_read(&lfs, &file, buf, to_read);
+  //     if (read_len <= 0) break;
+  //     crc = crc32_update(crc, buf, read_len);
+  //     remaining -= read_len;
+  // }
+
+  // crc ^= 0xFFFFFFFF;
+  // printf("File CRC32: 0x%08X\r\n", crc);
+
+  // // 同时打印文件实际大小
+  // lfs_file_seek(&lfs, &file, 0, LFS_SEEK_END);
+  // int32_t size = lfs_file_tell(&lfs, &file);
+  // printf("LFS file size: %d\r\n", size);
+
+
+  // lfs_file_close(&lfs, &file);
 
 
   return 0;

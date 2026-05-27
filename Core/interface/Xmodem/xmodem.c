@@ -1,205 +1,528 @@
+/**
+ * @file  xmodem_ymodem.c
+ * @brief 统一 Xmodem / Xmodem-1K / Ymodem 接收实现
+ *
+ * 分层设计：
+ *   L1 UART 原语      uart_flush / uart_send_byte / uart_recv
+ *   L2 包收发         recv_packet_body / send_cancel
+ *   L3 包校验         crc16_ccitt / pkt_crc_check / validate_packet
+ *   L4 协议语义       detect_protocol / ymodem_process_header_pkt
+ *                     flush_prev_buf / handle_eot / wait_next_frame
+ *   L5 公共入口       Proto_Start_Receive
+ */
+
 #include "xmodem.h"
+#include "usart.h"
+#include <string.h>
+#include <stdio.h>
 
+/* ============================================================
+ *  常量
+ * ============================================================ */
+#define PKT_DATA_128      128
+#define PKT_DATA_1K       1024
+#define PKT_MAX_LEN       (3 + PKT_DATA_1K + 2)   /* 1029 */
 
+#define HANDSHAKE_RETRIES 3
+#define PACKET_RETRIES    10
+#define TIMEOUT_HANDSHAKE 5000
+#define TIMEOUT_PACKET    2000
+#define TIMEOUT_BODY      2000
+#define TIMEOUT_EOT_RETRY 1000
 
+/* ============================================================
+ *  传输上下文
+ *  所有运行时状态集中在一个结构，函数间通过指针传递，
+ *  消除隐式全局耦合，也方便将来支持多路并发传输。
+ * ============================================================ */
+typedef struct {
+    ProtoType   protocol;
+    uint8_t     expected;       /* 期望下一个包的块号 */
+    int         is_ymodem;
 
-//CRC16-CCITT校验，校验成功返回1，失败返回0
-//pkt格式: [SOH][block#][~block#][128字节数据][CRC_H][CRC_L]
-static int Xmodem_Crc_Check(char *buf, int len)
+    uint8_t     pkt[PKT_MAX_LEN];   /* 当前包缓冲 */
+    int         data_len;           /* 当前包数据段长度 */
+
+    uint8_t     prev_buf[PKT_DATA_1K];  /* 前一包数据（"看前一包"策略） */
+    int         prev_len;
+    int         has_prev;
+
+    int         total_recv;         /* 累计有效字节数 */
+    YmodemFileInfo *file_info;      /* 外部传入，Ymodem 文件信息输出 */
+} TransferCtx;
+
+/* ============================================================
+ *  模块级回调
+ * ============================================================ */
+static Write_Flash_Callback s_write_cb = NULL;
+
+void Proto_Register_Write_Callback(Write_Flash_Callback cb)
 {
-    uint16_t crc = 0;
-    // 对128字节数据部分计算CRC16-CCITT (多项式0x1021)
-    for (int i = 3; i < 131; i++)
-    {
-        crc ^= ((uint16_t)(uint8_t)buf[i] << 8);
-        for (int j = 0; j < 8; j++)
-        {
-            if (crc & 0x8000)
-                crc = (crc << 1) ^ 0x1021;
-            else
-                crc <<= 1;
-        }
-    }
-    // 接收到的CRC在pkt[131]和pkt[132]，大端序
-    uint16_t recv_crc = ((uint8_t)buf[131] << 8) | (uint8_t)buf[132];
-    return (crc == recv_crc) ? 1 : 0;
+    s_write_cb = cb;
 }
 
-//握手阶段：只负责发送'C'并等待发送方返回SOH
-//返回值：1=收到SOH，-1=握手失败
-static int Xmodem_Handshake(uint8_t *start_byte, uint8_t *first_byte)
+/* ============================================================
+ *  L1：UART 原语
+ * ============================================================ */
+static void uart_flush(void)
 {
-    int retries = 3;
+    UART_FlushBuffers(&huart1);
+}
 
-    while(retries--)
-    {
-        HAL_UART_Transmit(&huart1, start_byte, 1, 0xFFFF);
-        if(HAL_UART_Receive(&huart1, first_byte, 1, 5000) == HAL_OK)
-        {
-            if(first_byte[0] == Xmodem_SOH)
-            {
-                return 1;
-            }
-        }
+static void uart_send_byte(uint8_t b)
+{
+    HAL_UART_Transmit(&huart1, &b, 1, 0xFFFF);
+}
+
+static HAL_StatusTypeDef uart_recv(uint8_t *buf, uint16_t len, uint32_t timeout_ms)
+{
+    return HAL_UART_Receive(&huart1, buf, len, timeout_ms);
+}
+
+/* ============================================================
+ *  L2：包收发
+ * ============================================================ */
+
+/**
+ * @brief 发送取消序列（2 × CAN）
+ */
+static void send_cancel(void)
+{
+    uart_send_byte(PROTO_CAN);
+    uart_send_byte(PROTO_CAN);
+}
+
+/**
+ * @brief 接收包体（pkt[0] 已填充 SOH/STX）
+ *        继续收 blk + ~blk + data + CRC_H + CRC_L
+ * @param pkt       缓冲区首地址
+ * @param data_len  [out] 数据段长度
+ * @return 1=成功, 0=超时
+ */
+static int recv_packet_body(uint8_t *pkt, int *data_len)
+{
+    *data_len = (pkt[0] == PROTO_STX) ? PKT_DATA_1K : PKT_DATA_128;
+    int body_len = 2 + *data_len + 2;   /* blk + ~blk + data + crc */
+
+    if (uart_recv(&pkt[1], (uint16_t)body_len, TIMEOUT_BODY) != HAL_OK) {
+        uart_flush();
+        return 0;
+    }
+    return 1;
+}
+
+/* ============================================================
+ *  L3：包校验
+ * ============================================================ */
+
+/**
+ * @brief CRC16-CCITT（多项式 0x1021）
+ */
+static uint16_t crc16_ccitt(const uint8_t *data, int len)
+{
+    uint16_t crc = 0;
+    for (int i = 0; i < len; i++) {
+        crc ^= (uint16_t)data[i] << 8;
+        for (int j = 0; j < 8; j++)
+            crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : (crc << 1);
+    }
+    return crc;
+}
+
+/**
+ * @brief 对完整包（pkt[0]=SOH/STX）做 CRC 校验
+ * @return 1=通过, 0=失败
+ */
+static int pkt_crc_check(const uint8_t *pkt, int data_len)
+{
+    uint16_t calc = crc16_ccitt(&pkt[3], data_len);
+    uint16_t recv = ((uint16_t)pkt[3 + data_len] << 8) | pkt[3 + data_len + 1];
+    return (calc == recv) ? 1 : 0;
+}
+
+/**
+ * @brief 校验当前包的块号完整性、顺序、CRC
+ *
+ * @return  1  = 校验通过，可写缓冲
+ *          0  = 重复包（ACK 丢失重传），已补发 ACK，调用方跳过写缓冲
+ *         -1  = 校验失败，已发 NAK
+ */
+static int validate_packet(const TransferCtx *ctx)
+{
+    const uint8_t *pkt = ctx->pkt;
+    uint8_t blk     = pkt[1];
+    uint8_t blk_inv = pkt[2];
+
+    /* 块号补码完整性 */
+    if ((uint8_t)(blk + blk_inv) != 0xFF) {
+        uart_send_byte(PROTO_NAK);
+        return -1;
     }
 
+    /* 重复包：ACK 丢失导致发送方重传上一包 */
+    if (blk == (uint8_t)(ctx->expected - 1)) {
+        uart_send_byte(PROTO_ACK);
+        return 0;
+    }
+
+    /* 乱序 */
+    if (blk != ctx->expected) {
+        uart_send_byte(PROTO_NAK);
+        return -1;
+    }
+
+    /* CRC */
+    if (!pkt_crc_check(pkt, ctx->data_len)) {
+        uart_send_byte(PROTO_NAK);
+        return -1;
+    }
+
+    return 1;
+}
+
+/* ============================================================
+ *  L4：协议语义
+ * ============================================================ */
+
+/**
+ * @brief 握手：发 'C'，等待首包头字节（SOH 或 STX）
+ * @param first_byte [out]
+ * @return 1=成功, -1=失败
+ */
+static int proto_handshake(uint8_t *first_byte)
+{
+    int retries = HANDSHAKE_RETRIES;
+    while (retries--) {
+        uart_flush();
+        uart_send_byte(PROTO_C);
+        if (uart_recv(first_byte, 1, TIMEOUT_HANDSHAKE) == HAL_OK &&
+            (*first_byte == PROTO_SOH || *first_byte == PROTO_STX))
+            return 1;
+    }
     return -1;
 }
 
-
-
-//接收方发送启动包，启动Xmodem传输，返回接收总字节数，失败返回-1
-int Xmodem_Start_Transfer(uint32_t startadddr)
+/**
+ * @brief 根据首包内容检测协议类型，填充 ctx->protocol / is_ymodem
+ *        调用前 pkt[0..2] 必须已填充（头字节 + 块号 + 反块号）
+ */
+static void detect_protocol(TransferCtx *ctx)
 {
-    uint8_t start_byte = Xmodem_Start_Byte;
-    uint8_t ack = Xmodem_ACK;
-    uint8_t nak = Xmodem_NAK;
-    uint8_t expected = 1;  // Xmodem块号从1开始，255后回绕到0
-    int total_received = 0;
-    uint8_t pkt[133];
-
-    char prev_buf[128];    // 前一个包的数据缓冲（看前一个包策略）
-    int has_prev = 0;      // 是否已缓冲了前一个包
-    int retries;
-    uint8_t tmp;
-
-
-    UART_FlushBuffers(&huart1);  // 确保接收缓冲区干净，避免残留数据干扰握手和后续接收
-
-    // 阶段1：握手，仅负责发送'C'并拿到首包控制字节
-    retries = Xmodem_Handshake(&start_byte, pkt);
-    if(retries < 0)
-    {
-        printf("Failed to start Xmodem transfer.\r\n");
-        return -1;
+    if (ctx->pkt[0] == PROTO_SOH) {
+        ctx->protocol  = PROTO_XMODEM;
+        ctx->is_ymodem = 0;
+    } else if (ctx->pkt[1] == 0x00 && (uint8_t)(ctx->pkt[1] + ctx->pkt[2]) == 0xFF) {
+        /* STX + 块号 0 → Ymodem 文件名包 */
+        ctx->protocol  = PROTO_YMODEM;
+        ctx->is_ymodem = 1;
+    } else {
+        ctx->protocol  = PROTO_XMODEM_1K;
+        ctx->is_ymodem = 0;
     }
 
-    // 收到SOH后，再进入完整包接收阶段
-    if(HAL_UART_Receive(&huart1, &pkt[1], 132, 5000) != HAL_OK)
-    {
-        UART_FlushBuffers(&huart1);
-        HAL_UART_Transmit(&huart1, &nak, 1, 0xFFFF);
-        printf("Timeout waiting for first packet.\r\n");
-        return -1;
-    }
-
-    // 阶段2：循环接收数据包（看前一个包策略：先缓冲，确认不是最后包再写入）
-    while(1)
-    {
-        // 校验块号和补码
-        if(pkt[1] != expected || (uint8_t)(pkt[1] + pkt[2]) != 0xFF)
-        {
-            // 判断是否为重复包（ACK丢失导致发送方重传上一个包）
-            if(pkt[1] == (uint8_t)(expected - 1) && (uint8_t)(pkt[1] + pkt[2]) == 0xFF)
-            {
-                // 补码校验通过，说明确实是上一个包的重传
-                // 不写Flash、不改prev_buf、不递增expected，只补发ACK
-                HAL_UART_Transmit(&huart1, &ack, 1, 0xFFFF);
-            }
-            else
-            {
-                // 真正的校验失败
-                HAL_UART_Transmit(&huart1, &nak, 1, 0xFFFF);
-            }
-        }
-        // CRC校验
-        else if(Xmodem_Crc_Check((char *)pkt, 133) == 0)
-        {
-            HAL_UART_Transmit(&huart1, &nak, 1, 0xFFFF);
-        }
-        else
-        {
-            // 校验通过：先把前一个缓冲包写入Flash（它不是最后包，128字节全是有效数据）
-            if(has_prev)
-            {
-                Write_Buffer_To_Flash(&startadddr, prev_buf);
-                total_received += 128;
-            }
-            // 当前包先缓冲，等确认不是最后包再写
-            memcpy(prev_buf, &pkt[3], 128);
-            has_prev = 1;
-            HAL_UART_Transmit(&huart1, &ack, 1, 0xFFFF);
-            expected++;  // uint8_t自动回绕：255→0
-        }
-
-        // 等待下一个包（含重试机制）
-        memset(pkt, 0, sizeof(pkt));
-        retries = 10;
-        while(retries--)
-        {
-            if(HAL_UART_Receive(&huart1, pkt, 1, 500) != HAL_OK)
-            {
-                UART_FlushBuffers(&huart1);
-                HAL_UART_Transmit(&huart1, &nak, 1, 0xFFFF);
-                continue;
-            }
-
-            if(pkt[0] == Xmodem_EOT)
-            {
-                HAL_UART_Transmit(&huart1, &ack, 1, 0xFFFF);
-                // EOT表示传输结束，当前缓冲的就是最后一个包
-                if(has_prev)
-                {
-                    // 剥离Xmodem填充的0x1A，找到有效数据末尾
-                    int valid_len = 128;
-                    while(valid_len > 0 && (uint8_t)prev_buf[valid_len - 1] == 0x1A)
-                    {
-                        valid_len--;
-                    }
-                    if(valid_len > 0)
-                    {
-                        // 有效数据后的位置补0xFF（Flash擦除状态），凑满128字节对齐写入
-                        memset(&prev_buf[valid_len], 0xFF, 128 - valid_len);
-                        Write_Buffer_To_Flash(&startadddr, prev_buf);
-                        total_received += valid_len;
-                    }
-                }
-
-                // 确保发送方收到ACK：短暂等待，如果收到重发的EOT就再ACK一次
-                
-                if(HAL_UART_Receive(&huart1, &tmp, 1, 1000) == HAL_OK && tmp == Xmodem_EOT)
-                {
-                    HAL_UART_Transmit(&huart1, &ack, 1, 0xFFFF);
-                }
-                
-                printf("Transfer complete, %d bytes written.\r\n", total_received);
-                return total_received;
-            }
-            else if(pkt[0] == Xmodem_CAN)
-            {
-                // 标准要求检测两个连续CAN字节，防止单字节干扰误判取消
-                uint8_t second_byte;
-                if(HAL_UART_Receive(&huart1, &second_byte, 1, 1000) == HAL_OK && second_byte == Xmodem_CAN)
-                {
-                    uint8_t can = Xmodem_CAN;
-                    HAL_UART_Transmit(&huart1, &can, 1, 0xFFFF);
-                    HAL_UART_Transmit(&huart1, &can, 1, 0xFFFF);
-                    printf("Transfer cancelled by sender.\r\n");
-                    return -1;
-                }
-                // 单个CAN可能是线路干扰，忽略继续重试
-                continue;
-            }
-            else if(pkt[0] == Xmodem_SOH)
-            {
-                // 超时500ms：115200baud下132字节约12ms，留足余量
-                if(HAL_UART_Receive(&huart1, &pkt[1], 132, 500) == HAL_OK)
-                    break;  // 收到完整包，回到外层循环处理
-                else
-                {
-                    UART_FlushBuffers(&huart1);
-                    HAL_UART_Transmit(&huart1, &nak, 1, 0xFFFF); // 通知发送方重传
-                }
-            }
-        }
-
-        if(retries < 0)
-        {
-            printf("Timeout waiting for packet.\r\n");
-            return -1;
-        }
-    }
-
+    printf("Protocol detected: %s\r\n",
+           ctx->protocol == PROTO_XMODEM    ? "Xmodem (128B)"    :
+           ctx->protocol == PROTO_XMODEM_1K ? "Xmodem-1K (1024B)" : "Ymodem (1024B)");
 }
 
+/**
+ * @brief 解析 Ymodem 文件名包的数据段
+ *        格式: "filename\0size_decimal\0..."
+ */
+static void parse_ymodem_header(const uint8_t *data, YmodemFileInfo *info)
+{
+    if (!info) return;
+    memset(info, 0, sizeof(*info));
+
+    int n = 0;
+    while (n < 63 && data[n] != '\0')
+        info->filename[n] = (char)data[n++];
+    info->filename[n] = '\0';
+
+    if (n > 0 && data[n] == '\0') {
+        const uint8_t *p = &data[n + 1];
+        uint32_t size = 0;
+        while (*p >= '0' && *p <= '9')
+            size = size * 10 + (*p++ - '0');
+        info->filesize = size;
+    }
+}
+
+/**
+ * @brief 处理 Ymodem 文件名包：校验 → 解析 → ACK+'C' → 等待数据首包
+ *
+ * 成功后 ctx->pkt 已填充第一个数据包，ctx->data_len 已更新，
+ * ctx->expected 重置为 1。
+ *
+ * @return  1 = 成功继续
+ *          0 = 空文件名包（无更多文件），调用方应返回 0
+ *         -1 = 错误，调用方应返回 -1
+ */
+static int ymodem_process_header_pkt(TransferCtx *ctx)
+{
+    if (!pkt_crc_check(ctx->pkt, ctx->data_len)) {
+        uart_send_byte(PROTO_NAK);
+        printf("Ymodem header CRC error.\r\n");
+        return -1;
+    }
+
+    /* 全零数据段 = 无更多文件（Ymodem 多文件结束标志） */
+    int all_zero = 1;
+    for (int i = 3; i < 3 + ctx->data_len; i++) {
+        if (ctx->pkt[i] != 0) { all_zero = 0; break; }
+    }
+    if (all_zero) {
+        uart_send_byte(PROTO_ACK);
+        printf("Ymodem: no more files.\r\n");
+        return 0;
+    }
+
+    parse_ymodem_header(&ctx->pkt[3], ctx->file_info);
+    if (ctx->file_info)
+        printf("Ymodem file: \"%s\", size: %lu bytes\r\n",
+               ctx->file_info->filename,
+               (unsigned long)ctx->file_info->filesize);
+
+    /* ACK 文件名包，再发 'C' 请求数据 */
+    uart_send_byte(PROTO_ACK);
+    uart_send_byte(PROTO_C);
+
+    /* 等待第一个数据包 */
+    if (uart_recv(&ctx->pkt[0], 1, TIMEOUT_HANDSHAKE) != HAL_OK ||
+        (ctx->pkt[0] != PROTO_SOH && ctx->pkt[0] != PROTO_STX)) {
+        printf("Ymodem: timeout waiting for first data packet.\r\n");
+        return -1;
+    }
+    if (!recv_packet_body(ctx->pkt, &ctx->data_len)) {
+        uart_send_byte(PROTO_NAK);
+        return -1;
+    }
+
+    ctx->expected = 1;
+    return 1;
+}
+
+/**
+ * @brief 写回调包装：失败时自动发送 CAN
+ * @return 0=成功, -1=写失败
+ */
+static int write_to_flash(const uint8_t *data, size_t len)
+{
+    if (!s_write_cb) return 0;
+    if (s_write_cb(data, len) != 0) {
+        send_cancel();
+        printf("Flash write error, transfer cancelled.\r\n");
+        return -1;
+    }
+    return 0;
+}
+
+/**
+ * @brief 将前一包缓冲写入 Flash（中间包，非最后包）
+ *        调用后更新 ctx->total_recv
+ * @return 0=成功, -1=写失败
+ */
+static int flush_prev_buf(TransferCtx *ctx)
+{
+    if (!ctx->has_prev) return 0;
+    if (write_to_flash(ctx->prev_buf, (size_t)ctx->prev_len) < 0)
+        return -1;
+    ctx->total_recv += ctx->prev_len;
+    return 0;
+}
+
+/**
+ * @brief 处理最后一包（收到 EOT 时调用）：
+ *        剥离 0x1A 填充 → 精确截断（Ymodem 文件大小）→ 写 Flash
+ * @return 0=成功, -1=写失败
+ */
+static int flush_last_buf(TransferCtx *ctx)
+{
+    if (!ctx->has_prev) return 0;
+
+    int valid = ctx->prev_len;
+
+    if (ctx->file_info && ctx->file_info->filesize > 0) {
+        // Ymodem：精确截断
+        int remaining = (int)ctx->file_info->filesize - ctx->total_recv;
+        if (remaining > 0 && remaining < valid)
+            valid = remaining;
+    } else {
+        // Xmodem/Xmodem-1K：剥离 0x1A
+        while (valid > 0 && (uint8_t)ctx->prev_buf[valid - 1] == 0x1A)
+            valid--;
+    }
+
+    if (valid <= 0) return 0;
+
+    /* 尾部补 0xFF（Flash 擦除态），保持块对齐写入 */
+    memset(&ctx->prev_buf[valid], 0xFF, (size_t)(ctx->prev_len - valid));
+
+    if (write_to_flash(ctx->prev_buf, (size_t)ctx->prev_len) < 0)
+        return -1;
+    ctx->total_recv += valid;
+    return 0;
+}
+
+/**
+ * @brief 处理 EOT：ACK → 写最后一包 → 等待可能的 EOT 重传
+ *                  → Ymodem 额外接收尾包（全零文件名包）
+ * @return 传输总字节数（>=0），失败返回 -1
+ */
+static int handle_eot(TransferCtx *ctx)
+{
+    uart_send_byte(PROTO_ACK);
+
+    if (flush_last_buf(ctx) < 0)
+        return -1;
+
+    /* 等待可能的 EOT 重传并再次确认 */
+    uint8_t tmp;
+    if (uart_recv(&tmp, 1, TIMEOUT_EOT_RETRY) == HAL_OK && tmp == PROTO_EOT)
+        uart_send_byte(PROTO_ACK);
+
+    /* Ymodem：接收结束尾包（全零文件名包） */
+    if (ctx->is_ymodem) {
+        uart_send_byte(PROTO_C);
+
+        int tail_dlen  = 0;
+        int ymodem_ok  = 0;
+        if (uart_recv(&ctx->pkt[0], 1, TIMEOUT_HANDSHAKE) == HAL_OK &&
+            (ctx->pkt[0] == PROTO_SOH || ctx->pkt[0] == PROTO_STX) &&
+            recv_packet_body(ctx->pkt, &tail_dlen) &&
+            pkt_crc_check(ctx->pkt, tail_dlen))
+        {
+            uart_send_byte(PROTO_ACK);
+            ymodem_ok = 1;
+        }
+        if (!ymodem_ok)
+            printf("Warning: Ymodem tail packet not received.\r\n");
+    }
+
+    printf("Transfer complete. Protocol=%s, Written=%d bytes.\r\n",
+           ctx->protocol == PROTO_XMODEM    ? "Xmodem"    :
+           ctx->protocol == PROTO_XMODEM_1K ? "Xmodem-1K" : "Ymodem",
+           ctx->total_recv);
+
+    return ctx->total_recv;
+}
+
+/**
+ * @brief 等待下一帧（首字节），处理 EOT / CAN / 超时重试
+ *
+ * @return  WAIT_FRAME_DATA  (1)  收到完整 SOH/STX 包，可继续处理
+ *          WAIT_FRAME_EOT   (2)  收到 EOT，调用方调用 handle_eot()
+ *          WAIT_FRAME_ERROR (-1) 超时重试耗尽 / 对端取消
+ */
+#define WAIT_FRAME_DATA   1
+#define WAIT_FRAME_EOT    2
+#define WAIT_FRAME_ERROR  (-1)
+
+static int wait_next_frame(TransferCtx *ctx)
+{
+    memset(ctx->pkt, 0, sizeof(ctx->pkt));
+    int retries = PACKET_RETRIES;
+
+    while (retries--) {
+        if (uart_recv(&ctx->pkt[0], 1, TIMEOUT_PACKET) != HAL_OK) {
+            uart_flush();
+            uart_send_byte(PROTO_NAK);
+            continue;
+        }
+
+        switch (ctx->pkt[0]) {
+
+        case PROTO_EOT:
+            return WAIT_FRAME_EOT;
+
+        case PROTO_CAN: {
+            uint8_t second;
+            if (uart_recv(&second, 1, 1000) == HAL_OK && second == PROTO_CAN) {
+                send_cancel();
+                printf("Transfer cancelled by sender.\r\n");
+                return WAIT_FRAME_ERROR;
+            }
+            /* 单个 CAN 视为线路噪声，继续重试 */
+            continue;
+        }
+
+        case PROTO_SOH:
+        case PROTO_STX:
+            if (recv_packet_body(ctx->pkt, &ctx->data_len))
+                return WAIT_FRAME_DATA;
+            uart_send_byte(PROTO_NAK);
+            break;
+
+        default:
+            /* 未知字节，噪声，忽略 */
+            break;
+        }
+    }
+
+    send_cancel();
+    printf("Too many retries, transfer aborted.\r\n");
+    return WAIT_FRAME_ERROR;
+}
+
+/* ============================================================
+ *  L5：公共入口
+ * ============================================================ */
+int Proto_Start_Receive(uint32_t start_addr, YmodemFileInfo *file_info)
+{
+    (void)start_addr;   /* 地址由写回调内部管理 */
+
+    TransferCtx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.expected  = 1;
+    ctx.file_info = file_info;
+
+    /* ── 阶段 1：握手 ──────────────────────────────────────── */
+    uart_flush();
+    if (proto_handshake(&ctx.pkt[0]) < 0) {
+        printf("Handshake failed.\r\n");
+        return -1;
+    }
+
+    /* ── 阶段 2：接收首包包体 ──────────────────────────────── */
+    if (!recv_packet_body(ctx.pkt, &ctx.data_len)) {
+        uart_send_byte(PROTO_NAK);
+        printf("Timeout on first packet body.\r\n");
+        return -1;
+    }
+
+    /* ── 阶段 3：协议检测 ──────────────────────────────────── */
+    detect_protocol(&ctx);
+
+    /* ── 阶段 4：Ymodem 特有——处理文件名首包 ───────────────── */
+    if (ctx.is_ymodem) {
+        int ret = ymodem_process_header_pkt(&ctx);
+        if (ret <= 0) return ret;   /* 0=无更多文件, -1=错误 */
+    }
+
+    /* ── 阶段 5：主循环接收数据包 ──────────────────────────── */
+    while (1) {
+        int vret = validate_packet(&ctx);
+
+        if (vret == 1) {
+            /* 校验通过：写前一包，缓冲当前包 */
+            if (flush_prev_buf(&ctx) < 0)
+                return -1;
+            memcpy(ctx.prev_buf, &ctx.pkt[3], (size_t)ctx.data_len);
+            ctx.prev_len = ctx.data_len;
+            ctx.has_prev = 1;
+            uart_send_byte(PROTO_ACK);
+            ctx.expected++;
+        }
+        /* vret == 0: 重复包，validate_packet 已补发 ACK，直接等下一帧 */
+        /* vret ==-1: 校验失败，validate_packet 已发 NAK，直接等下一帧 */
+
+        /* 等待下一帧 */
+        int fret = wait_next_frame(&ctx);
+        if (fret == WAIT_FRAME_EOT)
+            return handle_eot(&ctx);
+        if (fret == WAIT_FRAME_ERROR)
+            return -1;
+        /* fret == WAIT_FRAME_DATA：ctx.pkt 已填充，继续循环 */
+    }
+}
 

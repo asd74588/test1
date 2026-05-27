@@ -7,6 +7,7 @@
 static uint8_t lfs_read_buffer[LFS_CACHE_SIZE];
 static uint8_t lfs_prog_buffer[LFS_CACHE_SIZE];
 static uint8_t lfs_lookahead_buffer[LFS_LOOKAHEAD_SIZE];
+static uint8_t lfs_file_cache[LFS_FILE_CACHE_SIZE];
 
 // 参考结构，你需要根据实际情况实现函数体
 int my_flash_read(const struct lfs_config *c, lfs_block_t block, 
@@ -32,7 +33,10 @@ int my_flash_sync(const struct lfs_config *c) {
     return 0;
 }
 
-// lfs_port.c
+const struct lfs_file_config lfs_file_cfg = {
+    .buffer = lfs_file_cache,
+};
+
 
 // 定义配置结构体，把回调函数的地址赋给对应的函数指针成员
 const struct lfs_config my_lfs_config = {
