@@ -1,88 +1,73 @@
-#ifndef __OTA_STATE_MACHINE_H
-#define __OTA_STATE_MACHINE_H
+/**
+ * @file    ota_state_machine.h
+ * @brief   A/B双区OTA Bootloader — 表驱动状态机头文件
+ */
 
+#ifndef OTA_STATE_MACHINE_H
+#define OTA_STATE_MACHINE_H
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include <stdint.h>
+
 #include "global.h"
-
-// ========== 基础定义 ==========
+#include "xmodem.h"
+#include "lfs_config.h"
+#include "eeprom_emul.h"
+#include "flash_bootloader.h"
+/* ================================================================
+ * 状态枚举
+ * ================================================================ */
 typedef enum {
-    OTA_STATE_BOOT,
-    OTA_STATE_UPGRADING,
-    OTA_STATE_VERIFYING,
-    OTA_STATE_REVERT,
-    OTA_COUNT
-} State;
+    OTA_STATE_BOOT      = 0U,
+    OTA_STATE_UPGRADING = 1U,
+    OTA_STATE_VERIFYING = 2U,
+    OTA_STATE_REVERT    = 3U,
+    OTA_STATE_SAME      = 0xFFU,  /**< handler返回此值表示不迁移 */
+} ota_state_t;
 
-typedef enum {
-    EV_START,
-    EV_STOP,
-    EV_TICK,
-    EV_ERROR_OCCUR,
-    EV_ERROR_CLEAR,
-    EV_DATA_RECEIVED,
-    EV_TIMEOUT,
-    EV_COUNT
-} Event;
 
-// 事件数据（可携带额外信息）
+/* ================================================================
+ * 类型定义
+ * ================================================================ */
+
+/** 状态机上下文：所有运行时数据集中在此结构体，禁止全局散变量 */
 typedef struct {
-    Event type;
-    void* data;
-    int data_size;
-} EventData;
+    ota_state_t  state;           /**< 当前状态（内存镜像，与EEPROM同步） */
+    uint32_t     active_slot;     /**< 当前活跃分区 SLOT_A / SLOT_B        */
+    uint32_t     target_slot;     /**< 升级目标分区                         */
+    uint8_t      active_valid;    /**< 活跃分区完整性（0=无效，1=有效）      */
+    uint8_t      xmodem_retry;    /**< Xmodem重试计数                       */
+    uint32_t     revert_reason;   /**< 回退原因标志                          */
+
+    /* 业务相关指针，方便handler访问，非必要可删除 */
+    void    *resource_ctx ;        /**< 系统资源相关上下文指针，方便handler访问，非必要可删除 */
+    transfer_cfg_t *transfer_cfg;  /**< 传输回调配置，OTA状态机不关心细节，仅传递给Xmodem */
+
+} ota_ctx_t;
+
+/**
+ * 状态表项：
+ *   guard_fn   — 返回1表示允许进入本状态，返回0跳过
+ *   handler_fn — 执行业务，返回期望迁移到的下一状态
+ *                返回 OTA_STATE_SAME 表示留在当前状态（不做迁移）
+ */
+typedef struct {
+    ota_state_t   state;
+    uint8_t     (*guard_fn)  (const ota_ctx_t *ctx);
+    ota_state_t (*handler_fn)(ota_ctx_t *ctx);
+} ota_state_entry_t;
 
 
 
-// 状态机结构
-typedef struct StateMachine StateMachine;
-// 状态处理函数类型（接收事件）
-typedef void (*StateHandler)(StateMachine* sm, EventData* event);
 
-struct StateMachine {
-    State current_state;
-    State previous_state;
-    StateHandler handler;
-    void* context;
-    
-    // 事件队列（可选）
-    EventData* event_queue;
-    int queue_size;
-    int queue_head;
-    int queue_tail;
-    int queue_capacity;
-};
+/* ================================================================
+ * Xmodem 重试上限
+ * ================================================================ */
+#define XMODEM_MAX_RETRY    3U
 
+/* ================================================================
+ * 公共接口
+ * ================================================================ */
+void ota_run(ota_ctx_t *ctx);      /**< OTA主循环入口，替换main()中的while(1)+switch */
 
-// 状态处理函数声明
-void boot_state_handler(StateMachine* sm, EventData* event);
-void upgeading_state_handler(StateMachine* sm, EventData* event);
-void verifying_state_handler(StateMachine* sm, EventData* event);
-void revert_state_handler(StateMachine* sm, EventData* event);
-
-// 状态函数表
-static const StateHandler state_handlers[OTA_COUNT] = {
-    boot_state_handler,
-    upgeading_state_handler,
-    verifying_state_handler,
-    revert_state_handler
-};
-
-// 状态名称
-static const char* state_names[OTA_COUNT] = {
-    "OTA_STATE_BOOT", "OTA_STATE_UPGRADING",
-    "OTA_STATE_VERIFYING", "OTA_STATE_REVERT"
-};
-
-//事件名称
-static const char* event_names[EV_COUNT] = {
-    "START", "STOP", "TICK", "ERROR_OCCUR", 
-    "ERROR_CLEAR", "DATA_RECEIVED", "TIMEOUT"
-};
-
-
-
-#endif
+#endif /* OTA_STATE_MACHINE_H */
 

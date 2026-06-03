@@ -44,47 +44,29 @@
 /* 无效虚拟地址（擦除态标记） */
 #define EE_ADDR_INVALID     0xFFFFU
 
-/* ======================== 用户虚拟地址 ======================== */
-/* 用户在此定义变量地址，范围 0x0001 ~ 0xFFFE */
 
-/* OTA 状态机 — 驱动整个 Bootloader 流程，一个变量搞定 */
-#define EE_VAR_OTA_STATE            0x0001U
+/* ================================================================
+ * 分区定义
+ * ================================================================ */
+#define SLOT_A              0x00000001U
+#define SLOT_B              0x00000002U
+#define OPPOSITE_SLOT(s)    (((s) == SLOT_A) ? SLOT_B : SLOT_A)
+#define SLOT_NAME(s)        (((s) == SLOT_B) ? "B" : "A")
 
-enum ota_state_t
-{ 
-    OTA_STATE_BOOT = 0,       // 正常启动：检查分区完整性，降级回退，等待升级指令，跳转APP
-    OTA_STATE_UPGRADING,      // 升级中：Bootloader等待Xmodem接收固件
-    OTA_STATE_VERIFYING,      // 校验中：新固件已写入，校验通过则切换分区，失败则回退
-    OTA_STATE_REVERT      // 回退中：Bootloader等待Xmodem接收回退固件
-};
+/* ================================================================
+ * EEPROM 变量索引（根据实际EE_VAR定义调整）
+ * ================================================================ */
+#define EE_VAR_OTA_STATE    0U
+#define EE_VAR_ACTIVE_SLOT  1U
+#define EE_VAR_TARGET_SLOT  2U
+#define EE_VAR_REVERT_REASON 3U
 
-/* 当前活跃分区 — 决定Bootloader跳转哪个分区 */
-#define EE_VAR_ACTIVE_SLOT          0x0002U
-
-/* 升级目标分区 — 记录正在往哪个分区写（掉电恢复用，= !ACTIVE_SLOT） */
-#define EE_VAR_TARGET_SLOT          0x0003U
-
-enum slot_t
-{
-    SLOT_A,             // 0:A分区
-    SLOT_B,             // 1:B分区
-    SLOT_COUNT,
-};
-
-/* 固件大小（字节）— 由App端在请求升级时写入，用于完整性校验 */
-#define EE_VAR_FIRMWARE_SIZE        0x0004U
-
-/* 回退原因 — 进入REVERT前写入，REVERT内零Flash校验 */
-#define EE_VAR_REVERT_REASON        0x0005U
-
-enum revert_reason_t
-{
-    REVERT_ACTIVE_VALID,// 升级回退：active有效，直接回退到active
-    REVERT_OTHER_VALID,// 启动降级：active无效，other有效，切分区
-    REVERT_BOTH_INVALID, // 两分区都无效，进UPGRADING
-
-};
-
+/* ================================================================
+ * 回退原因标志
+ * ================================================================ */
+#define REVERT_ACTIVE_VALID   0x00000001U  /**< 升级回退，active有效   */
+#define REVERT_OTHER_VALID    0x00000002U  /**< 启动降级，other有效    */
+#define REVERT_BOTH_INVALID   0x00000003U  /**< 双区均无效             */
 
 /* ======================== 函数声明 ======================== */
 

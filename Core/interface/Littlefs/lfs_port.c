@@ -9,6 +9,8 @@ static uint8_t lfs_prog_buffer[LFS_CACHE_SIZE];
 static uint8_t lfs_lookahead_buffer[LFS_LOOKAHEAD_SIZE];
 static uint8_t lfs_file_cache[LFS_FILE_CACHE_SIZE];
 
+extern spinor_info_t          spinor;
+
 // 参考结构，你需要根据实际情况实现函数体
 int my_flash_read(const struct lfs_config *c, lfs_block_t block, 
                   lfs_off_t off, void *buffer, lfs_size_t size) {

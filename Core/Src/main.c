@@ -35,6 +35,10 @@
 #include "xmodem.h"
 #include "../interface/Littlefs/lfs.h"
 #include "lfs_config.h"
+#include "ota_state_machine.h"
+#include "data_storage.h"
+#include "fs_cmd.h"
+#include "shell.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -44,7 +48,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define XMODEM_MAX_RETRY  3
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -66,35 +70,151 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-  lfs_t lfs;  
-  lfs_file_t file;
+
+#define PATH "a.elf"
+extern const struct lfs_config my_lfs_config;
+extern const struct lfs_file_config lfs_file_cfg;
+extern spinor_info_t          spinor;
 
 
-int Write_Buffer_To_NorFlash(const char *buf, size_t len)
+
+
+uint8_t lfs_init(lfs_ctx_t *lfs_ctx)
 {
-    lfs_file_write(&lfs, &file, (const void *)buf, (lfs_size_t)len);
-    //lfs_file_sync(&lfs, &file);
+  if( lfs_ctx == NULL )
+    return 1;
 
-    return 0;
+  if( spinor_init(&spinor) < 0 )
+    return 1;
+
+  int mount_err;
+  int file_err;
+
+
+  mount_err = lfs_mount(&lfs_ctx->lfs, &my_lfs_config);
+  dbg_printf("lfs_mount: %d\r\n", mount_err);
+  
+  if (mount_err) 
+  {
+    lfs_format(&lfs_ctx->lfs, &my_lfs_config);
+    mount_err = lfs_mount(&lfs_ctx->lfs, &my_lfs_config);
+    dbg_printf("LittleFS formatted and mounted,err: %d\r\n", mount_err);
+  }
+
+  if (mount_err != 0) 
+  {
+    return 1;
+  }
+
+  /*到这里的话文件系统肯定挂载上了*/
+  lfs_ctx->mounted = 1;
+
+  file_err = lfs_file_opencfg(&lfs_ctx->lfs, &lfs_ctx->file, PATH, LFS_O_WRONLY | LFS_O_CREAT, &lfs_file_cfg);
+  dbg_printf("lfs_file_open(write): %d\r\n", file_err);
+
+  if (file_err != 0) 
+  {
+    return 1;
+  }
+
+  /*到这里的话文件句柄已经打开*/
+  lfs_ctx->file_open = 1;
+
+  return 0;
 }
-uint32_t crc32_update(uint32_t crc, uint8_t *data, uint32_t len)
-{
-    for(uint32_t i = 0; i < len; i++)
-    {
-        crc ^= data[i];
 
-        for(uint32_t j = 0; j < 8; j++)
-        {
-            if(crc & 1)
-                crc = (crc >> 1) ^ 0xEDB88320;
-            else
-                crc >>= 1;
+/* --- Ymodem (rz/sz) ----------------------------------------------- */
+int  ymodem_receive(void)          /* rz：从串口接收文件存入 FS */
+{
+  return 0;
+}
+
+int  ymodem_send(const char *path) /* sz：从 FS 发送文件      */
+{
+  return 0;
+}
+
+/* --- 设备信息 ------------------------------------------------------ */
+const char *sys_get_version(void)   /* 返回版本字符串            */
+{
+  return "1.0.0"; /* 示例版本 */
+}
+
+uint32_t    sys_get_sn     (void)   /* 返回设备序列号            */
+{
+  return 0x12345678; /* 示例序列号 */
+}
+
+/* --- 无线配置 ------------------------------------------------------ */
+int  wifi_set_ssid(int argc, char *argv[])
+{
+  return 0;
+}
+
+int  wifi_set_pass(int argc, char *argv[])
+{
+  return 0;
+}
+
+int  wifi_connect (int argc, char *argv[])
+{
+  return 0;
+}
+
+int  wifi_status  (int argc, char *argv[])
+{
+  return 0;
+}
+
+/* --- OTA ---------------------------------------------------------- */
+int  ota_start(int argc, char *argv[])     /* 传入 URL 或文件路径       */
+{
+  return 0;
+}
+int  ota_status(int argc, char *argv[])    /* 查询 OTA 状态             */
+{
+  uint32_t flag = Read_Flag(EE_VAR_OTA_STATE);
+  printf("OTA State: %u\r\n", flag);
+  return 0;
+}
+
+#define SIZEOF(arr) (sizeof(arr) / sizeof((arr)[0]))
+#define RX_BUF_SIZE 256
+
+static volatile uint8_t  rx_buf[RX_BUF_SIZE];
+static volatile uint16_t rx_head = 0;
+static volatile uint16_t rx_tail = 0;
+
+static uint8_t rx_byte;   /* HAL 中断写入目标，必须全局/static */
+
+/* 中断回调：收到字符存入环形缓冲区 */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1) {
+        uint16_t next = (rx_head + 1) % RX_BUF_SIZE;
+        if (next != rx_tail) {          /* 缓冲未满才写入 */
+            rx_buf[rx_head] = rx_byte;
+            rx_head = next;
         }
+        HAL_UART_Receive_IT(&huart1, &rx_byte, 1);  /* 重新挂起 */
     }
-
-    return crc;
 }
 
+// 底层完全由用户控制，Shell 不知道是 UART 还是别的
+static void my_putc(char c) {
+    HAL_UART_Transmit(&huart3, (uint8_t*)&c, 1, 10);
+}
+
+static char my_getc(void) {
+    // 从环形缓冲区阻塞读取（shell_rx_feed 在中断里喂）
+    while (rx_head == rx_tail);
+    char c = rx_buf[rx_tail];
+    rx_tail = (rx_tail + 1) % RX_BUF_SIZE;
+    return c;
+}
+
+
+lfs_ctx_t lfs_ctx;
 /* USER CODE END 0 */
 
 /**
@@ -132,36 +252,103 @@ int main(void)
   MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
   EE_Init();
-  Proto_Register_Write_Callback(Write_Buffer_To_NorFlash);
 
-  extern const struct lfs_config my_lfs_config;
-  extern const struct lfs_file_config lfs_file_cfg;
+  ota_ctx_t ctx;
+  
+  transfer_cfg_t transfer_cfg;
+  shell_config_t shell_cfg;
 
-  if( spinor_init(&spinor) < 0 )
-    return 1;
 
-  int err = lfs_mount(&lfs, &my_lfs_config);
-  printf("lfs_mount: %d\r\n", err);
-  if (err) {
-    printf("LittleFS init failed, stop here.\r\n");
-    return 1;
+
+
+
+  static const shell_cmd_t my_cmds[] = {
+    { "ls",      "list files",        fs_cmd_ls      },
+    { "cat",     "print file",        fs_cmd_cat     },
+    { "write",   "write to file",     fs_cmd_write   },
+    { "rm",      "remove file",       fs_cmd_rm      },
+    { "mkdir",   "make directory",    fs_cmd_mkdir   },
+    { "free",    "show fs usage",     fs_cmd_free    },
+    { "wifi",    "wifi config",       wifi_set_ssid  },
+    { "ota",     "OTA upgrade",       ota_start      },
+    { "version", "show version",      ota_status     },
+    { "sn",      "show serial no",    ota_status     },
+  };
+
+  memset(&transfer_cfg, 0, sizeof(transfer_cfg_t));
+  memset(&lfs_ctx, 0, sizeof(lfs_ctx_t));
+  memset(&ctx, 0, sizeof(ota_ctx_t));
+  memset(&shell_cfg, 0, sizeof(shell_config_t));
+
+  /* 传输配置初始化：写回调指向 LittleFS，写上下文为 lfs_ctx */
+  transfer_cfg.write_cb = (storage_callback_t)lfs_storage_callback;                 // 选择存储后端的回调函数
+  transfer_cfg.write_user_ctx = (void *)&lfs_ctx;              // ctx透传给回调，Xmodem 只做中转
+
+  /* 接收入口：receive_cb 指向 Proto_Start_Receive，recv_user_ctx 传入 transfer_cfg 本身 */
+  transfer_cfg.receive_cb = (receive_callback_t)Proto_Start_Receive;                 // 协议层接收入口
+  transfer_cfg.recv_user_ctx = (void *)&transfer_cfg;              // 第一个参数会被传给 Proto_Start_Receive
+
+  /* 业务相关指针引用 */
+  ctx.transfer_cfg = &transfer_cfg;                         // 传输配置放入 ctx，方便 handler 访问
+  ctx.resource_ctx  = &lfs_ctx;
+
+
+  /*Shell 配置*/
+  shell_cfg.putc = (void (*)(char))my_putc;  // 简单适配，直接调用 my_putc 发送一个字节
+  shell_cfg.getc = (char (*)(void))my_getc;   // 简单适配，直接调用 my_getc 接收一个字节（阻塞）
+  shell_cfg.commands = my_cmds;                    // 命令表，定义在 fs
+  shell_cfg.cmd_count = SIZEOF(my_cmds);           // 命令数量
+  shell_cfg.prompt = "> ";                         // 提示符
+  shell_cfg.history_size = 8;                      // 历史记录条数
+
+  lfs_init(&lfs_ctx);
+
+  fs_cmd_init(&lfs_ctx); // 注入文件系统上下文，供 fs_cmd 使用
+  
+
+  while(HAL_UART_Receive(&huart1, &rx_byte, 1, 5000) == HAL_OK)
+  {
+    if(rx_byte == 's' || rx_byte == 'S')
+    {
+        HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
+        shell_init(&shell_cfg);
+        shell_run();
+        break;
+    }
+    if(rx_byte == 'f' || rx_byte == 'F')
+    {
+        if (lfs_ctx.mounted) {
+            lfs_unmount(&lfs_ctx.lfs);
+        }
+        int fmt_err = lfs_format(&lfs_ctx.lfs, &my_lfs_config);
+        dbg_printf("lfs_format: %d\r\n", fmt_err);
+        if (fmt_err == 0) {
+            int mount_err = lfs_mount(&lfs_ctx.lfs, &my_lfs_config);
+            dbg_printf("lfs_mount after format: %d\r\n", mount_err);
+        }
+        break;
+    }
   }
 
+  HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
+  shell_init(&shell_cfg);
+  ota_run(&ctx);
+
   // uint8_t rx_byte = 0;
-  // printf("Press 'f' or 'F' to format external flash...\r\n");
+  // dbg_printf("Press 'f' or 'F' to format external flash...\r\n");
 
   
   // if (HAL_UART_Receive(&huart1, &rx_byte, 1, 5000) == HAL_OK) {
   //     if (rx_byte == 'f' || rx_byte == 'F') {
   //       if (err == 0) {
-  //         lfs_unmount(&lfs);
+  //         lfs_unmount(&lfs_ctx.lfs);
   //       }
 
-  //       int fmt_err = lfs_format(&lfs, &my_lfs_config);
-  //       printf("lfs_format: %d\r\n", fmt_err);
+  //       int fmt_err = lfs_format(&lfs_ctx.lfs, &my_lfs_config);
+  //       dbg_printf("lfs_format: %d\r\n", fmt_err);
   //       if (fmt_err == 0) {
-  //         err = lfs_mount(&lfs, &my_lfs_config);
-  //        printf("lfs_mount after format: %d\r\n", err);
+  //         err = lfs_mount(&lfs_ctx.lfs, &my_lfs_config);
+  //        dbg_printf("lfs_mount after format: %d\r\n", err);
   //      }  
   //   }
   // }
@@ -172,34 +359,29 @@ int main(void)
 
   // static uint8_t file_buffer[512];
   
-  // int file_err = lfs_file_opencfg(&lfs, &file, "a.elf", LFS_O_WRONLY | LFS_O_CREAT, &lfs_file_cfg);
-  // printf("lfs_file_open(write): %d\r\n", file_err);
 
-  // if (file_err != 0) {
-  //   lfs_file_close(&lfs, &file);
-  // }
 
   // int rv = Proto_Start_Receive(APP_B_START_ADDR, NULL);
   // if(rv > 0)
   // {
-  //   printf("Xmodem transfer complete, %d bytes received.\r\n", rv);
+  //   dbg_printf("Xmodem transfer complete, %d bytes received.\r\n", rv);
   // }
   // else
   // {
-  //   printf("Xmodem transfer failed.\r\n");
+  //   dbg_printf("Xmodem transfer failed.\r\n");
   // }
   
 
 // uint32_t crc = 0xFFFFFFFF;
 // crc = crc32_update(crc, test, 9);
 // crc ^= 0xFFFFFFFF;
-// printf("CRC32 = 0x%08X\r\n", crc);
+// dbg_printf("CRC32 = 0x%08X\r\n", crc);
 
   // uint8_t buf[16];
-  // lfs_file_seek(&lfs, &file, 0, LFS_SEEK_SET);
-  // lfs_file_read(&lfs, &file, buf, 16);
+  // lfs_file_seek(&lfs_ctx.lfs, &lfs_ctx.file, 0, LFS_SEEK_SET);
+  // lfs_file_read(&lfs_ctx.lfs, &lfs_ctx.file, buf, 16);
   // for(int i = 0; i < 16; i++) {
-  //     printf("%02X ", buf[i]);
+  //     dbg_printf("%02X ", buf[i]);
   // }
 
   // 使用串口接收时记录的真实大小，而不是lfs_file_size
@@ -210,292 +392,24 @@ int main(void)
 
   // while (remaining > 0) {
   //     int to_read = (remaining > sizeof(buf)) ? sizeof(buf) : remaining;
-  //     int read_len = lfs_file_read(&lfs, &file, buf, to_read);
+  //     int read_len = lfs_file_read(&lfs_ctx.lfs, &lfs_ctx.file, buf, to_read);
   //     if (read_len <= 0) break;
   //     crc = crc32_update(crc, buf, read_len);
   //     remaining -= read_len;
   // }
 
   // crc ^= 0xFFFFFFFF;
-  // printf("File CRC32: 0x%08X\r\n", crc);
+  // dbg_printf("File CRC32: 0x%08X\r\n", crc);
 
   // // 同时打印文件实际大小
-  // lfs_file_seek(&lfs, &file, 0, LFS_SEEK_END);
-  // int32_t size = lfs_file_tell(&lfs, &file);
-  // printf("LFS file size: %d\r\n", size);
+  // lfs_file_seek(&lfs_ctx.lfs, &lfs_ctx.file, 0, LFS_SEEK_END);
+  // int32_t size = lfs_file_tell(&lfs_ctx.lfs, &lfs_ctx.file);
+  // dbg_printf("LFS file size: %d\r\n", size);
 
-
-  // lfs_file_close(&lfs, &file);
-
+  // lfs_file_close(&lfs_ctx.lfs, &lfs_ctx.file);
 
   return 0;
-  /* 在 EE_Init() 后统一声明将要使用的局部变量（避免在循环/块中间再声明） */
-  // uint32_t ota_state = 0;
-  // uint32_t active_slot = 0;
-  // uint32_t app_addr = 0;
-  // uint8_t rx_byte = 0;
-  // uint32_t start_tick = 0;
-  // uint32_t other_slot = 0;
-  // uint32_t other_addr = 0;
-  // uint32_t target_slot = 0;
-  // uint32_t write_addr = 0;
-  // uint32_t active_addr = 0;
-  // uint8_t active_valid = 0;
-  // uint8_t xmodem_retry = 0;
-  // int received = 0;
-  // uint32_t first_word = 0;
-  // uint32_t new_addr = 0;
-  // uint32_t old_active = 0;
-  // uint32_t reason = 0;
-
-  // /* ========== A/B双区OTA Bootloader 状态机 ========== */
-  // ota_state = Read_Flag(EE_VAR_OTA_STATE);
-  // active_slot = Read_Flag(EE_VAR_ACTIVE_SLOT);
-
-  // /* 首次上电EEPROM无数据时，EE_Read返回失败，Read_Flag返回0xFFFFFFFF */
-  // if (active_slot != SLOT_A && active_slot != SLOT_B)
-  // {
-  //   active_slot = SLOT_A;
-  //   Write_Flag(EE_VAR_ACTIVE_SLOT, SLOT_A);
-  //   Write_Flag(EE_VAR_OTA_STATE, OTA_STATE_BOOT);
-  //   ota_state = OTA_STATE_BOOT;
-  // }
-
-
-
-
-  /*
-   * 状态流转：
-   *   BOOT ──(升级触发)──→ UPGRADING ──(接收成功)──→ VERIFYING
-   *     ↑ ↑                                       │
-   *     │ │                                (校验通过)→ 切分区，跳转
-   *     │ │                                (校验失败)→ REVERT ←─┐
-   *     │ │                                        ↑            │
-   *     │ └────────────────────────────────────────┘   (升级回退)
-   *     └───(活跃分区无效)──→ REVERT (启动降级)
-   */
   /* USER CODE END 2 */
-
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
-  // while (1)
-  // {
-  //   switch (ota_state)
-  //   {
-  //     case OTA_STATE_BOOT:
-  //     {
-  //       app_addr = (active_slot == SLOT_B) ? APP_B_START_ADDR : APP_A_START_ADDR;
-
-  //       /* 当前活跃分区无效，转REVERT处理降级启动 */
-  //       if (Verify_APP_Integrity_Flash(app_addr) == 0)
-  //       {
-  //         printf("Slot %s invalid, entering revert for fallback.\r\n",
-  //                (active_slot == SLOT_B) ? "B" : "A");
-  //         /* 预检查另一分区，设置回退原因，REVERT内零Flash校验 */
-  //         other_slot = (active_slot == SLOT_A) ? SLOT_B : SLOT_A;
-  //         other_addr = (other_slot == SLOT_B) ? APP_B_START_ADDR : APP_A_START_ADDR;
-  //         if (Verify_APP_Integrity_Flash(other_addr) != 0)
-  //         {
-  //           Write_Flag(EE_VAR_REVERT_REASON, REVERT_OTHER_VALID);
-  //         }
-  //         else
-  //         {
-  //           Write_Flag(EE_VAR_REVERT_REASON, REVERT_BOTH_INVALID);
-  //         }
-  //         ota_state = OTA_STATE_REVERT;
-  //         Write_Flag(EE_VAR_OTA_STATE, OTA_STATE_REVERT);
-  //         continue;
-  //       }
-
-  //       /* APP有效：3秒等待窗口，收到'U'进升级，否则跳转 */
-  //       printf("Press 'U' within 3s to enter upgrade mode...\r\n");
-  //       start_tick = HAL_GetTick();
-  //       while ((HAL_GetTick() - start_tick) < 3000U)
-  //       {
-  //         if (HAL_UART_Receive(&huart1, &rx_byte, 1, 100) == HAL_OK)
-  //         {
-  //           if (rx_byte == 'U' || rx_byte == 'u')
-  //           {
-  //             printf("Upgrade mode triggered.\r\n");
-  //             ota_state = OTA_STATE_UPGRADING;
-  //             Write_Flag(EE_VAR_OTA_STATE, OTA_STATE_UPGRADING);
-  //             Write_Flag(EE_VAR_TARGET_SLOT, (active_slot == SLOT_A) ? SLOT_B : SLOT_A);
-  //             break;
-  //           }
-  //         }
-  //       }
-
-  //       if (ota_state == OTA_STATE_UPGRADING)
-  //       {
-  //         continue;  /* 状态已变，重新走switch */
-  //       }
-
-  //       /* 超时无升级请求，跳转APP */
-  //       Jump_To_App_Flash(app_addr);
-
-  //     }
-
-  //     case OTA_STATE_UPGRADING:
-  //     {
-  //       target_slot = Read_Flag(EE_VAR_TARGET_SLOT);
-  //       /* 防御：target非法或等于active时，强制修正为active的对侧 */
-  //       if (target_slot != SLOT_A && target_slot != SLOT_B)
-  //       {
-  //         target_slot = SLOT_B;
-  //         Write_Flag(EE_VAR_TARGET_SLOT, target_slot);
-  //       }
-  //       else if (target_slot == active_slot && reason != REVERT_BOTH_INVALID)
-  //       {
-  //         target_slot = (active_slot == SLOT_A) ? SLOT_B : SLOT_A;
-  //         Write_Flag(EE_VAR_TARGET_SLOT, target_slot);
-  //       }
-
-  //       write_addr = (target_slot == SLOT_B) ? APP_B_START_ADDR : APP_A_START_ADDR;
-  //       active_addr = (active_slot == SLOT_B) ? APP_B_START_ADDR : APP_A_START_ADDR;
-
-  //       /* 一次性校验活跃分区有效性，存入RAM标志，避免每次重试都校验 */
-  //       active_valid = (Verify_APP_Integrity_Flash(active_addr) != 0) ? 1 : 0;
-
-  //       printf("OTA upgrading to slot %s, addr 0x%08lX (active %s %s)\r\n",
-  //              (target_slot == SLOT_B) ? "B" : "A", write_addr,
-  //              (active_slot == SLOT_B) ? "B" : "A",
-  //              active_valid ? "valid" : "invalid");
-
-  //       xmodem_retry = 0;
-
-  //       Erase_App_Flash(target_slot);
-
-  //       while (1)
-  //       {
-  //         received = Xmodem_Start_Transfer(write_addr);
-
-  //         if (received > 0)
-  //         {
-  //           printf("OTA received %d bytes, verifying...\r\n", received);
-  //           ota_state = OTA_STATE_VERIFYING;
-  //           Write_Flag(EE_VAR_OTA_STATE, OTA_STATE_VERIFYING);
-  //           break;
-  //         }
-
-  //         xmodem_retry++;
-  //         if (active_valid)
-  //         {
-  //           /* 活跃分区有效：达到重试上限后退回BOOT，避免无限困在升级模式 */
-  //           printf("OTA receive failed, retry %d/%d\r\n", xmodem_retry, XMODEM_MAX_RETRY);
-  //           if (xmodem_retry >= XMODEM_MAX_RETRY)
-  //           {
-  //             printf("Max retry reached, active slot valid, falling back to BOOT.\r\n");
-  //             ota_state = OTA_STATE_BOOT;
-  //             Write_Flag(EE_VAR_OTA_STATE, OTA_STATE_BOOT);
-  //             break;
-  //           }
-  //         }
-  //         else
-  //         {
-  //           /* 活跃分区无效：必须留在升级模式等待固件，但避免无意义擦除 */
-  //           printf("OTA receive failed, active slot invalid, staying in UPGRADING.\r\n");
-  //           /* 检测目标分区是否有部分写入：首字非0xFF说明有残留数据，需重新擦除 */
-  //           first_word = *(volatile uint32_t *)write_addr;
-  //           if (first_word != 0xFFFFFFFFU)
-  //           {
-  //             printf("Partial write detected, re-erasing slot %s\r\n",
-  //                    (target_slot == SLOT_B) ? "B" : "A");
-  //             Erase_App_Flash(target_slot);
-  //           }
-  //           else
-  //           {
-  //             printf("No data written, retrying without erase.\r\n");
-  //           }
-  //           xmodem_retry = 0;  /* 无有效分区时不计次，持续等待 */
-  //         }
-  //       }
-
-  //       continue;
-  //     }
-     
-  //     case OTA_STATE_VERIFYING:
-  //     {
-  //       target_slot = Read_Flag(EE_VAR_TARGET_SLOT);
-  //       if (target_slot != SLOT_A && target_slot != SLOT_B)
-  //       {
-  //         target_slot = (active_slot == SLOT_A) ? SLOT_B : SLOT_A;
-  //       }
-  //       new_addr = (target_slot == SLOT_B) ? APP_B_START_ADDR : APP_A_START_ADDR;
-
-  //       /* 校验新写入的分区 */
-  //       if (Verify_APP_Integrity_Flash(new_addr) != 0)
-  //       {
-  //         /* 校验通过：先保存旧active，再切活跃分区，跳转新分区 */
-  //         old_active = active_slot;
-  //         active_slot = target_slot;
-  //         Write_Flag(EE_VAR_ACTIVE_SLOT, target_slot);
-  //         Write_Flag(EE_VAR_OTA_STATE, OTA_STATE_BOOT);
-
-  //         printf("OTA success, jumping to slot %s\r\n",
-  //                (target_slot == SLOT_B) ? "B" : "A");
-  //         Jump_To_App_Flash(new_addr);
-
-  //       }
-
-  //       /* 校验失败 → 升级回退 */
-  //       printf("Slot %s verification failed, rolling back.\r\n",
-  //              (target_slot == SLOT_B) ? "B" : "A");
-  //       Write_Flag(EE_VAR_REVERT_REASON, REVERT_ACTIVE_VALID);
-  //       ota_state = OTA_STATE_REVERT;
-  //       Write_Flag(EE_VAR_OTA_STATE, OTA_STATE_REVERT);
-  //       continue;
-  //     }
-
-  //     case OTA_STATE_REVERT:
-  //     {
-  //       reason = Read_Flag(EE_VAR_REVERT_REASON);
-
-  //       /*
-  //        * REVERT纯标志驱动，零Flash校验（进入前已预写原因）：
-  //        *   - REVERT_ACTIVE_VALID：升级回退，active有效，直接回BOOT
-  //        *   - REVERT_OTHER_VALID：启动降级，other有效，切分区回BOOT
-  //        *   - REVERT_BOTH_INVALID：两分区都无效，进UPGRADING
-  //        */
-  //       if (reason == REVERT_ACTIVE_VALID)
-  //       {
-  //         printf("Upgrade revert: active slot %s valid, returning to BOOT.\r\n",
-  //                (active_slot == SLOT_B) ? "B" : "A");
-  //         ota_state = OTA_STATE_BOOT;
-  //         Write_Flag(EE_VAR_OTA_STATE, OTA_STATE_BOOT);
-  //         continue;
-  //       }
-  //       else if (reason == REVERT_OTHER_VALID)
-  //       {
-  //         other_slot = (active_slot == SLOT_A) ? SLOT_B : SLOT_A;
-  //         printf("Boot fallback: switching from slot %s to slot %s.\r\n",
-  //                (active_slot == SLOT_B) ? "B" : "A",
-  //                (other_slot == SLOT_B) ? "B" : "A");
-  //         active_slot = other_slot;
-  //         Write_Flag(EE_VAR_ACTIVE_SLOT, other_slot);
-  //         Write_Flag(EE_VAR_TARGET_SLOT, other_slot == SLOT_A ? SLOT_B : SLOT_A);
-  //         ota_state = OTA_STATE_BOOT;
-  //         Write_Flag(EE_VAR_OTA_STATE, OTA_STATE_BOOT);
-  //         continue;
-  //       }
-  //       else
-  //       {
-  //         /* REVERT_BOTH_INVALID 或异常值：两分区都无效，进升级模式 */
-  //         printf("No valid app in any slot, entering upgrade mode.\r\n");
-  //         ota_state = OTA_STATE_UPGRADING;
-  //         Write_Flag(EE_VAR_OTA_STATE, OTA_STATE_UPGRADING);
-  //         Write_Flag(EE_VAR_TARGET_SLOT, SLOT_B);
-  //         continue;
-  //       }
-  //     }
-
-  //     default:
-  //     {
-  //       /* 异常状态，重置为BOOT */
-  //       ota_state = OTA_STATE_BOOT;
-  //       Write_Flag(EE_VAR_OTA_STATE, OTA_STATE_BOOT);
-  //       continue;
-  //     }
-  //   }
   //   /* USER CODE END WHILE */
 
   //   /* USER CODE BEGIN 3 */
@@ -593,7 +507,7 @@ void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */
   /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+     ex: dbg_printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */

@@ -1,5 +1,5 @@
 #include "uart_bootloader.h"
-
+#include "shell.h"
 void Init_Uart()
 {
    
@@ -37,6 +37,9 @@ void UART_FlushBuffers(UART_HandleTypeDef *huart)
     __HAL_UART_FLUSH_DRREGISTER(huart);
 
 }
+
+
+
 
 // void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 // {

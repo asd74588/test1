@@ -49,17 +49,10 @@ typedef struct {
 
     int         total_recv;         /* 累计有效字节数 */
     YmodemFileInfo *file_info;      /* 外部传入，Ymodem 文件信息输出 */
+
+
+    transfer_cfg_t *transfer_cfg;       /* 外部传入，数据存储回调配置 */
 } TransferCtx;
-
-/* ============================================================
- *  模块级回调
- * ============================================================ */
-static Write_Flash_Callback s_write_cb = NULL;
-
-void Proto_Register_Write_Callback(Write_Flash_Callback cb)
-{
-    s_write_cb = cb;
-}
 
 /* ============================================================
  *  L1：UART 原语
@@ -220,7 +213,7 @@ static void detect_protocol(TransferCtx *ctx)
         ctx->is_ymodem = 0;
     }
 
-    printf("Protocol detected: %s\r\n",
+    dbg_printf("Protocol detected: %s\r\n",
            ctx->protocol == PROTO_XMODEM    ? "Xmodem (128B)"    :
            ctx->protocol == PROTO_XMODEM_1K ? "Xmodem-1K (1024B)" : "Ymodem (1024B)");
 }
@@ -262,7 +255,7 @@ static int ymodem_process_header_pkt(TransferCtx *ctx)
 {
     if (!pkt_crc_check(ctx->pkt, ctx->data_len)) {
         uart_send_byte(PROTO_NAK);
-        printf("Ymodem header CRC error.\r\n");
+        dbg_printf("Ymodem header CRC error.\r\n");
         return -1;
     }
 
@@ -273,13 +266,13 @@ static int ymodem_process_header_pkt(TransferCtx *ctx)
     }
     if (all_zero) {
         uart_send_byte(PROTO_ACK);
-        printf("Ymodem: no more files.\r\n");
+        dbg_printf("Ymodem: no more files.\r\n");
         return 0;
     }
 
     parse_ymodem_header(&ctx->pkt[3], ctx->file_info);
     if (ctx->file_info)
-        printf("Ymodem file: \"%s\", size: %lu bytes\r\n",
+        dbg_printf("Ymodem file: \"%s\", size: %lu bytes\r\n",
                ctx->file_info->filename,
                (unsigned long)ctx->file_info->filesize);
 
@@ -290,7 +283,7 @@ static int ymodem_process_header_pkt(TransferCtx *ctx)
     /* 等待第一个数据包 */
     if (uart_recv(&ctx->pkt[0], 1, TIMEOUT_HANDSHAKE) != HAL_OK ||
         (ctx->pkt[0] != PROTO_SOH && ctx->pkt[0] != PROTO_STX)) {
-        printf("Ymodem: timeout waiting for first data packet.\r\n");
+        dbg_printf("Ymodem: timeout waiting for first data packet.\r\n");
         return -1;
     }
     if (!recv_packet_body(ctx->pkt, &ctx->data_len)) {
@@ -306,12 +299,15 @@ static int ymodem_process_header_pkt(TransferCtx *ctx)
  * @brief 写回调包装：失败时自动发送 CAN
  * @return 0=成功, -1=写失败
  */
-static int write_to_flash(const uint8_t *data, size_t len)
+static int write_to_storage(transfer_cfg_t *transfer_cfg, const uint8_t *data, size_t len)
 {
-    if (!s_write_cb) return 0;
-    if (s_write_cb(data, len) != 0) {
+    dbg_printf("write_to_storage\r\n");
+    if (!transfer_cfg->write_cb) return 0;
+
+    dbg_printf("write_to_storage\r\n");
+    if (transfer_cfg->write_cb((const void *)data, len, transfer_cfg->write_user_ctx) != 0) {
         send_cancel();
-        printf("Flash write error, transfer cancelled.\r\n");
+        dbg_printf("Flash write error, transfer cancelled.\r\n");
         return -1;
     }
     return 0;
@@ -324,8 +320,11 @@ static int write_to_flash(const uint8_t *data, size_t len)
  */
 static int flush_prev_buf(TransferCtx *ctx)
 {
+    dbg_printf("flush_prev_buf\r\n");
     if (!ctx->has_prev) return 0;
-    if (write_to_flash(ctx->prev_buf, (size_t)ctx->prev_len) < 0)
+
+    dbg_printf("flush_prev_buf\r\n");
+    if (write_to_storage(ctx->transfer_cfg, ctx->prev_buf, (size_t)ctx->prev_len) < 0)
         return -1;
     ctx->total_recv += ctx->prev_len;
     return 0;
@@ -358,7 +357,7 @@ static int flush_last_buf(TransferCtx *ctx)
     /* 尾部补 0xFF（Flash 擦除态），保持块对齐写入 */
     memset(&ctx->prev_buf[valid], 0xFF, (size_t)(ctx->prev_len - valid));
 
-    if (write_to_flash(ctx->prev_buf, (size_t)ctx->prev_len) < 0)
+    if (write_to_storage(ctx->transfer_cfg, ctx->prev_buf, (size_t)ctx->prev_len) < 0)
         return -1;
     ctx->total_recv += valid;
     return 0;
@@ -396,10 +395,10 @@ static int handle_eot(TransferCtx *ctx)
             ymodem_ok = 1;
         }
         if (!ymodem_ok)
-            printf("Warning: Ymodem tail packet not received.\r\n");
+            dbg_printf("Warning: Ymodem tail packet not received.\r\n");
     }
 
-    printf("Transfer complete. Protocol=%s, Written=%d bytes.\r\n",
+    dbg_printf("Transfer complete. Protocol=%s, Written=%d bytes.\r\n",
            ctx->protocol == PROTO_XMODEM    ? "Xmodem"    :
            ctx->protocol == PROTO_XMODEM_1K ? "Xmodem-1K" : "Ymodem",
            ctx->total_recv);
@@ -439,7 +438,7 @@ static int wait_next_frame(TransferCtx *ctx)
             uint8_t second;
             if (uart_recv(&second, 1, 1000) == HAL_OK && second == PROTO_CAN) {
                 send_cancel();
-                printf("Transfer cancelled by sender.\r\n");
+                dbg_printf("Transfer cancelled by sender.\r\n");
                 return WAIT_FRAME_ERROR;
             }
             /* 单个 CAN 视为线路噪声，继续重试 */
@@ -460,33 +459,34 @@ static int wait_next_frame(TransferCtx *ctx)
     }
 
     send_cancel();
-    printf("Too many retries, transfer aborted.\r\n");
+    dbg_printf("Too many retries, transfer aborted.\r\n");
     return WAIT_FRAME_ERROR;
 }
 
 /* ============================================================
  *  L5：公共入口
  * ============================================================ */
-int Proto_Start_Receive(uint32_t start_addr, YmodemFileInfo *file_info)
+int Proto_Start_Receive(transfer_cfg_t *transfer_cfg, YmodemFileInfo *file_info)
 {
-    (void)start_addr;   /* 地址由写回调内部管理 */
 
     TransferCtx ctx;
     memset(&ctx, 0, sizeof(ctx));
     ctx.expected  = 1;
     ctx.file_info = file_info;
 
+    ctx.transfer_cfg = transfer_cfg;
+
     /* ── 阶段 1：握手 ──────────────────────────────────────── */
     uart_flush();
     if (proto_handshake(&ctx.pkt[0]) < 0) {
-        printf("Handshake failed.\r\n");
+        dbg_printf("Handshake failed.\r\n");
         return -1;
     }
 
     /* ── 阶段 2：接收首包包体 ──────────────────────────────── */
     if (!recv_packet_body(ctx.pkt, &ctx.data_len)) {
         uart_send_byte(PROTO_NAK);
-        printf("Timeout on first packet body.\r\n");
+        dbg_printf("Timeout on first packet body.\r\n");
         return -1;
     }
 

@@ -11,7 +11,7 @@
       <ToolsetNumber>0x4</ToolsetNumber>
       <ToolsetName>ARM-ADS</ToolsetName>
       <pArmCC>5060960::V5.06 update 7 (build 960)::ARMCC</pArmCC>
-      <pCCUsed>6190000::V6.19::ARMCLANG</pCCUsed>
+      <pCCUsed>5060960::V5.06 update 7 (build 960)::ARMCC</pCCUsed>
       <uAC6>0</uAC6>
       <TargetOption>
         <TargetCommonOption>
@@ -339,9 +339,9 @@
             <v6Rtti>0</v6Rtti>
             <VariousControls>
               <MiscControls></MiscControls>
-              <Define>USE_HAL_DRIVER,STM32L431xx NDEBUG</Define>
+              <Define>USE_HAL_DRIVER,STM32L431xx NDEBUG OTA_TEST_UPGRADING Debug</Define>
               <Undefine></Undefine>
-              <IncludePath>../Core/Inc;../Drivers/STM32L4xx_HAL_Driver/Inc;../Drivers/STM32L4xx_HAL_Driver/Inc/Legacy;../Drivers/CMSIS/Device/ST/STM32L4xx/Include;../Drivers/CMSIS/Include;..\Core\interface;..\Core\interface\FLASH;..\Core\interface\SPI;..\Core\interface\UART;..\Core\interface\Xmodem;..\Core\interface\Littlefs;..\Core\interface\ELF</IncludePath>
+              <IncludePath>../Core/Inc;../Drivers/STM32L4xx_HAL_Driver/Inc;../Drivers/STM32L4xx_HAL_Driver/Inc/Legacy;../Drivers/CMSIS/Device/ST/STM32L4xx/Include;../Drivers/CMSIS/Include;..\Core\interface;..\Core\interface\FLASH;..\Core\interface\SPI;..\Core\interface\UART;..\Core\interface\Xmodem;..\Core\interface\Littlefs;..\Core\interface\ELF;..\Core\interface\STATE_MACHINE;..\Core\interface\STORAGE;..\Core\interface\SHELL;..\Core\interface\FS_CMD</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -1001,6 +1001,46 @@
               <FileName>elf_loader.h</FileName>
               <FileType>5</FileType>
               <FilePath>..\Core\interface\ELF\elf_loader.h</FilePath>
+            </File>
+            <File>
+              <FileName>ota_state_machine.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\interface\STATE_MACHINE\ota_state_machine.c</FilePath>
+            </File>
+            <File>
+              <FileName>ota_state_machine.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Core\interface\STATE_MACHINE\ota_state_machine.h</FilePath>
+            </File>
+            <File>
+              <FileName>data_storage.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\interface\STORAGE\data_storage.c</FilePath>
+            </File>
+            <File>
+              <FileName>data_storage.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Core\interface\STORAGE\data_storage.h</FilePath>
+            </File>
+            <File>
+              <FileName>shell.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\interface\SHELL\shell.c</FilePath>
+            </File>
+            <File>
+              <FileName>shell.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Core\interface\SHELL\shell.h</FilePath>
+            </File>
+            <File>
+              <FileName>fs_cmd.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\interface\FS_CMD\fs_cmd.c</FilePath>
+            </File>
+            <File>
+              <FileName>fs_cmd.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Core\interface\FS_CMD\fs_cmd.h</FilePath>
             </File>
           </Files>
         </Group>

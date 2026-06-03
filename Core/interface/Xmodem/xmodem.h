@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
-
+#include "uart_bootloader.h"
 /* ============================================================
  *  协议控制字节
  * ============================================================ */
@@ -33,30 +33,40 @@ typedef struct {
 } YmodemFileInfo;
 
 /* ============================================================
- *  回调：写 NorFlash
+ *  回调：数据存储回调
  *  参数: buf      数据缓冲区
  *        len      有效字节数（最后一包可能 < 块大小）
+ *        user_ctx  用户上下文指针（Proto_Start_Receive 的 storage_cfg 参数）
  *  返回: 0=成功, 非0=失败（失败将导致传输取消）
  * ============================================================ */
-typedef int (*Write_Flash_Callback)(const void *buf, size_t len);
+typedef int (*storage_callback_t)(const uint8_t *buf, uint32_t len, void *user_ctx);
+typedef int (*receive_callback_t)(void *user_ctx, void *file_info_out);
+
+/* ============================================================
+ *  数据存储的回调接口定义
+ *  由上层业务实现，Xmodem协议层调用
+ * ============================================================ */
+typedef struct {
+    storage_callback_t  write_cb;
+    void                *write_user_ctx;  // 存储回调的私有数据，不关心类型
+
+    receive_callback_t receive_cb;  
+    void               *recv_user_ctx; // 接收回调的私有数据不关心类型   
+} transfer_cfg_t;
+
 
 /* ============================================================
  *  公共 API
  * ============================================================ */
 
 /**
- * @brief 注册 Flash 写回调
- */
-void Proto_Register_Write_Callback(Write_Flash_Callback cb);
-
-/**
  * @brief 启动接收传输（自动检测协议）
  *
- * @param start_addr  Flash 写入起始地址（保留，供回调内部使用）
+ * @param transfer_cfg   传输配置指针，包含写回调和用户上下文
  * @param file_info   若为 Ymodem，握手后填充文件名/大小；其他协议忽略，可传 NULL
  * @return            实际写入字节数，失败返回 -1
  */
-int Proto_Start_Receive(uint32_t start_addr, YmodemFileInfo *file_info);
+int Proto_Start_Receive(transfer_cfg_t *transfer_cfg, YmodemFileInfo *file_info);
 
 #endif /* XMODEM_YMODEM_H */
 
