@@ -329,49 +329,47 @@ int Jump_To_App_Flash(void *resource_ctx, uint32_t appaddr)
         }
     }
 
-    /* ---- 关全局中断 ---- */
+    /* ---- 关闭外设，恢复到干净状态 ---- */
     __disable_irq();
 
-    /* ---- 反初始化外设 ---- */
-    /* UART1：接收升级数据，关 DMA 和 UART */
-    HAL_UART_DMAStop(&huart1);
+    /* 1. 反初始化外设
+     *    HAL_UART_DeInit 内部调用 HAL_UART_MspDeInit，
+     *    自动完成 DMA 反初始化、NVIC 禁用、GPIO 复位、关闭外设时钟 */
     HAL_UART_DeInit(&huart1);
-    HAL_DMA_DeInit(&hdma_usart1_rx);
-
-    /* SPI1：LittleFS 访问外部 Flash */
+    HAL_UART_DeInit(&huart3);
     HAL_SPI_DeInit(&hspi1);
 
-    /* UART3：调试输出（DeInit 后 printf 不再有效）*/
-    HAL_UART_DeInit(&huart3);
-
-    /* ---- 关 SysTick ---- */
-    SysTick->CTRL = 0U;
-    SysTick->LOAD = 0U;
-    SysTick->VAL  = 0U;
-
-    /* ---- 复位时钟树 ---- */
+    /* 2. 复位时钟树到上电默认状态
+     *    必须在 HAL_DeInit() 之前调用，因为 HAL_RCC_DeInit() 内部
+     *    使用 HAL_GetTick() 做超时判断，需要 SysTick 仍在运行。
+     *    HAL_RCC_DeInit 将：
+     *    - SYSCLK 切回 MSI 4MHz
+     *    - 关闭 HSE/HSI/PLL
+     *    - 清零 PLLCFGR（防止 App 误判"PLL 配置未变"跳过重配）
+     *    - 清除 RCC 中断 */
     HAL_RCC_DeInit();
 
-    /* ---- 清除所有 NVIC 中断使能和挂起位 ---- */
-    for (uint8_t i = 0U; i < 8U; i++) {
+    /* 3. 反初始化 HAL（停止 SysTick、清零 HAL 状态） */
+    HAL_DeInit();
+
+    /* 4. 清除所有 NVIC 中断使能和挂起位（兜底，防止遗漏） */
+    for (uint32_t i = 0; i < 8; i++) {
         NVIC->ICER[i] = 0xFFFFFFFFU;
         NVIC->ICPR[i] = 0xFFFFFFFFU;
     }
 
-    /* ---- 切换向量表 ---- */
+    /* Set VTOR and MSP, then jump */
     SCB->VTOR = appaddr;
     __DSB();
     __ISB();
 
-    /* ---- 设置 MSP，恢复线程特权模式 ---- */
     __set_MSP(*(__IO uint32_t *)appaddr);
-    __set_CONTROL(0U);
     __ISB();
 
-    /* ---- 开中断，跳转 ---- */
-    uint32_t jump_addr = *(__IO uint32_t *)(appaddr + 4U);
-    void (*jump_to_app)(void) = (void (*)(void))jump_addr;
-
+     uint32_t app_entry = *(__IO uint32_t *)(appaddr + 4U);
+     /* Keep the Thumb LSB bit set in the entry address. Clearing it causes
+         an invalid processor state (UsageFault INVSTATE) on Cortex-M. */
+     void (*jump_to_app)(void) = (void (*)(void))app_entry;
     __enable_irq();
     jump_to_app();
 
@@ -388,45 +386,52 @@ static int read_elf_from_lfs(const char *path,
                               uint32_t    buf_size,
                               uint32_t   *out_size)
 {
-    lfs_file_t  file;
-    int         err;
+    int err;
 
     BL_INFO("opening \"%s\" from LittleFS...", path);
 
-    if(lfs_ctx.file_open == 0U) {
-        BL_ERR("LittleFS file not open");
+    if (lfs_ctx.file_open == 0U) {
         err = lfs_file_open(&lfs_ctx.lfs, &lfs_ctx.file, path, LFS_O_RDONLY);
         lfs_ctx.file_open = (err == LFS_ERR_OK) ? 1U : 0U;
         if (err < 0) {
-        BL_ERR("lfs_file_open failed: %d (file not found?)", err);
-        return err;
+            BL_ERR("lfs_file_open failed: %d", err);
+            return err;
         }
     }
-    
-    lfs_file_seek(&((lfs_ctx_t *)(&lfs_ctx))->lfs, &((lfs_ctx_t *)(&lfs_ctx))->file, 0, LFS_SEEK_SET);
+
+    /* 文件总大小 */
     lfs_soff_t fsize = lfs_file_size(&lfs_ctx.lfs, &lfs_ctx.file);
     BL_INFO("file size = %d bytes", (int)fsize);
 
-    if (fsize <= 0) {
-        BL_ERR("invalid file size: %d", (int)fsize);
+    if (fsize <= (lfs_soff_t)sizeof(Firmware_Header_t)) {
+        BL_ERR("file too small: %d bytes", (int)fsize);
         lfs_file_close(&lfs_ctx.lfs, &lfs_ctx.file);
+        lfs_ctx.file_open = 0U;
         return -1;
     }
 
-    if ((uint32_t)fsize > buf_size) {
-        BL_ERR("file too large: %d bytes > buf %u bytes (strip debug symbols?)",
-               (int)fsize, buf_size);
+    /* 跳过 Header，只读 payload */
+    lfs_file_seek(&lfs_ctx.lfs, &lfs_ctx.file, sizeof(Firmware_Header_t), LFS_SEEK_SET);
+
+    lfs_soff_t payload_size = fsize - (lfs_soff_t)sizeof(Firmware_Header_t);
+    BL_INFO("payload size = %d bytes", (int)payload_size);
+
+    if ((uint32_t)payload_size > buf_size) {
+        BL_ERR("payload too large: %d > %u bytes", (int)payload_size, buf_size);
         lfs_file_close(&lfs_ctx.lfs, &lfs_ctx.file);
+        lfs_ctx.file_open = 0U;
         return -1;
     }
 
-    BL_INFO("reading to RAM 0x%08x...", (uint32_t)(uintptr_t)buf);
+    BL_INFO("reading to RAM 0x%08X...", (uint32_t)(uintptr_t)buf);
 
-    lfs_ssize_t nread = lfs_file_read(&lfs_ctx.lfs, &lfs_ctx.file, buf, (lfs_size_t)fsize);
+    lfs_ssize_t nread = lfs_file_read(&lfs_ctx.lfs, &lfs_ctx.file,
+                                       buf, (lfs_size_t)payload_size);
     lfs_file_close(&lfs_ctx.lfs, &lfs_ctx.file);
+    lfs_ctx.file_open = 0U;
 
-    if (nread != fsize) {
-        BL_ERR("read incomplete: got %d / %d bytes", (int)nread, (int)fsize);
+    if (nread != payload_size) {
+        BL_ERR("read incomplete: %d / %d bytes", (int)nread, (int)payload_size);
         return -1;
     }
 
@@ -434,7 +439,6 @@ static int read_elf_from_lfs(const char *path,
     BL_INFO("read OK: %u bytes", *out_size);
     return 0;
 }
-
 /* ===================================================================
  * 第五部分：按 section 写入 Flash（内部函数）
  * =================================================================== */
@@ -532,12 +536,24 @@ static int write_sections_to_flash(elf_ctx_t *ctx, uint8_t slot)
 int bootloader_load_and_jump(void)
 {
     BL_INFO("elf_buf actual address: 0x%08x", (uint32_t)(uintptr_t)elf_buf);
+    /* ---- 打印上次复位原因，便于定位 APP 是否触发了复位 ---- */
+    if (__HAL_RCC_GET_FLAG(RCC_FLAG_IWDGRST))  BL_INFO("Reset cause: IWDG");
+    if (__HAL_RCC_GET_FLAG(RCC_FLAG_WWDGRST))  BL_INFO("Reset cause: WWDG");
+    if (__HAL_RCC_GET_FLAG(RCC_FLAG_LPWRRST))  BL_INFO("Reset cause: LowPower");
+    if (__HAL_RCC_GET_FLAG(RCC_FLAG_BORRST))   BL_INFO("Reset cause: BOR");
+    if (__HAL_RCC_GET_FLAG(RCC_FLAG_PINRST))   BL_INFO("Reset cause: PIN/PWR");
+#ifdef RCC_FLAG_PORRST
+    if (__HAL_RCC_GET_FLAG(RCC_FLAG_PORRST))   BL_INFO("Reset cause: POR");
+#endif
+    if (__HAL_RCC_GET_FLAG(RCC_FLAG_SFTRST))   BL_INFO("Reset cause: Software");
+    __HAL_RCC_CLEAR_RESET_FLAGS();
     int      ret;
     uint32_t elf_size = 0U;
     uint32_t entry    = 0U;
 
-    /* 从 EEPROM 仿真读取目标 slot（0 = SLOT_A，1 = SLOT_B）*/
-    uint8_t target_slot = (Read_Flag(EE_VAR_TARGET_SLOT) == 0U) ? SLOT_A : SLOT_B;
+    /* 从 EEPROM 仿真读取目标 slot（SLOT_A=1，SLOT_B=2）*/
+    uint32_t stored_slot = Read_Flag(EE_VAR_TARGET_SLOT);
+    uint8_t target_slot = (stored_slot == SLOT_B) ? SLOT_B : SLOT_A;
     uint32_t app_start  = (target_slot == SLOT_B) ? APP_B_START_ADDR : APP_A_START_ADDR;
 
     BL_INFO("=========================================");
@@ -598,7 +614,6 @@ int bootloader_load_and_jump(void)
     ret = write_sections_to_flash(&ctx, target_slot);
     if (ret != 0) {
         BL_ERR("write_sections_to_flash FAILED! App Flash may be corrupted.");
-        BL_ERR("SYSTEM HALTED — waiting for watchdog reset");
         while (1) {}   /* Flash 写失败不应跳转，等看门狗复位重试 */
     }
 
@@ -612,7 +627,6 @@ try_existing:
     BL_WARN("[4/5] skip Flash write, trying existing App at 0x%08x...", app_start);
 
     if (!Verify_APP_Integrity_Flash(app_start)) {
-        BL_ERR("no valid App in Flash — SYSTEM HALTED");
         while (1) {}
     }
 

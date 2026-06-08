@@ -32,5 +32,20 @@ typedef struct {
     uint8_t      file_open;     // 1=句柄已打开
 }lfs_ctx_t;
 
+
+#define FW_MAGIC 0xAABBCCDD
+
+typedef struct
+{
+    uint32_t magic;
+    uint32_t version;
+    uint32_t size;
+    uint32_t crc32;
+    uint8_t  sha256[32];
+    uint8_t  signature[64];   // R(32) + S(32)，固定长度
+    uint8_t  reserved[144];
+} Firmware_Header_t;
+
+
 #endif
 

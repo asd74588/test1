@@ -56,10 +56,15 @@
 /* ================================================================
  * EEPROM 变量索引（根据实际EE_VAR定义调整）
  * ================================================================ */
-#define EE_VAR_OTA_STATE    0U
-#define EE_VAR_ACTIVE_SLOT  1U
-#define EE_VAR_TARGET_SLOT  2U
-#define EE_VAR_REVERT_REASON 3U
+#define EE_VAR_OTA_STATE        0U
+#define EE_VAR_ACTIVE_SLOT      1U
+#define EE_VAR_TARGET_SLOT      2U
+#define EE_VAR_REVERT_REASON    3U
+#define EE_VAR_DEVICE_SN        4U   /* 设备序列号（出厂写入）         */
+
+
+#define EE_VAR_WIFI_SSID_BASE   10U  /* 10~17：WiFi SSID（8×4 字节）  */
+#define EE_VAR_WIFI_PASS_BASE   18U  /* 18~25：WiFi 密码（8×4 字节）  */
 
 /* ================================================================
  * 回退原因标志

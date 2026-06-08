@@ -30,5 +30,9 @@ int Verify_APP_Integrity_Flash(uint32_t appaddr);
 //跳转到指定位置执行烧录的bin文件
 int Jump_To_App_Flash(void *resource_ctx, uint32_t appaddr);
 
+
+int bootloader_load_and_jump(void);
+
+
 #endif
 

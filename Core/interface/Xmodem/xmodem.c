@@ -165,11 +165,16 @@ static int validate_packet(const TransferCtx *ctx)
     }
 
     /* CRC */
-    if (!pkt_crc_check(pkt, ctx->data_len)) {
+    // if (!pkt_crc_check(pkt, ctx->data_len)) {
+    //     uart_send_byte(PROTO_NAK);
+    //     return -1;
+    // }
+
+   if (!pkt_crc_check(pkt, ctx->data_len)) {
+        dbg_printf("CRC fail at blk %d\r\n", blk);  // 加这行
         uart_send_byte(PROTO_NAK);
         return -1;
     }
-
     return 1;
 }
 

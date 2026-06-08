@@ -16,7 +16,12 @@
 #include <string.h>
 #include "lfs.h"
 #include "data_storage.h"
+#include "flash_bootloader.h"
+#include "app_verify.h"
 
+#define OTA_FILE_PATH "a.elf"
+
+extern const struct lfs_file_config lfs_file_cfg;
 /* ================================================================
  * 前置声明
  * ================================================================ */
@@ -134,8 +139,7 @@ static void fsm_ctx_init(ota_ctx_t *ctx)
     Write_Flag(EE_VAR_OTA_STATE,   OTA_STATE_UPGRADING);
     dbg_printf("[TEST] forced into UPGRADING mode\r\n");
     return;
-#endif
-
+#else
     ctx->state       = (ota_state_t)Read_Flag(EE_VAR_OTA_STATE);
     ctx->active_slot = Read_Flag(EE_VAR_ACTIVE_SLOT);
 
@@ -163,6 +167,7 @@ static void fsm_ctx_init(ota_ctx_t *ctx)
         /* BOOT / UPGRADING / REVERT：active 推导即可，无需读 EEPROM */
         ctx->target_slot = OPPOSITE_SLOT(ctx->active_slot);
     }
+#endif
 }
 /* ================================================================
  * Guard 函数：纯谓词，无副作用
@@ -258,11 +263,11 @@ static ota_state_t handle_boot(ota_ctx_t *ctx)
  */
 static ota_state_t handle_upgrading(ota_ctx_t *ctx)
 {
-    uint32_t first_word;
     uint32_t write_addr  = (ctx->target_slot == SLOT_B) ? APP_B_START_ADDR
                                                          : APP_A_START_ADDR;
     uint32_t active_addr = (ctx->active_slot == SLOT_B) ? APP_B_START_ADDR
                                                          : APP_A_START_ADDR;
+    lfs_ctx_t *fs = (lfs_ctx_t *)ctx->resource_ctx;
 
     
     /* active_valid 仅初次进入时评估，存入ctx避免重复校验 */
@@ -278,103 +283,66 @@ static ota_state_t handle_upgrading(ota_ctx_t *ctx)
 
     while (1) 
     {
+        if (fs == NULL || fs->mounted == 0U) {
+            dbg_printf("[UPGRADING] LittleFS not ready\r\n");
+            return ctx->active_valid ? OTA_STATE_BOOT : OTA_STATE_UPGRADING;
+        }
+
+        if (fs->file_open) {
+            lfs_file_close(&fs->lfs, &fs->file);
+            fs->file_open = 0U;
+        }
+
+        int open_err = lfs_file_opencfg(&fs->lfs, &fs->file, OTA_FILE_PATH,
+                                        LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC,
+                                        &lfs_file_cfg);
+        if (open_err != 0) {
+            dbg_printf("[UPGRADING] open %s failed: %d\r\n", OTA_FILE_PATH, open_err);
+            return ctx->active_valid ? OTA_STATE_BOOT : OTA_STATE_UPGRADING;
+        }
+        fs->file_open = 1U;
+
         int received = ctx->transfer_cfg->receive_cb(ctx->transfer_cfg->recv_user_ctx, NULL);
 
         if (received > 0) {
             dbg_printf("[TEST][PASS] Xmodem received=%d bytes\r\n", received);
         } else {
             dbg_printf("[TEST][FAIL] Xmodem failed, ret=%d\r\n", received);
-            return OTA_STATE_BOOT;
+            lfs_file_close(&fs->lfs, &fs->file);
+            fs->file_open = 0U;
+            return ctx->active_valid ? OTA_STATE_BOOT : OTA_STATE_UPGRADING;
         }
 
-        int err = lfs_file_truncate(&((lfs_ctx_t *)(ctx->resource_ctx))->lfs,&((lfs_ctx_t *)(ctx->resource_ctx))->file, received);
+        int err = lfs_file_truncate(&fs->lfs, &fs->file, received);
         if (err == 0) {
              dbg_printf("truncate file to %d bytes\r\n", received);
         } else {
             dbg_printf("truncate failed: %d\r\n", err);
         }
 
-        lfs_soff_t file_size = lfs_file_size(&((lfs_ctx_t *)(ctx->resource_ctx))->lfs, &((lfs_ctx_t *)(ctx->resource_ctx))->file);
+        lfs_soff_t file_size = lfs_file_size(&fs->lfs, &fs->file);
         if (file_size == received) {
             dbg_printf("file size after truncate: %d bytes\r\n", (int)file_size);
         } else {
             dbg_printf("file size mismatch after truncate: %d bytes\r\n", (int)file_size);
         }
         
+
+        lfs_file_close(&fs->lfs, &fs->file);
+        fs->file_open = 0U;
+        
+        if(verify_firmware(OTA_FILE_PATH) != 0)
+        {
+            dbg_printf("Failed to verify firmware\r\n");
+            Write_Flag(EE_VAR_REVERT_REASON,
+                       ctx->active_valid ? REVERT_ACTIVE_VALID : REVERT_BOTH_INVALID);
+            return ctx->active_valid ? OTA_STATE_REVERT : OTA_STATE_UPGRADING;
+        }
+
         return OTA_STATE_VERIFYING;
-        ctx->xmodem_retry++;
-
-        if (ctx->active_valid) 
-        {
-            dbg_printf("[UPGRADING] recv failed, retry %u/%u\r\n",
-                   ctx->xmodem_retry, XMODEM_MAX_RETRY);
-            if (ctx->xmodem_retry >= XMODEM_MAX_RETRY) 
-            {
-                dbg_printf("[UPGRADING] max retry, active valid -> BOOT\r\n");
-                return OTA_STATE_BOOT;
-            }
-        } 
-        else 
-        {
-            /* 活跃无效：持续等待，按需重擦 */
-            dbg_printf("[UPGRADING] active invalid, staying in UPGRADING\r\n");
-            first_word = *(volatile uint32_t *)write_addr;
-            if (first_word != 0xFFFFFFFFU) 
-            {
-                dbg_printf("[UPGRADING] partial write detected, re-erasing\r\n");
-                Erase_App_Flash(ctx->target_slot);
-            }
-            ctx->xmodem_retry = 0U;  /* 无有效分区时不计次 */
-        }
     }
 }
 
-
-uint32_t crc32_update(uint32_t crc, uint8_t *data, uint32_t len)
-{
-    for(uint32_t i = 0; i < len; i++)
-    {
-        crc ^= data[i];
-
-        for(uint32_t j = 0; j < 8; j++)
-        {
-            if(crc & 1)
-                crc = (crc >> 1) ^ 0xEDB88320;
-            else
-                crc >>= 1;
-        }
-    }
-
-    return crc;
-}
-
-int Verify_Transferred_App(ota_ctx_t *ctx)
-{
-    lfs_file_seek(&((lfs_ctx_t *)(ctx->resource_ctx))->lfs, 
-                                  &((lfs_ctx_t *)(ctx->resource_ctx))->file, 
-                                  0, LFS_SEEK_SET);
-
-    lfs_soff_t file_size = lfs_file_size(&((lfs_ctx_t *)(ctx->resource_ctx))->lfs, &((lfs_ctx_t *)(ctx->resource_ctx))->file);
-    dbg_printf("file size after truncate: %d bytes\r\n", (int)file_size);
-
-    uint32_t real_size = lfs_file_size(&((lfs_ctx_t *)(ctx->resource_ctx))->lfs, &((lfs_ctx_t *)(ctx->resource_ctx))->file); // 从Xmodem传输结果获取，存在某个变量里
-    uint8_t buf[1024];
-    uint32_t remaining = real_size;  // ← 关键：用真实大小，不用lfs文件大小
-    uint32_t crc = 0xFFFFFFFF;
-
-  while (remaining > 0) {
-      int to_read = (remaining > sizeof(buf)) ? sizeof(buf) : remaining;
-      int read_len = lfs_file_read(&((lfs_ctx_t *)(ctx->resource_ctx))->lfs, &((lfs_ctx_t *)(ctx->resource_ctx))->file, buf, to_read);
-      if (read_len <= 0) break;
-      crc = crc32_update(crc, buf, read_len);
-      remaining -= read_len;
-  }
-
-  crc ^= 0xFFFFFFFF;
-  dbg_printf("File CRC32: 0x%08X\r\n", crc);
-
-  return 1;
-}
 
 /**
  * @brief  VERIFYING handler
@@ -382,13 +350,10 @@ int Verify_Transferred_App(ota_ctx_t *ctx)
  */
 static ota_state_t handle_verifying(ota_ctx_t *ctx)
 {
-        lfs_soff_t file_size = lfs_file_size(&((lfs_ctx_t *)(ctx->resource_ctx))->lfs, &((lfs_ctx_t *)(ctx->resource_ctx))->file);
-        dbg_printf("file size after truncate: %d bytes\r\n", (int)file_size);
+    uint32_t active_addr = (ctx->active_slot == SLOT_B) ? APP_B_START_ADDR
+                                                         : APP_A_START_ADDR;
 
-    uint32_t new_addr = (ctx->target_slot == SLOT_B) ? APP_B_START_ADDR
-                                                      : APP_A_START_ADDR;
-
-    if (Verify_Transferred_App(ctx) != 0) 
+    if (verify_firmware(OTA_FILE_PATH) == 0) 
     {
         dbg_printf("[VERIFYING] slot %s verified OK -> now active\r\n",
                 SLOT_NAME(ctx->target_slot));
@@ -403,8 +368,9 @@ static ota_state_t handle_verifying(ota_ctx_t *ctx)
     }
 
     dbg_printf("[VERIFYING] slot %s FAILED, -> REVERT\r\n", SLOT_NAME(ctx->target_slot));
-    Write_Flag(EE_VAR_REVERT_REASON, REVERT_ACTIVE_VALID);
-    ctx->revert_reason = REVERT_ACTIVE_VALID;
+    ctx->revert_reason = (Verify_APP_Integrity_Flash(active_addr) != 0)
+                         ? REVERT_ACTIVE_VALID : REVERT_BOTH_INVALID;
+    Write_Flag(EE_VAR_REVERT_REASON, ctx->revert_reason);
     return OTA_STATE_REVERT;
 }
 
