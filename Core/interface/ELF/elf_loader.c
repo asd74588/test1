@@ -182,6 +182,216 @@ static const char *reloc_type_name(uint8_t type)
 //     return ELF_OK;
 // }
 
+
+
+static uint32_t movwt_get_imm(uint16_t upper, uint16_t lower)
+{
+    uint32_t imm4 = (upper & 0x000FU);
+    uint32_t i    = (upper >> 10) & 0x1U;       // ← 补上 i 位
+    uint32_t imm3 = (lower >> 12) & 0x7U;
+    uint32_t imm8 =  lower        & 0xFFU;
+    return (imm4 << 12) | (i << 11) | (imm3 << 8) | imm8;
+}
+
+static void movwt_set_imm(uint16_t *upper, uint16_t *lower, uint32_t imm16)
+{
+    uint32_t imm4 = (imm16 >> 12) & 0xFU;
+    uint32_t i    = (imm16 >> 11) & 0x1U;       // ← 补上 i 位
+    uint32_t imm3 = (imm16 >>  8) & 0x7U;
+    uint32_t imm8 =  imm16        & 0xFFU;
+    *upper = (*upper & 0xFBF0U) | (i << 10) | imm4;   // ← 写回 i，mask也要含bit10
+    *lower = (*lower & 0x8F00U) | (imm3 << 12) | imm8;
+}
+
+
+static void relocate_movwt(uint16_t *h16, uint32_t half_end,
+                            uint32_t offset,
+                            uint32_t LINK_MIN, uint32_t LINK_END,
+                            uint32_t actual_code_end,
+                            uint32_t RT_BASE,  uint32_t RT_SIZE,
+                            uint8_t *done_bmp,   /* ← 新增，可为NULL */
+                            uint32_t *fixed_count)
+{
+    ELF_INFO("relocate_movwt: half_end=%u offset=0x%08x LINK=[0x%05x,0x%05x) code_end=0x%05x",
+             half_end, offset, LINK_MIN, LINK_END, actual_code_end);
+
+    struct {
+        uint32_t h;
+        uint32_t imm16;
+        int      valid;
+    } pending[16];
+    memset(pending, 0, sizeof(pending));
+
+    uint32_t h = 0;
+    uint32_t stat_movw = 0, stat_movt = 0, stat_pair = 0;
+    uint32_t stat_skip_val = 0, stat_skip_post = 0, stat_orphan = 0;
+
+    while (h < half_end) {
+        uint16_t hw0 = h16[h];   /* first HW (低地址, bits[15:0], 含 opcode) */
+
+        /* ── 32位指令判断：first HW 高3位=111 且 bits[12:11]≠00 ── */
+        int is32 = ((hw0 & 0xE000U) == 0xE000U) &&
+                   ((hw0 & 0x1800U) != 0x0000U);
+
+        if (!is32) {
+            /* 16位指令，不含 MOVW/MOVT，直接跳过 */
+            h += 1;
+            continue;
+        }
+
+        if (h + 1U >= half_end) break;
+        uint16_t hw1 = h16[h + 1U];   /* second HW (高地址, bits[31:16], 含 Rd) */
+
+        /* Rd 在 second HW 的 bits[11:8] */
+        uint32_t rd = (hw1 >> 8) & 0xFU;
+
+        /* ── MOVW T3: first HW = 1111 0i10 0100 imm4 ──
+         *   mask 0xFBF0, 期望 0xF240
+         * ── */
+        if ((hw0 & 0xFBF0U) == 0xF240U) {
+            uint32_t imm4 = (hw0        ) & 0x000FU;
+            uint32_t i    = (hw0 >> 10  ) & 0x0001U;
+            uint32_t imm3 = (hw1 >> 12  ) & 0x0007U;
+            uint32_t imm8 = (hw1        ) & 0x00FFU;
+            uint32_t imm16 = (imm4 << 12) | (i << 11) | (imm3 << 8) | imm8;
+
+            ELF_INFO("  MOVW h=%-5u addr=0x%05x hw0=0x%04x hw1=0x%04x "
+                     "R%-2u imm4=%u i=%u imm3=%u imm8=0x%02x -> imm16=0x%04x%s",
+                     h, h * 2U, hw0, hw1, rd,
+                     imm4, i, imm3, imm8, imm16,
+                     pending[rd].valid ? " [overwrite pending]" : "");
+
+            pending[rd].h     = h;
+            pending[rd].imm16 = imm16;
+            pending[rd].valid = 1;
+            stat_movw++;
+            h += 2; continue;
+        }
+
+        /* ── MOVT T1: first HW = 1111 0i10 1100 imm4 ──
+         *   mask 0xFBF0, 期望 0xF2C0
+         * ── */
+        if ((hw0 & 0xFBF0U) == 0xF2C0U) {
+            uint32_t imm4   = (hw0        ) & 0x000FU;
+            uint32_t i      = (hw0 >> 10  ) & 0x0001U;
+            uint32_t imm3   = (hw1 >> 12  ) & 0x0007U;
+            uint32_t imm8   = (hw1        ) & 0x00FFU;
+            uint32_t high16 = (imm4 << 12) | (i << 11) | (imm3 << 8) | imm8;
+
+            stat_movt++;
+
+            if (!pending[rd].valid) {
+                ELF_INFO("  MOVT h=%-5u addr=0x%05x hw0=0x%04x hw1=0x%04x "
+                         "R%-2u high16=0x%04x  [ORPHAN: no pending MOVW for R%u]",
+                         h, h * 2U, hw0, hw1, rd, high16, rd);
+                stat_orphan++;
+                h += 2; continue;
+            }
+
+            uint32_t low16 = pending[rd].imm16;
+            uint32_t val   = (high16 << 16) | low16;
+            uint32_t ph    = pending[rd].h;
+            pending[rd].valid = 0;
+            stat_pair++;
+
+            ELF_INFO("  MOVT h=%-5u addr=0x%05x hw0=0x%04x hw1=0x%04x "
+                     "R%-2u high16=0x%04x low16=0x%04x -> val=0x%08x  "
+                     "(MOVW at h=%u addr=0x%05x)",
+                     h, h * 2U, hw0, hw1, rd,
+                     high16, low16, val, ph, ph * 2U);
+
+            /* ── 值域过滤 ── */
+
+            /* high16 必须为 0（链接基址 0x00000000 的 Flash 指针）*/
+            if (high16 != 0x0000U) {
+                ELF_INFO("    -> SKIP: high16=0x%04x != 0 (not a Flash ptr at base 0)", high16);
+                stat_skip_val++;
+                h += 2; continue;
+            }
+
+            /* low16 落在 [LINK_MIN, actual_code_end) 范围内 */
+            if (val < LINK_MIN || val >= actual_code_end) {
+                ELF_INFO("    -> SKIP: val=0x%08x out of [0x%05x, 0x%05x)",
+                         val, LINK_MIN, actual_code_end);
+                stat_skip_val++;
+                h += 2; continue;
+            }
+
+            /* 对齐校验：偶数必须 4 字节对齐 */
+            if ((val & 1U) == 0U && (val & 3U) != 0U) {
+                ELF_INFO("    -> SKIP: val=0x%08x even but not 4-aligned", val);
+                stat_skip_val++;
+                h += 2; continue;
+            }
+
+            /* 重定向后越界回退 */
+            uint32_t new_val = val + offset;
+            uint32_t addr    = new_val & ~1U;
+            int ok = (addr >= RT_BASE && addr < RT_BASE + RT_SIZE) || reloc_in_ram(addr);
+            if (!ok) {
+                ELF_INFO("    -> SKIP: post-reloc addr=0x%08x out of range", addr);
+                stat_skip_post++;
+                h += 2; continue;
+            }
+
+            /* ── 写回 MOVW ── */
+            uint32_t nl = new_val & 0xFFFFU;
+            uint16_t w_hw0 = h16[ph];
+            uint16_t w_hw1 = h16[ph + 1U];
+
+            uint16_t new_w_hw0 = (w_hw0 & 0xFBF0U)
+                               | (uint16_t)(((nl >> 11) & 0x1U) << 10)
+                               | (uint16_t)((nl >> 12) & 0xFU);
+            uint16_t new_w_hw1 = (w_hw1 & 0x8F00U)
+                               | (uint16_t)(((nl >> 8) & 0x7U) << 12)
+                               | (uint16_t)(nl & 0xFFU);
+
+            ELF_INFO("    MOVW write: h=%u hw0: 0x%04x->0x%04x  hw1: 0x%04x->0x%04x",
+                     ph, w_hw0, new_w_hw0, w_hw1, new_w_hw1);
+
+            h16[ph]      = new_w_hw0;
+            h16[ph + 1U] = new_w_hw1;
+
+            /* ── 写回 MOVT ── */
+            uint32_t nh = new_val >> 16;
+            uint16_t new_hw0 = (hw0 & 0xFBF0U)
+                             | (uint16_t)(((nh >> 11) & 0x1U) << 10)
+                             | (uint16_t)((nh >> 12) & 0xFU);
+            uint16_t new_hw1 = (hw1 & 0x8F00U)
+                             | (uint16_t)(((nh >> 8) & 0x7U) << 12)
+                             | (uint16_t)(nh & 0xFFU);
+
+            ELF_INFO("    MOVT write: h=%u hw0: 0x%04x->0x%04x  hw1: 0x%04x->0x%04x",
+                     h, hw0, new_hw0, hw1, new_hw1);
+            ELF_INFO("    => 0x%08x -> 0x%08x  (offset +0x%08x)  R%u",
+                     val, new_val, offset, rd);
+
+            h16[h]      = new_hw0;
+            h16[h + 1U] = new_hw1;
+
+
+            if (done_bmp) {
+                uint32_t pw = ph / 2U;   /* MOVW 所在 word 索引 */
+                done_bmp[pw / 8U] |= (uint8_t)(1U << (pw % 8U));
+                uint32_t tw = h  / 2U;   /* MOVT 所在 word 索引 */
+                done_bmp[tw / 8U] |= (uint8_t)(1U << (tw % 8U));
+            }
+
+            (*fixed_count)++;
+            h += 2; continue;
+        }
+
+        /* 其他 32 位指令，跳过两个 halfword */
+        h += 2;
+    }
+
+    ELF_INFO("relocate_movwt done: movw=%u movt=%u pairs=%u "
+             "skip_val=%u skip_post=%u orphan=%u fixed=%u",
+             stat_movw, stat_movt, stat_pair,
+             stat_skip_val, stat_skip_post, stat_orphan, *fixed_count);
+}
+
+
 /* ===================================================================
  * 第二部分：ELF 解析（来自 llext_load.c : llext_find_tables()）
  * =================================================================== */
@@ -672,9 +882,25 @@ int elf_relocate_ex(elf_ctx_t *ctx, uint32_t offset, uint32_t app_max_size)
             ELF_INFO("  scanning exec \"%s\": %u words, litpool=%u entries",
                      name, word_end, lp_count);
 
+
+            uint32_t movwt_fixed = 0U;
+            /* ── 给 relocate_movwt 增加一个输出位图 ── */
+            uint8_t *movwt_done_bmp = (uint8_t *)calloc((word_end + 7U) / 8U, 1U);
+
+            relocate_movwt((uint16_t *)base, word_end * 2U,
+                            offset, LINK_MIN, LINK_END,
+                            actual_code_end,
+                            RT_BASE, RT_SIZE,
+                            movwt_done_bmp,   /* ← 新增 */
+                            &movwt_fixed);
+
             /* ── 第二步：Scatter + 向量表 + Literal Pool 三路处理 ── */
             uint32_t w = 0U;
             while (w < word_end) {
+                 if (movwt_done_bmp && (movwt_done_bmp[w/8U] >> (w%8U)) & 1U) {
+                    w++; continue;
+                }
+
 
                 /* ── Scatter Table 检测（优先级最高）── */
                 if (is_scatter_entry(base, w, word_end, LINK_END)) {

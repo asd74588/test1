@@ -140,7 +140,7 @@ static void enter_shell_forever(void)
 {
   Shell_Init();
   while (1) {
-    HAL_Delay(1000U);
+    Shell_Process();
   }
 }
 /* USER CODE END 0 */

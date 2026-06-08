@@ -42,7 +42,7 @@ static int verify_ecdsa(const Firmware_Header_t *hdr)
     memcpy(&pubkey[32], FW_PUBKEY_Y, 32);
 
     cmox_ecc_handle_t ecc_ctx;
-    static uint8_t ecc_buf[4096];  // static 避免栈溢出
+    static uint8_t ecc_buf[3072];  // 放入 SRAM2
     uint32_t fault_check = 0;
 
     cmox_ecc_construct(&ecc_ctx, CMOX_MATH_FUNCS_FAST, ecc_buf, sizeof(ecc_buf));
