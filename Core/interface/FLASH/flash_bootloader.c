@@ -12,11 +12,10 @@
 
 #include "flash_bootloader.h"
 #include "eeprom_emul.h"
-#include "elf_loader.h"
+#include "elf_loader_stream.h"
 #include "global.h"
 #include "lfs_config.h"
 #include "lfs.h"
-
 #include <string.h>
 #include <stdio.h>
 
@@ -54,6 +53,29 @@
  * ELF buffer（全局 .bss，启动时已清零，4字节对齐）
  * =================================================================== */
 static uint8_t elf_buf[ELF_BUF_SIZE] __attribute__((aligned(4)));
+
+/* ===================================================================
+ * Stream I/O 回调 — 以 elf_buf 为后端存储
+ * =================================================================== */
+
+/** elf_buf 内实际 ELF 文件大小（read_elf_from_lfs 写入后设置） */
+static uint32_t s_elf_file_size = 0U;
+
+static int elf_buf_read(uint32_t file_offset, void *dst, uint32_t len, void *user)
+{
+    (void)user;
+    if (len > s_elf_file_size || file_offset > s_elf_file_size - len) return -1;
+    memcpy(dst, elf_buf + file_offset, len);
+    return 0;
+}
+
+static int elf_buf_writeback(uint32_t file_offset, const void *src, uint32_t len, void *user)
+{
+    (void)user;
+    if (len > s_elf_file_size || file_offset > s_elf_file_size - len) return -1;
+    memcpy(elf_buf + file_offset, src, len);
+    return 0;
+}
 
 /* ===================================================================
  * 尾字节暂存（Write_Buffer_To_Flash 跨包拼接用）
@@ -230,6 +252,7 @@ HAL_StatusTypeDef Flush_Tail_To_Flash(uint32_t *startaddr)
 
     *startaddr += 8U;
     s_tail_len  = 0U;
+    memset(s_tail_bytes, 0, sizeof(s_tail_bytes));
 
     BL_INFO("Flush_Tail_To_Flash: OK");
     return HAL_OK;
@@ -370,7 +393,9 @@ int Jump_To_App_Flash(void *resource_ctx, uint32_t appaddr)
      /* Keep the Thumb LSB bit set in the entry address. Clearing it causes
          an invalid processor state (UsageFault INVSTATE) on Cortex-M. */
      void (*jump_to_app)(void) = (void (*)(void))app_entry;
-    __enable_irq();
+    /* 不在此处 __enable_irq()：中断由 App Reset Handler 负责开启。
+     * 若在此处开中断，VTOR/MSP 已切换但尚未跳转的窗口期内，
+     * 中断会以 Bootloader 栈帧进入 App 向量表，造成不可预测行为。 */
     jump_to_app();
 
     /* 不可达 */
@@ -442,7 +467,7 @@ static int read_elf_from_lfs(const char *path,
 /* ===================================================================
  * 第五部分：按 section 写入 Flash（内部函数）
  * =================================================================== */
-static int write_sections_to_flash(elf_ctx_t *ctx, uint8_t slot)
+static int write_sections_to_flash(elf_ctx_stream_t *ctx, uint8_t slot)
 {
     uint32_t flash_start = (slot == SLOT_B) ? APP_B_START_ADDR : APP_A_START_ADDR;
     uint32_t flash_size  = (slot == SLOT_B) ? APP_B_SIZE       : APP_A_SIZE;
@@ -457,67 +482,115 @@ static int write_sections_to_flash(elf_ctx_t *ctx, uint8_t slot)
     memset(s_tail_bytes, 0, sizeof(s_tail_bytes));
 
     /*
-     * 核心思路：
-     * ER_IROM1 和 RW_IRAM1 在文件里是连续的：
-     *   ER_IROM1: file off=0x034, size=4340 → 结束于 0x1128
-     *   RW_IRAM1: file off=0x1128, size=16  → 紧跟其后
+     * 逐 section 写入 Flash，每个 section 写到其正确的 Flash 地址：
+     *   - Flash section (sh_addr < 0x10000000): 目标 = sh_addr + offset
+     *   - RAM section (.data, sh_addr >= 0x10000000): 目标 = 紧接上一个 section 之后
      *
-     * 直接把两者合并，从 buf+0x034 开始，
-     * 连续写 4340+16=4356 字节到 flash_start，
-     * 中间不 flush，最后统一 flush 一次。
-     * 这样地址完全对应，不存在重叠问题。
+     * 这保证了 .data 初始值在 Flash 中的位置与 startup code 的 _sidata 一致。
+     * 连续写入方式对 GCC ELF 不适用：GCC 将 .data 放在独立的 segment，
+     * file offset 与 Flash load address 之间有对齐间隙，
+     * 导致 .data 被写到错误位置。
      */
-
-    /* 找到第一个非 BSS section 的起始 file offset */
-    uint32_t file_start = 0;
-    uint32_t total_size = 0;
+    uint32_t next_flash = flash_start;
 
     for (uint32_t i = 0; i < ctx->load_count; i++) {
-        elf32_shdr *shdr = ctx->load_shdrs[i];
+        elf32_shdr *shdr = &ctx->shdrs[ctx->load_shidx[i]];
         if (shdr->sh_type == SHT_NOBITS) continue;
         if (!(shdr->sh_flags & SHF_ALLOC)) continue;
+        if (shdr->sh_size == 0) continue;
 
-        if (file_start == 0) {
-            file_start = shdr->sh_offset;
+        const char *name = (ctx->shstrtab && shdr->sh_name)
+                           ? ctx->shstrtab + shdr->sh_name : "(?)";
+
+        /* 刷新上一 section 遗留的尾字节（避免跨间隙拼接） */
+        if (s_tail_len > 0U) {
+            uint32_t flush_addr = next_flash;
+            if (Flush_Tail_To_Flash(&flush_addr) != HAL_OK) {
+                BL_ERR("flush tail failed at 0x%08x", next_flash);
+                return -1;
+            }
+            next_flash = flush_addr;
         }
 
-        /* 累计到当前 section 末尾 */
-        uint32_t sec_end = shdr->sh_offset + shdr->sh_size;
-        if (sec_end > file_start + total_size) {
-            total_size = sec_end - file_start;
+        /* 确定目标 Flash 地址（RAM section 的 target_addr 必须在 flush
+         * 之后计算，否则 flush 推进 next_flash 会导致重叠误判）
+         *
+         * 判断 Flash section 的标准：
+         *   - ARMCC ET_EXEC: sh_addr 在 Flash 范围 (0x08000000+)
+         *   - GCC 0-based:   sh_addr 在低地址 (< 0x10000000)，不含 RAM
+         *   两种情况都排除 RAM section (sh_addr >= 0x10000000 且不在 Flash 范围)
+         *
+         * 目标地址计算：
+         *   - ET_EXEC: sh_addr 已在 Flash 范围，target = sh_addr + offset
+         *   - 0-based: sh_addr 是虚拟偏移（从 0 起），target = app_start + sh_addr
+         *     不能用 sh_addr + offset，因为 offset = app_start - link_base，
+         *     对 link_base 之前的 section（如 .isr_vector addr=0）会映射到
+         *     flash_start 之前 */
+        uint32_t target_addr;
+        int is_flash_sec = (shdr->sh_addr >= FLASH_BASE_ADDR &&
+                            shdr->sh_addr <  FLASH_BASE_ADDR + FLASH_TOTAL_SIZE) ||
+                           (shdr->sh_addr <  0x10000000U);
+        if (is_flash_sec) {
+            if (shdr->sh_addr >= FLASH_BASE_ADDR) {
+                /* ET_EXEC: sh_addr 在 Flash 范围，用 reloc offset */
+                target_addr = shdr->sh_addr + ctx->offset;
+            } else {
+                /* 0-based: sh_addr 是虚拟偏移，直接加 app_start */
+                target_addr = flash_start + shdr->sh_addr;
+            }
+        } else {
+            /* RAM section (.data): load address 紧接上一个 section 之后 */
+            target_addr = next_flash;
         }
+
+        /* Flash 已擦除为 0xFF，间隙无需写入，直接跳过 */
+        if (target_addr > next_flash) {
+            BL_INFO("gap: 0x%08x ~ 0x%08x (%u bytes)",
+                    next_flash, target_addr - 1U, target_addr - next_flash);
+            next_flash = target_addr;
+        }
+
+        /* 重叠检测：tail-flush 推进 next_flash 后，target_addr 可能落在
+         * 已写入区域内（非 8 字节对齐 section 间间隙 < padding 字节数），
+         * 此时静默继续会导致数据写到错误位置 */
+        if (target_addr < next_flash) {
+            BL_ERR("overlap: section \"%s\" target 0x%08x < next_flash 0x%08x",
+                   name, target_addr, next_flash);
+            return -1;
+        }
+
+        if (target_addr + shdr->sh_size > flash_end) {
+            BL_ERR("section \"%s\" overflows flash (0x%08x + %u > 0x%08x)",
+                   name, target_addr, shdr->sh_size, flash_end);
+            return -1;
+        }
+
+        BL_INFO("  \"%s\": buf+0x%05x, %u bytes -> flash 0x%08x",
+                name, shdr->sh_offset, shdr->sh_size, target_addr);
+
+        uint32_t write_addr = target_addr;
+        uint8_t *src = elf_buf + shdr->sh_offset;
+
+        HAL_StatusTypeDef status = Write_Buffer_To_Flash(&write_addr, src, shdr->sh_size);
+        if (status != HAL_OK) {
+            BL_ERR("flash write FAILED for \"%s\"", name);
+            return -1;
+        }
+        next_flash = write_addr;
     }
 
-    if (file_start == 0 || total_size == 0) {
-        BL_ERR("no loadable sections found");
-        return -1;
-    }
-
-    BL_INFO("continuous write: buf+0x%05x, size=%u -> flash 0x%08x",
-            file_start, total_size, flash_start);
-
-    if (flash_start + total_size > flash_end) {
-        BL_ERR("image too large for flash partition");
-        return -1;
-    }
-
-    uint32_t write_addr = flash_start;
-    uint8_t *src = ctx->buf + file_start;
-
-    HAL_StatusTypeDef status = Write_Buffer_To_Flash(&write_addr, src, total_size);
-    if (status != HAL_OK) {
-        BL_ERR("flash write FAILED");
-        return -1;
-    }
-
-    uint32_t flush_addr = write_addr;
-    if (Flush_Tail_To_Flash(&flush_addr) != HAL_OK) {
-        BL_ERR("flush FAILED");
-        return -1;
+    /* 刷新最后的尾字节 */
+    if (s_tail_len > 0U) {
+        uint32_t flush_addr = next_flash;
+        if (Flush_Tail_To_Flash(&flush_addr) != HAL_OK) {
+            BL_ERR("final flush FAILED");
+            return -1;
+        }
+        next_flash = flush_addr;
     }
 
     BL_INFO("write OK: flash 0x%08x ~ 0x%08x (%u bytes)",
-            flash_start, flush_addr - 1, flush_addr - flash_start);
+            flash_start, next_flash - 1U, next_flash - flash_start);
 
     return 0;
 }
@@ -550,6 +623,10 @@ int bootloader_load_and_jump(void)
     int      ret;
     uint32_t elf_size = 0U;
     uint32_t entry    = 0U;
+    uint32_t avail_after = 0U;
+    uint8_t *meta_buf_ptr = NULL, *work_buf_ptr = NULL;
+    elf_ctx_stream_t ctx;
+    int load_ok = 0;
 
     /* 从 EEPROM 仿真读取目标 slot（SLOT_A=1，SLOT_B=2）*/
     uint32_t stored_slot = Read_Flag(EE_VAR_TARGET_SLOT);
@@ -577,31 +654,93 @@ int bootloader_load_and_jump(void)
         BL_WARN("no valid ELF in LittleFS (err=%d), trying existing App...", ret);
         goto try_existing;
     }
+    s_elf_file_size = elf_size;
 
-    /* ---- Step 2: 解析 ELF ---- */
+    /* ---- Step 2: 解析 ELF（stream 模式）---- */
     BL_INFO("[2/5] parsing ELF...");
 
-    elf_ctx_t ctx;
-    ret = elf_parse(&ctx, elf_buf, elf_size);
+    /*
+     * meta_buf / work_buf 分配策略：
+     *   ELF 文件已读入 elf_buf[40KB]，重定向时 writeback 直接修改 elf_buf。
+     *   meta_buf（~10KB）和 work_buf（~4KB）共约 14KB，放在栈上会溢出，
+     *   所以复用 elf_buf 中 ELF 文件末尾之后的空闲区域。
+     *   只要 ELF 文件 < 40KB - 14KB = 26KB 就安全（实际 AXF 通常 < 20KB）。
+     */
+    avail_after = (elf_size < ELF_BUF_SIZE) ? (ELF_BUF_SIZE - elf_size) : 0U;
+
+    if (avail_after >= ELF_STREAM_META_BUF_MIN + 4096U) {
+        meta_buf_ptr = elf_buf + elf_size;
+        work_buf_ptr = meta_buf_ptr + ELF_STREAM_META_BUF_MIN;
+    } else {
+        BL_ERR("ELF too large, no room for stream buffers");
+        goto try_existing;
+    }
+
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.io.read       = elf_buf_read;
+    ctx.io.user       = NULL;
+    ctx.meta_buf      = meta_buf_ptr;
+    ctx.meta_buf_size = ELF_STREAM_META_BUF_MIN;
+    ctx.work_buf      = work_buf_ptr;
+    ctx.work_buf_size = avail_after - ELF_STREAM_META_BUF_MIN;
+
+    ret = elf_parse_stream(&ctx);
     if (ret != ELF_OK) {
-        BL_ERR("elf_parse failed: %d", ret);
+        BL_ERR("elf_parse_stream failed: %d", ret);
         goto try_existing;
     }
 
     /* ---- Step 3: 重定向 ---- */
-    BL_INFO("[3/5] relocating (base=0x%08x)...", app_start);
+    /* 推导 link_base：取第一个 exec section 的 sh_addr */
+    uint32_t link_base = 0U;
+    int found_exec = 0;
+    for (uint32_t si = 0; si < ctx.load_count; si++) {
+        elf32_shdr *s = &ctx.shdrs[ctx.load_shidx[si]];
+        if ((s->sh_flags & SHF_EXECINSTR) && !(s->sh_flags & SHF_WRITE)) {
+            link_base = s->sh_addr;
+            found_exec = 1;
+            break;
+        }
+    }
+    if (!found_exec) {
+        BL_ERR("no exec section found, cannot relocate");
+        goto try_existing;
+    }
+    /* 0-based ELF 修正：
+     * 0-based ELF 的虚拟地址空间从 0 开始，第一个 exec section 的
+     * sh_addr（如 0x190）只是段偏移，不是真正的基地址。
+     * 如果用 section offset 作为 link_base，reloc_offset = app_start - 0x190，
+     * 所有重定位值都会偏少 0x190。正确的 link_base 应为 0。
+     * 注意：Flash 地址（0x08000000+）虽然 < 0x10000000，但不是 0-based，
+     * 必须用 FLASH_BASE_ADDR 作为分界线。 */
+    if (link_base != 0U && link_base < FLASH_BASE_ADDR) {
+        BL_INFO("0-based ELF detected, link_base 0x%08x -> 0", link_base);
+        link_base = 0U;
+    }
+    /* link_base 合法性检查：
+     *   - 0-based:     link_base == 0（已修正），合法
+     *   - ET_EXEC:     link_base 在 Flash 范围（0x08000000+），合法
+     *   拒绝的情况：link_base > 0 但不在 Flash 范围，
+     *   这说明 .ARM.extab 等非代码 section 带了 SHF_EXECINSTR 被误取为基准 */
+    if (link_base > 0U &&
+        (link_base < FLASH_BASE_ADDR || link_base >= FLASH_BASE_ADDR + FLASH_TOTAL_SIZE)) {
+        BL_ERR("link_base 0x%08x out of Flash range, cannot relocate", link_base);
+        goto try_existing;
+    }
+    /* offset = 运行时基地址 − 链接时基地址 */
+    uint32_t reloc_offset = app_start - link_base;
+    uint32_t app_max      = (target_slot == SLOT_B) ? APP_B_SIZE : APP_A_SIZE;
 
-    ret = elf_relocate(&ctx, app_start);
+    BL_INFO("[3/5] relocating (link_base=0x%08x offset=0x%08x)...", link_base, reloc_offset);
+
+    ret = elf_relocate_stream(&ctx, reloc_offset, app_max, elf_buf_writeback);
     if (ret != ELF_OK) {
-        BL_ERR("elf_relocate failed: %d", ret);
+        BL_ERR("elf_relocate_stream failed: %d", ret);
         goto try_existing;
     }
 
-    /* section 布局汇总（调试用）*/
-    elf_dump_sections(&ctx);
-
     /* 入口地址 */
-    entry = elf_get_entry(&ctx);
+    entry = elf_stream_get_entry(&ctx);
     if (entry == 0U) {
         BL_ERR("invalid entry point (e_entry=0)");
         goto try_existing;
@@ -620,20 +759,21 @@ int bootloader_load_and_jump(void)
     /* 写入成功后可删除 LittleFS 中的 ELF（节省空间，可选）*/
     /* lfs_remove(&lfs_ctx.lfs, APP_ELF_PATH); */
 
-    goto do_jump;
+    load_ok = 1;
 
 try_existing:
-    /* ---- 降级：跳转到 Flash 中已有的 App ---- */
-    BL_WARN("[4/5] skip Flash write, trying existing App at 0x%08x...", app_start);
+    if (!load_ok) {
+        /* ---- 降级：跳转到 Flash 中已有的 App ---- */
+        BL_WARN("[4/5] skip Flash write, trying existing App at 0x%08x...", app_start);
 
-    if (!Verify_APP_Integrity_Flash(app_start)) {
-        while (1) {}
+        if (!Verify_APP_Integrity_Flash(app_start)) {
+            while (1) {}
+        }
+
+        entry = *(__IO uint32_t *)(app_start + 4U);
+        BL_INFO("fallback entry: 0x%08x", entry);
     }
 
-    entry = *(__IO uint32_t *)(app_start + 4U);
-    BL_INFO("fallback entry: 0x%08x", entry);
-
-do_jump:
     /* ---- Step 5: 跳转（通过 Jump_To_App_Flash 统一清理）---- */
     BL_INFO("[5/5] jumping to App at 0x%08x...", entry);
 

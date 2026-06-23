@@ -993,14 +993,14 @@
               <FilePath>..\Core\interface\ELF\elf.h</FilePath>
             </File>
             <File>
-              <FileName>elf_loader.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Core\interface\ELF\elf_loader.c</FilePath>
-            </File>
-            <File>
               <FileName>elf_loader.h</FileName>
               <FileType>5</FileType>
               <FilePath>..\Core\interface\ELF\elf_loader.h</FilePath>
+            </File>
+            <File>
+              <FileName>elf_loader_stream.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\interface\ELF\elf_loader_stream.c</FilePath>
             </File>
             <File>
               <FileName>ota_state_machine.c</FileName>
@@ -1106,6 +1106,11 @@
               <FileName>bsp_wifi.h</FileName>
               <FileType>5</FileType>
               <FilePath>..\Core\interface\BSP_WIFI\bsp_wifi.h</FilePath>
+            </File>
+            <File>
+              <FileName>elf_loader_stream.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Core\interface\ELF\elf_loader_stream.h</FilePath>
             </File>
           </Files>
         </Group>

@@ -33,18 +33,24 @@
  *   work_buf：建议 4–16 KB；exec Pass-1 bitmap 占 256K/4/8 = 8 KB
  *             若 work_buf < 8 KB，bitmap 压缩到 work_buf 一半，chunk 变小但正确
  *
- * ── 两遍 exec 扫描说明 ──
- *
- *   Pass-1（build litpool bitmap）：
- *     以 half-word 分块扫描，识别 16-bit LDR Rn,[PC,#imm8*4] 和
- *     32-bit LDR Rn,[PC,#imm12]，在 bitmap 中标记 literal pool word 位置。
- *     需处理 32-bit LDR 跨块边界（上半字 0xF85F 在块尾）：pending_f85f 状态位。
- *
- *   Pass-2（relocate + writeback）：
- *     以 word 分块，携带 3-word carry 处理 scatter 跨块检测。
- *     scatter 处理优先（4-word 滑动窗口），其次向量表，再次 literal pool，
- *     最后函数体内部一律跳过。
- */
+* ── 三遍 exec 扫描说明 ──
+*
+*   Pass-1（build litpool bitmap）：
+*     以 half-word 分块扫描，识别 16-bit LDR Rn,[PC,#imm8*4] 和
+*     32-bit LDR Rn,[PC,#imm12]，在 bitmap 中标记 literal pool word 位置。
+*     需处理 32-bit LDR 跨块边界（上半字 0xF85F 在块尾）：pending_f85f 状态位。
+*
+*   Pass-2（relocate + writeback）：
+*     以 word 分块，携带 3-word carry 处理 scatter 跨块检测。
+*     scatter 处理优先（4-word 滑动窗口），其次向量表，再次 literal pool，
+*     最后函数体内部一律跳过。
+*
+*   Pass-3（MOVW/MOVT pair relocation）：
+*     以 half-word 粒度扫描，检测 Thumb2 MOVW(0xF240)/MOVT(0xF2C0) 指令对。
+*     MOVW/MOVT 将 32 位地址编码为两个 16 位立即数嵌入指令中，
+*     不在 literal pool 中，Pass-2 的 word 级扫描无法检测。
+*     按 Rd 寄存器配对，解码组合地址，若落入 link Flash 范围则重定向写回。
+*/
 
 #include "elf_loader_stream.h"
 #include <string.h>
@@ -250,14 +256,16 @@ static void movw_encode_imm16(uint16_t imm16, uint16_t *upper, uint16_t *lower)
  * @param half_base    本块首 half 在 section 内的绝对 half 索引
  * @param sec_words    section 总 word 数
  * @param bitmap       位图缓冲区（已清零，全 section 大小）
- * @param pending_f85f 跨块状态：上块末尾遗留的 0xF85F 上半字
+ * @param pending_32bit 跨块状态：上块末尾遗留的 32-bit LDR 上半字
+ * @param pending_hw   跨块时上半字内容（0xF8DF 或 0xF85F）
  * =================================================================== */
 static void litpool_bitmap_update(const uint16_t *h16,
                                   uint32_t        chunk_halfs,
                                   uint32_t        half_base,
                                   uint32_t        sec_words,
                                   uint8_t        *bitmap,
-                                  int            *pending_f85f)
+                                  int            *pending_32bit,
+                                  uint16_t       *pending_hw)
 {
 #define SET_LP(lp_w) do { \
     uint32_t _w=(lp_w); \
@@ -272,12 +280,22 @@ static void litpool_bitmap_update(const uint16_t *h16,
         uint32_t instr_byte = h * 2U;
         uint32_t pc_align   = (instr_byte + 4U) & ~3U;
 
-        /* ── 处理跨块遗留的 0xF85F 上半字 ── */
-        if (*pending_f85f) {
-            *pending_f85f = 0;
-            uint32_t prev_pc = ((h-1U)*2U + 4U) & ~3U;
-            uint32_t imm     = (uint32_t)(h16[i] & 0x0FFFU);
-            SET_LP((prev_pc + imm) / 4U);
+        /* ── 处理跨块遗留的 32-bit LDR 上半字 ── */
+        if (*pending_32bit) {
+            *pending_32bit = 0;
+            /* 上半字位于 h-1，PC = 上半字地址 + 4（Thumb2 流水线） */
+            uint32_t pend_pc = ((h-1U)*2U + 4U) & ~3U;
+            if (*pending_hw == 0xF8DFU) {
+                /* LDR Rt,[PC,#+imm12] */
+                uint32_t imm = (uint32_t)(h16[i] & 0x0FFFU);
+                SET_LP((pend_pc + imm) / 4U);
+            } else {
+                /* LDR Rt,[PC,#-imm8]  (0xF85F): imm8 是字节偏移，负方向 */
+                uint32_t imm8 = (uint32_t)(h16[i] & 0x00FFU);
+                if (imm8 <= pend_pc) {
+                    SET_LP((pend_pc - imm8) / 4U);
+                }
+            }
             continue;
         }
 
@@ -290,14 +308,31 @@ static void litpool_bitmap_update(const uint16_t *h16,
             continue;
         }
 
-        /* 32-bit LDR Rn,[PC,#imm12]  upper=0xF85F */
-        if (instr == 0xF85FU) {
+        /* 32-bit LDR Rt,[PC,#+imm12]  upper=0xF8DF */
+        if (instr == 0xF8DFU) {
             if (i+1U < chunk_halfs) {
                 uint32_t imm = (uint32_t)(h16[i+1U] & 0x0FFFU);
                 SET_LP((pc_align + imm) / 4U);
                 i++;
             } else {
-                *pending_f85f = 1;
+                *pending_32bit = 1;
+                *pending_hw = instr;
+            }
+            continue;
+        }
+
+        /* 32-bit LDR Rt,[PC,#-imm8]  upper=0xF85F
+         * T1 编码：imm8 为字节偏移，目标 = PC - imm8 */
+        if (instr == 0xF85FU) {
+            if (i+1U < chunk_halfs) {
+                uint32_t imm8 = (uint32_t)(h16[i+1U] & 0x00FFU);
+                if (imm8 <= pc_align) {
+                    SET_LP((pc_align - imm8) / 4U);
+                }
+                i++;
+            } else {
+                *pending_32bit = 1;
+                *pending_hw = instr;
             }
             continue;
         }
@@ -398,6 +433,10 @@ int elf_parse_stream(elf_ctx_stream_t *ctx)
             else ELF_WARN("too many REL/RELA, sec[%u] ignored", i);
             break;
         case SHT_PROGBITS: case SHT_NOBITS:
+        case 14:  /* SHT_INIT_ARRAY */
+        case 15:  /* SHT_FINI_ARRAY */
+        case 16:  /* SHT_PREINIT_ARRAY */
+        case 0x70000001U: /* SHT_ARM_EXIDX */
             if ((s->sh_flags & SHF_ALLOC) && s->sh_size>0) {
                 if (ctx->load_count < ELF_STREAM_MAX_LOAD)
                     ctx->load_shidx[ctx->load_count++]=(uint16_t)i;
@@ -451,13 +490,24 @@ static int reloc_path_a(elf_ctx_stream_t *ctx,
     for (uint32_t ri=0; ri<ctx->rel_count; ri++) {
         elf32_shdr *rel_shdr = &ctx->shdrs[ctx->rel_shidx[ri]];
 
+        /* 重置 MOVW lookahead 状态，防止上一个 REL section 遗留的
+         * pending MOVW 在本 section 被 MOVT 错误消费 */
+        {
+            uint32_t *state = (uint32_t *)ctx->work_buf;
+            state[2] = 0U;
+        }
+
         /* REL section 针对哪个 target section？ */
         uint32_t target_idx = rel_shdr->sh_info;
         if (target_idx >= ctx->ehdr->e_shnum) { total_skip++; continue; }
         elf32_shdr *tgt = &ctx->shdrs[target_idx];
 
         uint32_t entsize = rel_shdr->sh_entsize;
-        if (entsize < 8U) entsize = 8U;   /* REL entry = 8 bytes */
+        if (entsize < 8U)  entsize = 8U;   /* REL entry = 8 bytes */
+        if (entsize > 16U) {                /* RELA = 12, 防止异常值 */
+            ELF_WARN("REL[%u] entsize=%u abnormal, skip", ri, entsize);
+            total_skip++; continue;
+        }
         uint32_t n_entries = rel_shdr->sh_size / entsize;
 
         ELF_INFO("  REL[%u]: %u entries -> sec[%u] addr=0x%08x",
@@ -497,33 +547,71 @@ static int reloc_path_a(elf_ctx_stream_t *ctx,
 
             switch (r_type) {
 
-            /* ── ABS32 / TARGET1 ─────────────────── */
+            /* ── ABS32 / TARGET1 ───────────────────
+             *  仅重定向 Flash 地址；RAM 地址（MSP、.data 指针等）
+             *  不随 Flash 偏移变化，必须跳过。
+             *  val==0 为 NULL 指针，0-based ELF 中 val>=link_base(0)
+             *  会误判为 Flash 地址，需显式跳过。
+             *  加 post-check 防止损坏/恶意 ELF 写出非法地址。
+             */
             case R_ARM_ABS32:
             case R_ARM_TARGET1: {
                 uint32_t val;
                 if (ctx->io.read(file_off, &val, 4, ctx->io.user)!=0){
                     ELF_ERR("read ABS32 failed"); total_err++; break;
                 }
-                uint32_t nv = val + offset;
-                ELF_VERB("ABS32 @0x%08x  0x%08x -> 0x%08x", r_offset, val, nv);
-                if (writeback(file_off, &nv, 4, ctx->io.user)!=0){
-                    ELF_ERR("writeback ABS32 failed"); total_err++; break;
+                if (val == 0U) { total_skip++; break; }  /* NULL 指针 */
+                uint32_t v_check = val & ~1U;   /* 去掉 Thumb bit */
+                if (v_check >= link_base && v_check < link_base + rt_size) {
+                    uint32_t nv = val + offset;
+                    uint32_t a = nv & ~1U;
+                    if ((a >= rt_base && a < rt_base + rt_size) ||
+                        reloc_in_ram_s(a)) {
+                        ELF_VERB("ABS32 @0x%08x  0x%08x -> 0x%08x", r_offset, val, nv);
+                        if (writeback(file_off, &nv, 4, ctx->io.user)!=0){
+                            ELF_ERR("writeback ABS32 failed"); total_err++; break;
+                        }
+                        total_abs32++;
+                    } else {
+                        ELF_WARN("ABS32 postchk fail: 0x%08x -> 0x%08x", val, nv);
+                        total_skip++;
+                    }
+                } else {
+                    ELF_VERB("ABS32 @0x%08x  0x%08x skip (not Flash)", r_offset, val);
+                    total_skip++;
                 }
-                total_abs32++;
                 break;
             }
 
-            /* ── RELATIVE ────────────────────────── */
+            /* ── RELATIVE ──────────────────────────
+             *  同 ABS32，仅重定向 link Flash 范围内的值
+             *  val==0 为 NULL，跳过（同 ABS32）。
+             *  加 post-check 防止损坏/恶意 ELF 写出非法地址。
+             */
             case R_ARM_RELATIVE: {
                 uint32_t val;
                 if (ctx->io.read(file_off, &val, 4, ctx->io.user)!=0){
                     ELF_ERR("read RELATIVE failed"); total_err++; break;
                 }
-                uint32_t nv = val + offset;
-                if (writeback(file_off, &nv, 4, ctx->io.user)!=0){
-                    ELF_ERR("writeback RELATIVE failed"); total_err++; break;
+                if (val == 0U) { total_skip++; break; }  /* NULL 指针 */
+                uint32_t v_check = val & ~1U;
+                if (v_check >= link_base && v_check < link_base + rt_size) {
+                    uint32_t nv = val + offset;
+                    uint32_t a = nv & ~1U;
+                    if ((a >= rt_base && a < rt_base + rt_size) ||
+                        reloc_in_ram_s(a)) {
+                        if (writeback(file_off, &nv, 4, ctx->io.user)!=0){
+                            ELF_ERR("writeback RELATIVE failed"); total_err++; break;
+                        }
+                        total_abs32++;
+                    } else {
+                        ELF_WARN("RELATIVE postchk fail: 0x%08x -> 0x%08x", val, nv);
+                        total_skip++;
+                    }
+                } else {
+                    ELF_VERB("RELATIVE @0x%08x  0x%08x skip (not Flash)", r_offset, val);
+                    total_skip++;
                 }
-                total_abs32++;
                 break;
             }
 
@@ -538,56 +626,17 @@ static int reloc_path_a(elf_ctx_stream_t *ctx,
 
                 uint16_t imm16 = movw_decode_imm16(upper, lower);
 
-                /* 重建完整地址用于判断：需要配对的另一条记录。
-                 * 但 REL 表无 addend，且 MOVW/MOVT 各自独立记录。
-                 * 策略：对 imm16 加 offset 的低16位/高16位。
-                 * MOVW 记录：imm16 是目标地址低16位
-                 *   new_low16  = (full_addr + offset) & 0xFFFF
-                 *   full_addr  = (当前 MOVT imm16 << 16) | (当前 MOVW imm16)
-                 * 但两条记录独立出现，无法在单条里还原 full_addr。
-                 * 可行方案：保守做法，若 imm16 对应的"full 地址预测"
-                 *   落在 link Flash 范围，则 full_addr += offset 后写回对应16位。
-                 * 对 MOVT：高16位 = imm16，若 imm16 == link_base>>16，需要更新。
-                 * 对 MOVW：低16位 = imm16，无歧义，直接加 offset 低16位。
-                 *
-                 * 最稳妥：结合两者，但由于 REL 是顺序出现的 MOVW 后紧跟 MOVT，
-                 * 我们可以在 MOVW 时缓存 imm16，MOVT 时组合成完整地址再处理。
-                 * 此处采用简单独立处理：
-                 *   MOVW：new_imm16 = (uint16_t)((imm16 + (uint16_t)offset))
-                 *         但要考虑进位到高位；用 full_addr 来处理。
-                 * 最终采用：读取 MOVW 时保存，等到 MOVT 时一并处理（状态机）。
-                 * 此处实现简化版：逐条处理，依赖 MOVW/MOVT 严格相邻。
-                 */
-
-                /* 简单且正确的做法：
-                 * MOVW/MOVT 通常成对且 MOVT 紧跟 MOVW。
-                 * 对 MOVW 记录（type=47）：仅写入低16位
-                 *   new_full = (last_movt_imm16<<16|imm16) + offset
-                 *   新 MOVW  = new_full & 0xFFFF
-                 * 需要 lookahead。替代方案：
-                 *   MOVW 记录：存入 state machine
-                 *   MOVT 记录：组合后一次性更新两条
-                 * 为避免状态机复杂度，改用最简原则：
-                 *   单独处理每条，MOVW 加 offset 低16位（含进位），
-                 *   MOVT 加 offset 高16位（+进位来自 MOVW）。
-                 *   由于 MOVW 必然先于 MOVT，且我们按顺序遍历，
-                 *   可以用 static 变量记录 MOVW 进位。
-                 *
-                 * 但 static 在多实例并发下不安全。
-                 * 最佳做法：预读下一条，若当前=MOVW，下一条=MOVT，组合处理。
-                 */
-
-                /* === 实现：lookahead 组合 MOVW+MOVT === */
+                /* === lookahead 组合 MOVW+MOVT === */
                 if (r_type == R_ARM_THM_MOVW_ABS_NC) {
-                    /* 缓存当前 MOVW，等待 MOVT（下一条 REL entry）*/
-                    /* 此处保存 file_off 和 upper/lower，在下次循环处理 */
-                    /* 用 work_buf 前 12 字节作为跨条目临时状态 */
                     uint32_t *state = (uint32_t *)ctx->work_buf;
-                    state[0] = file_off;          /* MOVW file offset */
+                    if (state[2] == 0xF00DF00DU) {
+                        ELF_WARN("MOVW overwrite: prev MOVW @0x%08x orphaned",
+                                 state[0]);
+                    }
+                    state[0] = file_off;
                     state[1] = (uint32_t)upper | ((uint32_t)lower<<16);
-                    state[2] = 0xF00DF00DU;       /* magic: 有待处理的 MOVW */
+                    state[2] = 0xF00DF00DU;
                     ELF_VERB("MOVW @0x%08x imm16=0x%04x (buffered)", r_offset, imm16);
-                    total_movw++;
                     break;
                 }
 
@@ -605,37 +654,44 @@ static int reloc_path_a(elf_ctx_stream_t *ctx,
                         state[2]   = 0U;  /* 消费 */
 
                         uint16_t w_imm16 = movw_decode_imm16(movw_upper, movw_lower);
-                        uint16_t t_imm16 = imm16;  /* 当前 MOVT */
+                        uint16_t t_imm16 = imm16;
 
                         uint32_t full_addr = ((uint32_t)t_imm16<<16) | w_imm16;
                         uint32_t new_full  = full_addr + offset;
 
-                        /* 仅当 full_addr 在 link Flash 范围内才更新 */
-                        uint32_t link_size = rt_size;
                         int needs_reloc = (full_addr >= link_base &&
-                                           full_addr <  link_base + link_size);
+                                           full_addr <  link_base + rt_size);
 
                         if (needs_reloc) {
-                            uint16_t new_w = (uint16_t)(new_full & 0xFFFFU);
-                            uint16_t new_t = (uint16_t)(new_full >> 16);
+                            /* post-check: 确认重定向后地址在运行时 Flash 或 RAM */
+                            uint32_t a = new_full & ~1U;
+                            if ((a >= rt_base && a < rt_base + rt_size) ||
+                                reloc_in_ram_s(a)) {
+                                uint16_t new_w = (uint16_t)(new_full & 0xFFFFU);
+                                uint16_t new_t = (uint16_t)(new_full >> 16);
 
-                            uint16_t wu = movw_upper, wl = movw_lower;
-                            movw_encode_imm16(new_w, &wu, &wl);
-                            if (writeback(movw_foff,   &wu, 2, ctx->io.user)!=0 ||
-                                writeback(movw_foff+2U,&wl, 2, ctx->io.user)!=0) {
-                                ELF_ERR("writeback MOVW failed"); total_err++; break;
+                                uint16_t wu = movw_upper, wl = movw_lower;
+                                movw_encode_imm16(new_w, &wu, &wl);
+                                if (writeback(movw_foff,   &wu, 2, ctx->io.user)!=0 ||
+                                    writeback(movw_foff+2U,&wl, 2, ctx->io.user)!=0) {
+                                    ELF_ERR("writeback MOVW failed"); total_err++; break;
+                                }
+
+                                uint16_t tu=upper, tl=lower;
+                                movt_encode_imm16(new_t, &tu, &tl);
+                                if (writeback(file_off,   &tu, 2, ctx->io.user)!=0 ||
+                                    writeback(file_off+2U,&tl, 2, ctx->io.user)!=0) {
+                                    ELF_ERR("writeback MOVT failed"); total_err++; break;
+                                }
+
+                                ELF_VERB("MOVW/T @0x%08x/0x%08x  0x%08x -> 0x%08x",
+                                         movw_foff, file_off, full_addr, new_full);
+                                total_movw++;
+                            } else {
+                                ELF_WARN("MOVW/T postchk fail: 0x%08x -> 0x%08x",
+                                         full_addr, new_full);
+                                total_skip++;
                             }
-
-                            uint16_t tu=upper, tl=lower;
-                            movt_encode_imm16(new_t, &tu, &tl);
-                            if (writeback(file_off,   &tu, 2, ctx->io.user)!=0 ||
-                                writeback(file_off+2U,&tl, 2, ctx->io.user)!=0) {
-                                ELF_ERR("writeback MOVT failed"); total_err++; break;
-                            }
-
-                            ELF_VERB("MOVW/T @0x%08x/0x%08x  0x%08x -> 0x%08x",
-                                     movw_foff, file_off, full_addr, new_full);
-                            total_movw++;
                         } else {
                             ELF_VERB("MOVW/T @0x%08x skip (0x%08x RAM/other)",
                                      movw_foff, full_addr);
@@ -654,11 +710,16 @@ static int reloc_path_a(elf_ctx_stream_t *ctx,
             case R_ARM_THM_CALL:
             case R_ARM_CALL:
             case R_ARM_JUMP24:
+            case R_ARM_THM_JUMP24:
                 /* BL/BLX PC-relative：目标与位置同步偏移，相对距离不变，无需修改 */
                 total_call++;
                 break;
 
-            /* ── V4BX ────────────────────────────── */
+            /* ── V4BX / PREL31 (type=40) ─────────── */
+            /* R_ARM_V4BX == R_ARM_PREL31 == 40
+             * V4BX: ARMv4 BX 指令修补，无需修改
+             * PREL31: .ARM.exidx 31-bit PC-relative 偏移，无需修改
+             */
             case R_ARM_V4BX:
                 total_skip++;
                 break;
@@ -683,7 +744,7 @@ static int reloc_path_a(elf_ctx_stream_t *ctx,
     }
 
     ELF_INFO("  ABS32/REL=%u  MOVW/T pairs=%u  CALL(skip)=%u  other_skip=%u  err=%u",
-             total_abs32, total_movw/2U, total_call, total_skip, total_err);
+             total_abs32, total_movw, total_call, total_skip, total_err);
     return total_err ? ELF_ERR_PARAM : ELF_OK;
 }
 
@@ -691,13 +752,14 @@ static int reloc_path_a(elf_ctx_stream_t *ctx,
  * 路径 B — 值域猜测重定向（无 REL 表时使用）
  *
  * Fix-B1: scan_exec 去掉 sh_addr==0 限制，改为仅检查 is_exec && !is_write
- * Fix-B2: LINK_MIN/LINK_END 以 sh_addr（链接基地址）为基准
- *         LINK_MIN = sh_addr + 0x100（最小合法偏移）
- *         LINK_END = sh_addr + app_max_size
+ * Fix-B2: LINK_MIN/LINK_END 以全局 link_base（第一个 exec section 的 sh_addr）为基准
+ * Fix-B3: RT_BASE 使用全局 rt_base（= link_base + offset），而非 offset 本身
  * =================================================================== */
 static int reloc_path_b(elf_ctx_stream_t *ctx,
                         uint32_t          offset,
                         uint32_t          app_max_size,
+                        uint32_t          link_base,
+                        uint32_t          rt_base,
                         elf_writeback_fn  writeback)
 {
     ELF_INFO("--- Path B: value-range relocation (no REL table) ---");
@@ -715,7 +777,7 @@ static int reloc_path_b(elf_ctx_stream_t *ctx,
     }
     if (actual_code_end == 0U) actual_code_end = app_max_size;
 
-    uint32_t total_scanned=0, total_fixed=0;
+    uint32_t total_scanned=0, total_fixed=0, total_movw=0;
     uint32_t skip_section=0, skip_bounds=0, skip_align=0;
     uint32_t skip_float=0, skip_thumb=0, skip_litpool=0, skip_postchk=0;
     uint32_t scatter_entries=0;
@@ -745,12 +807,12 @@ static int reloc_path_b(elf_ctx_stream_t *ctx,
 
         uint32_t sec_words = shdr->sh_size / 4U;
 
-        /* Fix-B2: 以 sh_addr 为基准计算 LINK 范围 */
-        uint32_t LINK_BASE   = shdr->sh_addr;                 /* 链接时该 section 起始地址 */
-        uint32_t LINK_MIN    = LINK_BASE + 0x100U;            /* 最小有效地址偏移 */
-        uint32_t LINK_END    = LINK_BASE + app_max_size;      /* 链接分区上界 */
-        uint32_t LINK_STRICT = actual_code_end;               /* Thumb 指针上界 */
-        uint32_t RT_BASE     = offset;                        /* 运行时基地址 */
+        /* Fix-B2: 以全局 link_base 为基准计算 LINK 范围 */
+        uint32_t LINK_BASE   = link_base;                        /* 全局链接基地址 */
+        uint32_t LINK_MIN    = link_base + 0x100U;               /* 最小有效地址偏移 */
+        uint32_t LINK_END    = link_base + app_max_size;         /* 链接分区上界 */
+        uint32_t LINK_STRICT = actual_code_end;                  /* Thumb 指针上界 */
+        uint32_t RT_BASE     = rt_base;                          /* 运行时基地址 */
         uint32_t RT_SIZE     = app_max_size;
 
         uint32_t sec_fixed = 0U;
@@ -777,7 +839,8 @@ static int reloc_path_b(elf_ctx_stream_t *ctx,
 
             /* ── Pass-1: build litpool bitmap ── */
             {
-                int pending = 0;
+                int pending_32bit = 0;
+                uint16_t pending_hw = 0;
                 uint32_t half_end = sec_words * 2U;
                 for (uint32_t hoff=0; hoff<half_end; ) {
                     uint32_t nh = MIN(chunk_halfcap, half_end-hoff);
@@ -786,7 +849,8 @@ static int reloc_path_b(elf_ctx_stream_t *ctx,
                         ELF_ERR("Pass-1 read failed"); return ELF_ERR_PARAM;
                     }
                     litpool_bitmap_update((const uint16_t *)chunk_buf,
-                                         nh, hoff, sec_words, bitmap, &pending);
+                                         nh, hoff, sec_words, bitmap,
+                                         &pending_32bit, &pending_hw);
                     hoff += nh;
                 }
             }
@@ -821,6 +885,9 @@ static int reloc_path_b(elf_ctx_stream_t *ctx,
                     uint32_t total_in = carry_n + new_words;
                     if (total_in == 0U) break;
 
+                    /* abs_base: wbuf[0] 对应的绝对 word 索引。
+                     * 不变量：非首次迭代时 word_off >= carry_n（因为
+                     * new_words >= 1 才能到达后续迭代），不会下溢。 */
                     uint32_t abs_base = (carry_n>0&&word_off>0) ? word_off-carry_n : 0U;
                     uint32_t wb_start = carry_n;
                     uint32_t sc_start = (carry_n>=3U) ? carry_n-3U : 0U;
@@ -856,12 +923,39 @@ static int reloc_path_b(elf_ctx_stream_t *ctx,
                             skip_litpool++; w++; continue;
                         }
 
+                        /* Fix-B4: 跳过 Thumb2 MOVW/MOVT 指令编码
+                         * 0-based ELF 中 MOVT 编码如 0x0000F2C4 会落在
+                         * [LINK_MIN, LINK_END) 范围内被误判为 Flash 指针。
+                         * 这些指令由 Pass-3 MOVW/MOVT 扫描器单独处理。
+                         * 检测方法：word 低 16 位（内存中第一个 half-word）
+                         * 匹配 MOVW (0xF24x/0xF26x) 或 MOVT (0xF2Cx/0xF2Ex) */
+                        {
+                            uint16_t hw0 = (uint16_t)(wbuf[w] & 0xFFFFU);
+                            if ((hw0 & 0xFBF0U) == 0xF240U ||  /* MOVW */
+                                (hw0 & 0xFBF0U) == 0xF2C0U) {  /* MOVT */
+                                ELF_VERB("[%3u] skip MOVW/MOVT 0x%08x", abs_w, wbuf[w]);
+                                skip_litpool++; w++; continue;
+                            }
+                        }
+
                         int fixed = relocate_word_s(
                             &wbuf[w], offset, LINK_MIN, LINK_END, LINK_STRICT,
                             RT_BASE, RT_SIZE, abs_w,
                             &skip_bounds, &skip_align, &skip_float,
                             &skip_thumb, &skip_postchk);
-                        if (fixed) { sec_fixed++; total_fixed++; }
+                        if (fixed) {
+                            sec_fixed++; total_fixed++;
+                            /* carry 区域内的非 scatter word 被 modify 后
+                             * 不会进入 wb_start 批量 writeback 范围，
+                             * 必须立即单独写回，否则修改会丢失 */
+                            if (w < carry_n) {
+                                uint32_t co = shdr->sh_offset + (abs_base + w) * 4U;
+                                if (writeback(co, &wbuf[w], 4U, ctx->io.user) != 0) {
+                                    ELF_ERR("carry non-scatter writeback failed");
+                                    return ELF_ERR_PARAM;
+                                }
+                            }
+                        }
                         w++;
                     }
 
@@ -880,6 +974,158 @@ static int reloc_path_b(elf_ctx_stream_t *ctx,
                     if (new_words==0U) break;
                 }
                 ELF_INFO("    exec \"%s\": fixed=%u scatter=%u", name, sec_fixed, sec_scatter);
+            }
+
+            /* ── Pass-3: MOVW/MOVT pair relocation ──
+             *
+             * Thumb2 MOVW/MOVT 将 32 位地址编码为两个 16 位立即数
+             * 嵌入指令中，不在 literal pool 内，Pass-2 word 级扫描
+             * 无法检测。此 pass 以 half-word 粒度扫描，
+             * 检测 MOVW(0xF240) / MOVT(0xF2C0) 指令对，
+             * 按 Rd 寄存器配对，解码组合地址，若在 link Flash 范围
+             * 则重定向写回。
+             */
+            {
+                struct {
+                    uint16_t upper;     /* MOVW upper halfword (原始) */
+                    uint16_t lower;     /* MOVW lower halfword (原始) */
+                    uint32_t file_off;  /* MOVW 在文件中的偏移 */
+                    uint16_t imm16;     /* MOVW 解码的 imm16 */
+                    int      valid;     /* 是否有待配对的 MOVW */
+                } mtrack[16];
+                memset(mtrack, 0, sizeof(mtrack));
+
+                uint32_t ch3_half = ctx->work_buf_size / 2U;
+                uint32_t sec_half = shdr->sh_size / 2U;
+                uint32_t pend = 0U;       /* 跨块 32-bit 指令上半字标志 */
+                uint16_t pend_hw = 0U;    /* 上半字内容 */
+                uint32_t pend_foff = 0U;  /* 上半字文件偏移 */
+
+                for (uint32_t ho = 0U; ho < sec_half; ) {
+                    uint32_t nh = MIN(ch3_half, sec_half - ho);
+                    if (ctx->io.read(shdr->sh_offset + ho * 2U,
+                                     ctx->work_buf, nh * 2U,
+                                     ctx->io.user) != 0) {
+                        ELF_ERR("Pass-3 read failed"); return ELF_ERR_PARAM;
+                    }
+                    const uint16_t *h16 = (const uint16_t *)ctx->work_buf;
+                    uint32_t j = 0U;
+
+                    /* 处理跨块遗留的 32-bit 指令上半字 */
+                    if (pend && nh > 0U) {
+                        uint16_t lo = h16[0];
+                        if ((pend_hw & 0xFBF0U) == 0xF240U) {
+                            uint16_t rd = (lo >> 8) & 0xFU;
+                            mtrack[rd].upper    = pend_hw;
+                            mtrack[rd].lower    = lo;
+                            mtrack[rd].file_off = pend_foff;
+                            mtrack[rd].imm16    = movw_decode_imm16(pend_hw, lo);
+                            mtrack[rd].valid    = 1;
+                            ELF_VERB("MOVW R%u imm16=0x%04x (x-chunk)",
+                                     rd, mtrack[rd].imm16);
+                        }
+                        else if ((pend_hw & 0xFBF0U) == 0xF2C0U) {
+                            uint16_t rd = (lo >> 8) & 0xFU;
+                            if (rd < 16U && mtrack[rd].valid) {
+                                uint16_t ti = movw_decode_imm16(pend_hw, lo);
+                                    uint32_t fa = ((uint32_t)ti << 16) | mtrack[rd].imm16;
+                                /* MOVW/MOVT 使用 LINK_BASE 而非 LINK_MIN 做范围检测：
+                                 * LINK_MIN 加了 0x100 偏移是为了在 word 级扫描中排除
+                                 * 小整数常量的误判，但 MOVW/MOVT 只在编译器生成
+                                 * 真正地址时才出现，不会与 [0, 0x100) 的小整数混淆，
+                                 * 因此直接用 LINK_BASE 即可，也允许重定向低地址如
+                                 * 向量表前几项（0x08020000 ~ 0x080200FF）。 */
+                                if (fa >= LINK_BASE && fa < LINK_END) {
+                                    uint32_t nf = fa + offset;
+                                    uint16_t wu = mtrack[rd].upper, wl = mtrack[rd].lower;
+                                    movw_encode_imm16((uint16_t)(nf & 0xFFFFU), &wu, &wl);
+                                    if (writeback(mtrack[rd].file_off, &wu, 2, ctx->io.user) != 0 ||
+                                        writeback(mtrack[rd].file_off + 2U, &wl, 2, ctx->io.user) != 0) {
+                                        ELF_ERR("MOVW wb fail"); return ELF_ERR_PARAM;
+                                    }
+                                    uint16_t tu = pend_hw, tl = lo;
+                                    movt_encode_imm16((uint16_t)(nf >> 16), &tu, &tl);
+                                    if (writeback(pend_foff, &tu, 2, ctx->io.user) != 0 ||
+                                        writeback(pend_foff + 2U, &tl, 2, ctx->io.user) != 0) {
+                                        ELF_ERR("MOVT wb fail"); return ELF_ERR_PARAM;
+                                    }
+                                    ELF_INFO("MOVW/T R%u 0x%08x->0x%08x (x-chunk)",
+                                             rd, fa, nf);
+                                    sec_fixed++; total_fixed++; total_movw++;
+                                }
+                                mtrack[rd].valid = 0;
+                            }
+                        }
+                        pend = 0U;
+                        j = 1U;
+                    }
+
+                    while (j < nh) {
+                        uint16_t hw = h16[j];
+                        /* 32-bit Thumb2 指令起始？ bits[15:11] >= 0b11101 */
+                        if ((hw >> 11U) >= 0x1DU) {
+                            if (j + 1U >= nh) {
+                                /* 跨块边界，留到下次处理 */
+                                pend = 1U;
+                                pend_hw = hw;
+                                pend_foff = shdr->sh_offset + (ho + j) * 2U;
+                                break;
+                            }
+                            uint16_t up = hw, lo = h16[j + 1U];
+                            uint32_t fo = shdr->sh_offset + (ho + j) * 2U;
+
+                            /* MOVW: (upper & 0xFBF0) == 0xF240 */
+                            if ((up & 0xFBF0U) == 0xF240U) {
+                                uint16_t rd = (lo >> 8) & 0xFU;
+                                mtrack[rd].upper    = up;
+                                mtrack[rd].lower    = lo;
+                                mtrack[rd].file_off = fo;
+                                mtrack[rd].imm16    = movw_decode_imm16(up, lo);
+                                mtrack[rd].valid    = 1;
+                                ELF_VERB("MOVW R%u imm16=0x%04x", rd, mtrack[rd].imm16);
+                            }
+                            /* MOVT: (upper & 0xFBF0) == 0xF2C0 */
+                            else if ((up & 0xFBF0U) == 0xF2C0U) {
+                                uint16_t rd = (lo >> 8) & 0xFU;
+                                if (rd < 16U && mtrack[rd].valid) {
+                                    uint16_t ti = movw_decode_imm16(up, lo);
+                                    uint32_t fa = ((uint32_t)ti << 16) | mtrack[rd].imm16;
+
+                                    if (fa >= LINK_BASE && fa < LINK_END) {
+                                        uint32_t nf = fa + offset;
+                                        /* re-encode MOVW */
+                                        uint16_t wu = mtrack[rd].upper, wl = mtrack[rd].lower;
+                                        movw_encode_imm16((uint16_t)(nf & 0xFFFFU), &wu, &wl);
+                                        if (writeback(mtrack[rd].file_off, &wu, 2, ctx->io.user) != 0 ||
+                                            writeback(mtrack[rd].file_off + 2U, &wl, 2, ctx->io.user) != 0) {
+                                            ELF_ERR("MOVW wb fail"); return ELF_ERR_PARAM;
+                                        }
+                                        /* re-encode MOVT */
+                                        uint16_t tu = up, tl = lo;
+                                        movt_encode_imm16((uint16_t)(nf >> 16), &tu, &tl);
+                                        if (writeback(fo, &tu, 2, ctx->io.user) != 0 ||
+                                            writeback(fo + 2U, &tl, 2, ctx->io.user) != 0) {
+                                            ELF_ERR("MOVT wb fail"); return ELF_ERR_PARAM;
+                                        }
+                                        ELF_INFO("MOVW/T R%u 0x%08x->0x%08x", rd, fa, nf);
+                                        sec_fixed++; total_fixed++; total_movw++;
+                                    } else {
+                                        ELF_VERB("MOVW/T R%u skip 0x%08x", rd, fa);
+                                    }
+                                    mtrack[rd].valid = 0;
+                                } else {
+                                    ELF_VERB("MOVT R%u orphan", rd);
+                                }
+                            }
+                            j += 2U;
+                            continue;
+                        }
+                        /* 16-bit 指令，跳过 */
+                        j += 1U;
+                    }
+                    ho += nh;
+                }
+                ELF_INFO("    MOVW/MOVT pass \"%s\": movw_fixed=%u", name, total_movw);
             }
         }
 
@@ -904,6 +1150,14 @@ static int reloc_path_b(elf_ctx_stream_t *ctx,
                     if ((val&1U)==0U && (val>>16)!=(LINK_BASE>>16)){
                         skip_bounds++; continue;
                     }
+                    /* Fix-B4: 跳过 Thumb2 MOVW/MOVT 指令编码（同 exec section） */
+                    {
+                        uint16_t hw0 = (uint16_t)(val & 0xFFFFU);
+                        if ((hw0 & 0xFBF0U) == 0xF240U ||  /* MOVW */
+                            (hw0 & 0xFBF0U) == 0xF2C0U) {  /* MOVT */
+                            skip_bounds++; continue;
+                        }
+                    }
                     int fixed=relocate_word_s(
                         &wb[w], offset, LINK_MIN, LINK_END, LINK_STRICT,
                         RT_BASE, RT_SIZE, woff+w,
@@ -920,8 +1174,8 @@ static int reloc_path_b(elf_ctx_stream_t *ctx,
         }
     }
 
-    ELF_INFO("Path B done: scanned=%u fixed=%u scatter=%u",
-             total_scanned, total_fixed, scatter_entries);
+    ELF_INFO("Path B done: scanned=%u fixed=%u scatter=%u movw=%u",
+             total_scanned, total_fixed, scatter_entries, total_movw);
     ELF_INFO("  skip: bounds=%u align=%u float=%u thumb=%u litpool=%u postchk=%u",
              skip_bounds, skip_align, skip_float, skip_thumb, skip_litpool, skip_postchk);
     return ELF_OK;
@@ -957,6 +1211,15 @@ int elf_relocate_stream(elf_ctx_stream_t *ctx,
             break;
         }
     }
+    /* 0-based ELF 修正：虚拟地址空间从 0 开始，section offset 不是基地址。
+     * 若 link_base > 0 但 < FLASH_BASE_ADDR（0x08000000），说明是 0-based ELF，
+     * 强制 link_base = 0，使 offset = app_start - 0 = app_start，
+     * 所有 0-based 地址 + app_start 即映射到正确的 Flash 位置。
+     * 注意：Flash 地址（如 0x08020000）虽然 < 0x10000000，但不是 0-based。 */
+    if (link_base != 0U && link_base < 0x08000000U) {
+        ELF_INFO("0-based ELF: link_base 0x%08x -> 0", link_base);
+        link_base = 0U;
+    }
     uint32_t rt_base = link_base + offset;
 
     ELF_INFO("=== elf_relocate_stream ===");
@@ -969,7 +1232,7 @@ int elf_relocate_stream(elf_ctx_stream_t *ctx,
     if (ctx->rel_count > 0U) {
         rc = reloc_path_a(ctx, offset, link_base, rt_base, app_max_size, writeback);
     } else {
-        rc = reloc_path_b(ctx, offset, app_max_size, writeback);
+        rc = reloc_path_b(ctx, offset, app_max_size, link_base, rt_base, writeback);
     }
 
     ELF_INFO("=== elf_relocate_stream done (rc=%d) ===", rc);
@@ -991,12 +1254,19 @@ int elf_stream_get_section(const elf_ctx_stream_t *ctx,
 {
     if (!ctx||!info||idx>=ctx->load_count) return ELF_ERR_PARAM;
     elf32_shdr *s = &ctx->shdrs[ctx->load_shidx[idx]];
-    info->load_addr = (s->sh_addr < 0x10000000U)
-                      ? s->sh_addr + ctx->offset : s->sh_addr;
+    /* sh_addr==0 常见于 SHT_NOBITS/.bss（无固定地址），
+     * 加 offset 会产生无意义地址，置零让调用方自行判断 */
+    if (s->sh_addr == 0U) {
+        info->load_addr = 0U;
+    } else {
+        info->load_addr = (s->sh_addr < 0x10000000U)
+                          ? s->sh_addr + ctx->offset : s->sh_addr;
+    }
     info->size   = s->sh_size;
     info->is_bss = (s->sh_type == SHT_NOBITS) ? 1 : 0;
     info->name   = (ctx->shstrtab && s->sh_name) ? ctx->shstrtab+s->sh_name : "";
     info->data   = NULL;
     return ELF_OK;
 }
+
 
