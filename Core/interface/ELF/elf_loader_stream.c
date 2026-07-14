@@ -131,11 +131,11 @@ static int is_scatter_entry_s(const uint32_t *base, uint32_t w,
     return 1;
 }
 
-static void handle_scatter_entry_s(uint32_t *base, uint32_t w, uint32_t offset)
+static void handle_scatter_entry_s(uint32_t *base, uint32_t w, int32_t offset)
 {
     uint32_t old_src=base[w], old_fn=base[w+3];
-    base[w]   = old_src+offset;
-    base[w+3] = old_fn +offset;
+    base[w]   = (uint32_t)((int32_t)old_src + offset);
+    base[w+3] = (uint32_t)((int32_t)old_fn + offset);
     ELF_INFO("scatter [w=%u] src:0x%08x->0x%08x  fn:0x%08x->0x%08x",
              w, old_src, base[w], old_fn, base[w+3]);
 }
@@ -146,7 +146,7 @@ static void handle_scatter_entry_s(uint32_t *base, uint32_t w, uint32_t offset)
  * Fix-B1: LINK_MIN/LINK_END 以链接基地址（sh_addr）为基准
  * =================================================================== */
 static int relocate_word_s(uint32_t *slot,
-                            uint32_t  offset,
+                            int32_t   offset,
                             uint32_t  LINK_MIN,
                             uint32_t  LINK_END,
                             uint32_t  LINK_END_STRICT,
@@ -200,7 +200,7 @@ static int relocate_word_s(uint32_t *slot,
         if (val>=LINK_END){ (*skip_thumb)++; return 0; }
     }
 
-    uint32_t nv = val+offset;
+    uint32_t nv = (uint32_t)((int32_t)val + offset);
     {
         uint32_t a=nv&~1U;
         if (!(a>=RT_BASE&&a<RT_BASE+RT_SIZE)&&!reloc_in_ram_s(a)){
@@ -476,7 +476,7 @@ int elf_parse_stream(elf_ctx_stream_t *ctx)
  * @param writeback     写回回调
  * =================================================================== */
 static int reloc_path_a(elf_ctx_stream_t *ctx,
-                        uint32_t          offset,
+                        int32_t          offset,
                         uint32_t          link_base,
                         uint32_t          rt_base,
                         uint32_t          rt_size,
@@ -563,7 +563,7 @@ static int reloc_path_a(elf_ctx_stream_t *ctx,
                 if (val == 0U) { total_skip++; break; }  /* NULL 指针 */
                 uint32_t v_check = val & ~1U;   /* 去掉 Thumb bit */
                 if (v_check >= link_base && v_check < link_base + rt_size) {
-                    uint32_t nv = val + offset;
+                    uint32_t nv = (uint32_t)((int32_t)val + offset);
                     uint32_t a = nv & ~1U;
                     if ((a >= rt_base && a < rt_base + rt_size) ||
                         reloc_in_ram_s(a)) {
@@ -596,7 +596,7 @@ static int reloc_path_a(elf_ctx_stream_t *ctx,
                 if (val == 0U) { total_skip++; break; }  /* NULL 指针 */
                 uint32_t v_check = val & ~1U;
                 if (v_check >= link_base && v_check < link_base + rt_size) {
-                    uint32_t nv = val + offset;
+                    uint32_t nv = (uint32_t)((int32_t)val + offset);
                     uint32_t a = nv & ~1U;
                     if ((a >= rt_base && a < rt_base + rt_size) ||
                         reloc_in_ram_s(a)) {
@@ -756,7 +756,7 @@ static int reloc_path_a(elf_ctx_stream_t *ctx,
  * Fix-B3: RT_BASE 使用全局 rt_base（= link_base + offset），而非 offset 本身
  * =================================================================== */
 static int reloc_path_b(elf_ctx_stream_t *ctx,
-                        uint32_t          offset,
+                        int32_t           offset,
                         uint32_t          app_max_size,
                         uint32_t          link_base,
                         uint32_t          rt_base,
@@ -1036,7 +1036,7 @@ static int reloc_path_b(elf_ctx_stream_t *ctx,
                                  * 因此直接用 LINK_BASE 即可，也允许重定向低地址如
                                  * 向量表前几项（0x08020000 ~ 0x080200FF）。 */
                                 if (fa >= LINK_BASE && fa < LINK_END) {
-                                    uint32_t nf = fa + offset;
+                                    uint32_t nf = (uint32_t)((int32_t)fa + offset);
                                     uint16_t wu = mtrack[rd].upper, wl = mtrack[rd].lower;
                                     movw_encode_imm16((uint16_t)(nf & 0xFFFFU), &wu, &wl);
                                     if (writeback(mtrack[rd].file_off, &wu, 2, ctx->io.user) != 0 ||
@@ -1092,7 +1092,7 @@ static int reloc_path_b(elf_ctx_stream_t *ctx,
                                     uint32_t fa = ((uint32_t)ti << 16) | mtrack[rd].imm16;
 
                                     if (fa >= LINK_BASE && fa < LINK_END) {
-                                        uint32_t nf = fa + offset;
+                                        uint32_t nf = (uint32_t)((int32_t)fa + offset);
                                         /* re-encode MOVW */
                                         uint16_t wu = mtrack[rd].upper, wl = mtrack[rd].lower;
                                         movw_encode_imm16((uint16_t)(nf & 0xFFFFU), &wu, &wl);
@@ -1189,7 +1189,8 @@ static int reloc_path_b(elf_ctx_stream_t *ctx,
  *   无 REL section → Path B（值域猜测）
  * =================================================================== */
 int elf_relocate_stream(elf_ctx_stream_t *ctx,
-                        uint32_t          offset,
+                        uint32_t          link_base,
+                        int32_t          offset,
                         uint32_t          app_max_size,
                         elf_writeback_fn  writeback)
 {
@@ -1202,24 +1203,6 @@ int elf_relocate_stream(elf_ctx_stream_t *ctx,
 
     ctx->offset = offset;
 
-    /* 推导链接基地址：取第一个 exec section 的 sh_addr */
-    uint32_t link_base = 0U;
-    for (uint32_t i=0; i<ctx->load_count; i++) {
-        elf32_shdr *s = &ctx->shdrs[ctx->load_shidx[i]];
-        if ((s->sh_flags & SHF_EXECINSTR) && !(s->sh_flags & SHF_WRITE)) {
-            link_base = s->sh_addr;
-            break;
-        }
-    }
-    /* 0-based ELF 修正：虚拟地址空间从 0 开始，section offset 不是基地址。
-     * 若 link_base > 0 但 < FLASH_BASE_ADDR（0x08000000），说明是 0-based ELF，
-     * 强制 link_base = 0，使 offset = app_start - 0 = app_start，
-     * 所有 0-based 地址 + app_start 即映射到正确的 Flash 位置。
-     * 注意：Flash 地址（如 0x08020000）虽然 < 0x10000000，但不是 0-based。 */
-    if (link_base != 0U && link_base < 0x08000000U) {
-        ELF_INFO("0-based ELF: link_base 0x%08x -> 0", link_base);
-        link_base = 0U;
-    }
     uint32_t rt_base = link_base + offset;
 
     ELF_INFO("=== elf_relocate_stream ===");
@@ -1246,7 +1229,7 @@ int elf_relocate_stream(elf_ctx_stream_t *ctx,
 uint32_t elf_stream_get_entry(const elf_ctx_stream_t *ctx)
 {
     if (!ctx||!ctx->ehdr) return 0U;
-    return ctx->ehdr->e_entry + ctx->offset;
+    return (uint32_t)((int32_t)ctx->ehdr->e_entry + ctx->offset);
 }
 
 int elf_stream_get_section(const elf_ctx_stream_t *ctx,
@@ -1260,7 +1243,7 @@ int elf_stream_get_section(const elf_ctx_stream_t *ctx,
         info->load_addr = 0U;
     } else {
         info->load_addr = (s->sh_addr < 0x10000000U)
-                          ? s->sh_addr + ctx->offset : s->sh_addr;
+                          ? (uint32_t)((int32_t)s->sh_addr + ctx->offset) : s->sh_addr;
     }
     info->size   = s->sh_size;
     info->is_bss = (s->sh_type == SHT_NOBITS) ? 1 : 0;

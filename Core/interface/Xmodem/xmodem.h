@@ -41,6 +41,8 @@ typedef struct {
  * ============================================================ */
 typedef int (*storage_callback_t)(const uint8_t *buf, uint32_t len, void *user_ctx);
 typedef int (*receive_callback_t)(void *user_ctx, void *file_info_out);
+typedef int (*read_callback_t)(uint8_t *buf, uint32_t max_len,
+                               uint32_t *out_len, void *user_ctx);
 
 /* ============================================================
  *  数据存储的回调接口定义
@@ -53,6 +55,17 @@ typedef struct {
     receive_callback_t receive_cb;  
     void               *recv_user_ctx; // 接收回调的私有数据不关心类型   
 } transfer_cfg_t;
+
+/* ============================================================
+ *  Ymodem发送配置
+ *  由上层业务提供文件名、文件大小和读数据回调，协议层负责组包发送
+ * ============================================================ */
+typedef struct {
+    const char      *filename;
+    uint32_t         filesize;
+    read_callback_t  read_cb;
+    void            *read_user_ctx;
+} ymodem_send_cfg_t;
 
 
 /* ============================================================
@@ -67,6 +80,14 @@ typedef struct {
  * @return            实际写入字节数，失败返回 -1
  */
 int Proto_Start_Receive(transfer_cfg_t *transfer_cfg, YmodemFileInfo *file_info);
+
+/**
+ * @brief 启动Ymodem发送
+ *
+ * @param send_cfg  发送配置指针，包含文件名、大小和读回调
+ * @return          实际发送字节数，失败返回 -1
+ */
+int Proto_Start_Send(const ymodem_send_cfg_t *send_cfg);
 
 #endif /* XMODEM_YMODEM_H */
 

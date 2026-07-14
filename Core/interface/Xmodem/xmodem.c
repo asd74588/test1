@@ -29,6 +29,8 @@
 #define TIMEOUT_PACKET    2000
 #define TIMEOUT_BODY      2000
 #define TIMEOUT_EOT_RETRY 1000
+#define SEND_RETRIES      10
+#define SEND_TIMEOUT      3000
 
 /* ============================================================
  *  传输上下文
@@ -70,6 +72,11 @@ static void uart_send_byte(uint8_t b)
 static HAL_StatusTypeDef uart_recv(uint8_t *buf, uint16_t len, uint32_t timeout_ms)
 {
     return HAL_UART_Receive(&huart1, buf, len, timeout_ms);
+}
+
+static void uart_send_raw(const uint8_t *buf, uint16_t len)
+{
+    HAL_UART_Transmit(&huart1, (uint8_t *)buf, len, 5000U);
 }
 
 /* ============================================================
@@ -131,6 +138,62 @@ static int pkt_crc_check(const uint8_t *pkt, int data_len)
     uint16_t calc = crc16_ccitt(&pkt[3], data_len);
     uint16_t recv = ((uint16_t)pkt[3 + data_len] << 8) | pkt[3 + data_len + 1];
     return (calc == recv) ? 1 : 0;
+}
+
+/**
+ * @brief 构造并发送一个Ymodem包（128B或1K）
+ *
+ * @param blk       块号（0 = 文件名包）
+ * @param data      数据指针
+ * @param data_len  实际有效字节，短包用0x1A填充
+ * @param pkt_sz    PKT_DATA_128 或 PKT_DATA_1K
+ * @return 0=ACK, -1=失败/取消
+ */
+static int send_ymodem_packet(uint8_t blk, const uint8_t *data,
+                              uint32_t data_len, uint32_t pkt_sz)
+{
+    static uint8_t pkt[PKT_MAX_LEN];
+
+    if (pkt_sz != PKT_DATA_128 && pkt_sz != PKT_DATA_1K) {
+        return -1;
+    }
+
+    memset(pkt, 0, sizeof(pkt));
+    pkt[0] = (pkt_sz == PKT_DATA_1K) ? PROTO_STX : PROTO_SOH;
+    pkt[1] = blk;
+    pkt[2] = (uint8_t)(~blk);
+
+    if (data != NULL && data_len > 0U) {
+        uint32_t copy = (data_len < pkt_sz) ? data_len : pkt_sz;
+        memcpy(&pkt[3], data, copy);
+        if (copy < pkt_sz) {
+            memset(&pkt[3 + copy], 0x1A, pkt_sz - copy);
+        }
+    }
+
+    uint16_t crc = crc16_ccitt(&pkt[3], (int)pkt_sz);
+    pkt[3 + pkt_sz]     = (uint8_t)(crc >> 8);
+    pkt[3 + pkt_sz + 1] = (uint8_t)(crc & 0xFFU);
+
+    uint16_t total_len = (uint16_t)(3U + pkt_sz + 2U);
+
+    for (int retry = 0; retry < SEND_RETRIES; retry++) {
+        uart_send_raw(pkt, total_len);
+
+        uint8_t resp = 0U;
+        if (uart_recv(&resp, 1U, SEND_TIMEOUT) != HAL_OK) {
+            continue;
+        }
+
+        if (resp == PROTO_ACK) {
+            return 0;
+        }
+        if (resp == PROTO_CAN) {
+            return -1;
+        }
+    }
+
+    return -1;
 }
 
 /**
@@ -529,5 +592,132 @@ int Proto_Start_Receive(transfer_cfg_t *transfer_cfg, YmodemFileInfo *file_info)
             return -1;
         /* fret == WAIT_FRAME_DATA：ctx.pkt 已填充，继续循环 */
     }
+}
+
+int Proto_Start_Send(const ymodem_send_cfg_t *send_cfg)
+{
+    if (send_cfg == NULL || send_cfg->filename == NULL ||
+        send_cfg->read_cb == NULL) {
+        return -1;
+    }
+
+    uint8_t c = 0U;
+    int got_c = 0;
+
+    /* 等待接收方发'C'，进入CRC模式 */
+    for (int i = 0; i < SEND_RETRIES; i++) {
+        if (uart_recv(&c, 1U, SEND_TIMEOUT) == HAL_OK && c == PROTO_C) {
+            got_c = 1;
+            break;
+        }
+    }
+    if (!got_c) {
+        dbg_printf("Ymodem send timeout: no 'C' from receiver.\r\n");
+        return -1;
+    }
+
+    /* 发送文件名包：filename\0size_decimal\0 */
+    uint8_t hdr[PKT_DATA_128];
+    memset(hdr, 0, sizeof(hdr));
+
+    int hlen = snprintf((char *)hdr, sizeof(hdr), "%s", send_cfg->filename);
+    if (hlen < 0 || hlen >= (int)sizeof(hdr)) {
+        return -1;
+    }
+    snprintf((char *)hdr + hlen + 1,
+             sizeof(hdr) - (uint32_t)hlen - 1U,
+             "%lu", (unsigned long)send_cfg->filesize);
+
+    if (send_ymodem_packet(0U, hdr, sizeof(hdr), PKT_DATA_128) < 0) {
+        dbg_printf("Ymodem send: header rejected.\r\n");
+        return -1;
+    }
+
+    /* 接收方ACK文件名包后，会再发一个'C'请求数据 */
+    got_c = 0;
+    for (int i = 0; i < SEND_RETRIES; i++) {
+        if (uart_recv(&c, 1U, SEND_TIMEOUT) == HAL_OK && c == PROTO_C) {
+            got_c = 1;
+            break;
+        }
+    }
+    if (!got_c) {
+        dbg_printf("Ymodem send: no 'C' after header ACK.\r\n");
+        return -1;
+    }
+
+    static uint8_t data_buf[PKT_DATA_1K];
+    uint8_t  blk = 1U;
+    uint32_t total_sent = 0U;
+
+    while (1) {
+        uint32_t nread = 0U;
+        if (send_cfg->read_cb(data_buf, PKT_DATA_1K, &nread,
+                              send_cfg->read_user_ctx) != 0) {
+            send_cancel();
+            dbg_printf("Ymodem send: read callback failed.\r\n");
+            return -1;
+        }
+
+        if (nread == 0U) {
+            break;
+        }
+
+        uint32_t pkt_sz = (nread > PKT_DATA_128) ? PKT_DATA_1K : PKT_DATA_128;
+        if (send_ymodem_packet(blk, data_buf, nread, pkt_sz) < 0) {
+            dbg_printf("Ymodem send: packet %u rejected/cancelled.\r\n", blk);
+            return -1;
+        }
+
+        total_sent += nread;
+        blk++;
+    }
+
+    /* EOT握手 */
+    got_c = 0;
+    int eot_acked = 0;
+    for (int i = 0; i < SEND_RETRIES; i++) {
+        uint8_t eot = PROTO_EOT;
+        uart_send_byte(eot);
+
+        if (uart_recv(&c, 1U, SEND_TIMEOUT) == HAL_OK) {
+            if (c == PROTO_ACK) {
+                eot_acked = 1;
+                break;
+            }
+            if (c == PROTO_NAK) {
+                continue;
+            }
+            if (c == PROTO_CAN) {
+                return -1;
+            }
+        }
+    }
+    if (!eot_acked) {
+        dbg_printf("Ymodem send: EOT not acknowledged.\r\n");
+        return -1;
+    }
+
+    /* 结束批量传输：等待'C'后发送空文件名包 */
+    got_c = 0;
+    for (int i = 0; i < SEND_RETRIES; i++) {
+        if (uart_recv(&c, 1U, SEND_TIMEOUT) == HAL_OK && c == PROTO_C) {
+            got_c = 1;
+            break;
+        }
+    }
+    if (!got_c) {
+        dbg_printf("Ymodem send: no 'C' before tail packet.\r\n");
+        return -1;
+    }
+
+    uint8_t empty[PKT_DATA_128];
+    memset(empty, 0, sizeof(empty));
+    if (send_ymodem_packet(0U, empty, sizeof(empty), PKT_DATA_128) < 0) {
+        dbg_printf("Ymodem send: tail packet rejected.\r\n");
+        return -1;
+    }
+
+    return (int)total_sent;
 }
 

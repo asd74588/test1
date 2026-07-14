@@ -464,14 +464,16 @@ static int read_elf_from_lfs(const char *path,
     BL_INFO("read OK: %u bytes", *out_size);
     return 0;
 }
-/* ===================================================================
- * 第五部分：按 section 写入 Flash（内部函数）
- * =================================================================== */
+
+
+
+
 static int write_sections_to_flash(elf_ctx_stream_t *ctx, uint8_t slot)
 {
     uint32_t flash_start = (slot == SLOT_B) ? APP_B_START_ADDR : APP_A_START_ADDR;
     uint32_t flash_size  = (slot == SLOT_B) ? APP_B_SIZE       : APP_A_SIZE;
     uint32_t flash_end   = flash_start + flash_size;
+    int32_t  offset      = ctx->offset;
 
     if (Erase_App_Flash(slot) != 0) {
         BL_ERR("flash erase failed");
@@ -482,116 +484,116 @@ static int write_sections_to_flash(elf_ctx_stream_t *ctx, uint8_t slot)
     memset(s_tail_bytes, 0, sizeof(s_tail_bytes));
 
     /*
-     * 逐 section 写入 Flash，每个 section 写到其正确的 Flash 地址：
-     *   - Flash section (sh_addr < 0x10000000): 目标 = sh_addr + offset
-     *   - RAM section (.data, sh_addr >= 0x10000000): 目标 = 紧接上一个 section 之后
-     *
-     * 这保证了 .data 初始值在 Flash 中的位置与 startup code 的 _sidata 一致。
-     * 连续写入方式对 GCC ELF 不适用：GCC 将 .data 放在独立的 segment，
-     * file offset 与 Flash load address 之间有对齐间隙，
-     * 导致 .data 被写到错误位置。
+     * prev_shdr: 上一个 Flash section 的节头（提供 sh_addralign）
+     * prev_dst:  上一个 Flash section 写入 Flash 的起始地址
+     * 两者配合可计算 RAM section（.data）的 LMA：
+     *   prev_flash_end = prev_dst + prev_shdr->sh_size
      */
-    uint32_t next_flash = flash_start;
+    elf32_shdr *prev_shdr    = NULL;
+    uint32_t    prev_dst     = flash_start;
+    uint32_t    last_written = flash_start;   /* 用于最终打印 */
 
     for (uint32_t i = 0; i < ctx->load_count; i++) {
         elf32_shdr *shdr = &ctx->shdrs[ctx->load_shidx[i]];
+
+        /* SHT_NOBITS (.bss) 不占文件空间，无需写 Flash */
         if (shdr->sh_type == SHT_NOBITS) continue;
+        /* 前面入表时已过滤，这里是双重保险 */
         if (!(shdr->sh_flags & SHF_ALLOC)) continue;
-        if (shdr->sh_size == 0) continue;
+        if (shdr->sh_size == 0U)           continue;
 
         const char *name = (ctx->shstrtab && shdr->sh_name)
                            ? ctx->shstrtab + shdr->sh_name : "(?)";
 
-        /* 刷新上一 section 遗留的尾字节（避免跨间隙拼接） */
-        if (s_tail_len > 0U) {
-            uint32_t flush_addr = next_flash;
-            if (Flush_Tail_To_Flash(&flush_addr) != HAL_OK) {
-                BL_ERR("flush tail failed at 0x%08x", next_flash);
+        /* -------------------------------------------------------
+         * 判断 Flash section 还是 RAM section
+         *   RAM section：sh_addr 是 VMA（SRAM 地址），≥ 0x10000000
+         *   Flash section：sh_addr 是链接地址（VMA == LMA），< 0x10000000
+         *                  或 ET_EXEC 时在 Flash 范围（0x08000000+）
+         * ------------------------------------------------------- */
+        int      is_ram = (shdr->sh_addr >= 0x10000000U);
+        uint32_t dst;
+
+        if (!is_ram) {
+            /* Flash section：dst = sh_addr + offset
+             * 0-based ELF：offset = app_start，sh_addr 是从 0 起的偏移
+             * ET_EXEC ELF：offset = app_start - link_base，sh_addr 是绝对地址
+             * 两种情况同一个公式均正确 */
+            dst = (uint32_t)((int32_t)shdr->sh_addr + offset);
+
+        } else {
+            /* RAM section (.data)：sh_addr 是 VMA（SRAM 地址），需推算 LMA
+             *
+             * 链接脚本约定：.data 的 LMA 紧跟上一个 Flash section 之后，
+             * 双重对齐取整：
+             *   Step 1：上一 Flash section 末尾按其自身对齐取整
+             *   Step 2：再按 .data 的对齐要求取整 → LMA
+             */
+            if (prev_shdr == NULL) {
+                BL_ERR("RAM section \"%s\" has no preceding Flash section", name);
                 return -1;
             }
-            next_flash = flush_addr;
+
+            uint32_t prev_flash_end = prev_dst + prev_shdr->sh_size;
+
+            uint32_t prev_align = prev_shdr->sh_addralign;
+            if (prev_align < 1U) prev_align = 1U;
+            uint32_t aligned_end = (prev_flash_end + prev_align - 1U)
+                                   & ~(prev_align - 1U);
+
+            uint32_t data_align = shdr->sh_addralign;
+            if (data_align < 1U) data_align = 1U;
+            dst = (aligned_end + data_align - 1U) & ~(data_align - 1U);
         }
 
-        /* 确定目标 Flash 地址（RAM section 的 target_addr 必须在 flush
-         * 之后计算，否则 flush 推进 next_flash 会导致重叠误判）
-         *
-         * 判断 Flash section 的标准：
-         *   - ARMCC ET_EXEC: sh_addr 在 Flash 范围 (0x08000000+)
-         *   - GCC 0-based:   sh_addr 在低地址 (< 0x10000000)，不含 RAM
-         *   两种情况都排除 RAM section (sh_addr >= 0x10000000 且不在 Flash 范围)
-         *
-         * 目标地址计算：
-         *   - ET_EXEC: sh_addr 已在 Flash 范围，target = sh_addr + offset
-         *   - 0-based: sh_addr 是虚拟偏移（从 0 起），target = app_start + sh_addr
-         *     不能用 sh_addr + offset，因为 offset = app_start - link_base，
-         *     对 link_base 之前的 section（如 .isr_vector addr=0）会映射到
-         *     flash_start 之前 */
-        uint32_t target_addr;
-        int is_flash_sec = (shdr->sh_addr >= FLASH_BASE_ADDR &&
-                            shdr->sh_addr <  FLASH_BASE_ADDR + FLASH_TOTAL_SIZE) ||
-                           (shdr->sh_addr <  0x10000000U);
-        if (is_flash_sec) {
-            if (shdr->sh_addr >= FLASH_BASE_ADDR) {
-                /* ET_EXEC: sh_addr 在 Flash 范围，用 reloc offset */
-                target_addr = shdr->sh_addr + ctx->offset;
-            } else {
-                /* 0-based: sh_addr 是虚拟偏移，直接加 app_start */
-                target_addr = flash_start + shdr->sh_addr;
+        /* 刷新上一 section 遗留的尾字节（< 8 字节的未对齐余量）
+         * 必须在写新 section 之前执行，否则尾字节会挂在错误地址 */
+        if (s_tail_len > 0U) {
+            uint32_t flush_addr = prev_dst + (prev_shdr ? prev_shdr->sh_size : 0U);
+            if (Flush_Tail_To_Flash(&flush_addr) != HAL_OK) {
+                BL_ERR("tail flush failed before \"%s\"", name);
+                return -1;
             }
-        } else {
-            /* RAM section (.data): load address 紧接上一个 section 之后 */
-            target_addr = next_flash;
         }
 
-        /* Flash 已擦除为 0xFF，间隙无需写入，直接跳过 */
-        if (target_addr > next_flash) {
-            BL_INFO("gap: 0x%08x ~ 0x%08x (%u bytes)",
-                    next_flash, target_addr - 1U, target_addr - next_flash);
-            next_flash = target_addr;
-        }
-
-        /* 重叠检测：tail-flush 推进 next_flash 后，target_addr 可能落在
-         * 已写入区域内（非 8 字节对齐 section 间间隙 < padding 字节数），
-         * 此时静默继续会导致数据写到错误位置 */
-        if (target_addr < next_flash) {
-            BL_ERR("overlap: section \"%s\" target 0x%08x < next_flash 0x%08x",
-                   name, target_addr, next_flash);
+        /* Flash 范围检查 */
+        if (dst < flash_start || dst + shdr->sh_size > flash_end) {
+            BL_ERR("section \"%s\" out of flash: dst=0x%08x size=%u end=0x%08x",
+                   name, dst, shdr->sh_size, flash_end);
             return -1;
         }
 
-        if (target_addr + shdr->sh_size > flash_end) {
-            BL_ERR("section \"%s\" overflows flash (0x%08x + %u > 0x%08x)",
-                   name, target_addr, shdr->sh_size, flash_end);
-            return -1;
-        }
+        BL_INFO("  \"%s\" [%s]: file+0x%05x  %u bytes  -> flash 0x%08x",
+                name, is_ram ? "RAM→LMA" : "Flash",
+                shdr->sh_offset, shdr->sh_size, dst);
 
-        BL_INFO("  \"%s\": buf+0x%05x, %u bytes -> flash 0x%08x",
-                name, shdr->sh_offset, shdr->sh_size, target_addr);
-
-        uint32_t write_addr = target_addr;
-        uint8_t *src = elf_buf + shdr->sh_offset;
-
-        HAL_StatusTypeDef status = Write_Buffer_To_Flash(&write_addr, src, shdr->sh_size);
-        if (status != HAL_OK) {
+        /* 写入 Flash */
+        uint8_t  *src        = elf_buf + shdr->sh_offset;
+        uint32_t  write_addr = dst;
+        if (Write_Buffer_To_Flash(&write_addr, src, shdr->sh_size) != HAL_OK) {
             BL_ERR("flash write FAILED for \"%s\"", name);
             return -1;
         }
-        next_flash = write_addr;
+
+        last_written = write_addr;   /* Write_Buffer_To_Flash 会推进 write_addr */
+
+        /* 仅 Flash section 更新 prev，RAM section 不影响 LMA 推算链 */
+        if (!is_ram) {
+            prev_shdr = shdr;
+            prev_dst  = dst;
+        }
     }
 
-    /* 刷新最后的尾字节 */
+    /* 刷新最后遗留的尾字节 */
     if (s_tail_len > 0U) {
-        uint32_t flush_addr = next_flash;
-        if (Flush_Tail_To_Flash(&flush_addr) != HAL_OK) {
-            BL_ERR("final flush FAILED");
+        if (Flush_Tail_To_Flash(&last_written) != HAL_OK) {
+            BL_ERR("final tail flush FAILED");
             return -1;
         }
-        next_flash = flush_addr;
     }
 
     BL_INFO("write OK: flash 0x%08x ~ 0x%08x (%u bytes)",
-            flash_start, next_flash - 1U, next_flash - flash_start);
-
+            flash_start, last_written - 1U, last_written - flash_start);
     return 0;
 }
 
@@ -690,50 +692,25 @@ int bootloader_load_and_jump(void)
         goto try_existing;
     }
 
-    /* ---- Step 3: 重定向 ---- */
-    /* 推导 link_base：取第一个 exec section 的 sh_addr */
-    uint32_t link_base = 0U;
-    int found_exec = 0;
+   /* ---- Step 3: 重定向 ---- */
+    /* 取所有可分配 section 的最小 sh_addr 作为链接基地址 */
+    uint32_t link_base = UINT32_MAX;
     for (uint32_t si = 0; si < ctx.load_count; si++) {
         elf32_shdr *s = &ctx.shdrs[ctx.load_shidx[si]];
-        if ((s->sh_flags & SHF_EXECINSTR) && !(s->sh_flags & SHF_WRITE)) {
+        if (s->sh_addr < link_base)
             link_base = s->sh_addr;
-            found_exec = 1;
-            break;
-        }
     }
-    if (!found_exec) {
-        BL_ERR("no exec section found, cannot relocate");
+    if (link_base == UINT32_MAX) {
+        BL_ERR("no allocatable section found, cannot relocate");
         goto try_existing;
     }
-    /* 0-based ELF 修正：
-     * 0-based ELF 的虚拟地址空间从 0 开始，第一个 exec section 的
-     * sh_addr（如 0x190）只是段偏移，不是真正的基地址。
-     * 如果用 section offset 作为 link_base，reloc_offset = app_start - 0x190，
-     * 所有重定位值都会偏少 0x190。正确的 link_base 应为 0。
-     * 注意：Flash 地址（0x08000000+）虽然 < 0x10000000，但不是 0-based，
-     * 必须用 FLASH_BASE_ADDR 作为分界线。 */
-    if (link_base != 0U && link_base < FLASH_BASE_ADDR) {
-        BL_INFO("0-based ELF detected, link_base 0x%08x -> 0", link_base);
-        link_base = 0U;
-    }
-    /* link_base 合法性检查：
-     *   - 0-based:     link_base == 0（已修正），合法
-     *   - ET_EXEC:     link_base 在 Flash 范围（0x08000000+），合法
-     *   拒绝的情况：link_base > 0 但不在 Flash 范围，
-     *   这说明 .ARM.extab 等非代码 section 带了 SHF_EXECINSTR 被误取为基准 */
-    if (link_base > 0U &&
-        (link_base < FLASH_BASE_ADDR || link_base >= FLASH_BASE_ADDR + FLASH_TOTAL_SIZE)) {
-        BL_ERR("link_base 0x%08x out of Flash range, cannot relocate", link_base);
-        goto try_existing;
-    }
-    /* offset = 运行时基地址 − 链接时基地址 */
-    uint32_t reloc_offset = app_start - link_base;
-    uint32_t app_max      = (target_slot == SLOT_B) ? APP_B_SIZE : APP_A_SIZE;
 
-    BL_INFO("[3/5] relocating (link_base=0x%08x offset=0x%08x)...", link_base, reloc_offset);
+    int32_t reloc_offset = (int32_t)app_start - (int32_t)link_base;
+    uint32_t app_max = (target_slot == SLOT_B) ? APP_B_SIZE : APP_A_SIZE;
 
-    ret = elf_relocate_stream(&ctx, reloc_offset, app_max, elf_buf_writeback);
+    BL_INFO("[3/5] relocating (link_base=0x%08x offset=%d)...", link_base, reloc_offset);
+
+    ret = elf_relocate_stream(&ctx, link_base, reloc_offset, app_max, elf_buf_writeback);
     if (ret != ELF_OK) {
         BL_ERR("elf_relocate_stream failed: %d", ret);
         goto try_existing;

@@ -10,8 +10,8 @@
       <TargetName>test</TargetName>
       <ToolsetNumber>0x4</ToolsetNumber>
       <ToolsetName>ARM-ADS</ToolsetName>
-      <pArmCC>5060960::V5.06 update 7 (build 960)::ARMCC</pArmCC>
-      <pCCUsed>5060960::V5.06 update 7 (build 960)::ARMCC</pCCUsed>
+      <pArmCC>5060300::V5.06 update 3 (build 300)::ARMCC</pArmCC>
+      <pCCUsed>5060300::V5.06 update 3 (build 300)::ARMCC</pCCUsed>
       <uAC6>0</uAC6>
       <TargetOption>
         <TargetCommonOption>
@@ -375,7 +375,7 @@
             <ScatterFile></ScatterFile>
             <IncludeLibs></IncludeLibs>
             <IncludeLibsPath></IncludeLibsPath>
-            <Misc>..\Core\interface\SHA\libSTM32Cryptographic_CM4.a --emit-relocs</Misc>
+            <Misc>..\Core\interface\SHA\libSTM32Cryptographic_CM4.a</Misc>
             <LinkerInputFile></LinkerInputFile>
             <DisabledWarnings></DisabledWarnings>
           </LDads>

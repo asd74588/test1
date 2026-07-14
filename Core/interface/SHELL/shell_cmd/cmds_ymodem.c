@@ -114,90 +114,19 @@ int ymodem_receive(uint8_t argc, char **argv)
 /* ================================================================
  * Ymodem 发送（sz）
  * ================================================================ */
-
-/* ---- 协议常量（与接收侧保持一致） ---------------------------- */
-#define YM_SOH   0x01
-#define YM_STX   0x02
-#define YM_EOT   0x04
-#define YM_ACK   0x06
-#define YM_NAK   0x15
-#define YM_CAN   0x18
-#define YM_C     0x43
-
-#define YM_PKT_128   128
-#define YM_PKT_1K    1024
-#define YM_RETRIES   10
-#define YM_TIMEOUT   3000   /* ms */
-
-extern UART_HandleTypeDef huart1;
-
-static void ym_send_raw(const uint8_t *buf, uint16_t len)
+static int ymodem_read_cb(uint8_t *buf, uint32_t max_len,
+                          uint32_t *out_len, void *user)
 {
-    HAL_UART_Transmit(&huart1, buf, len, 5000U);
-}
-
-static int ym_recv_byte(uint8_t *b, uint32_t timeout_ms)
-{
-    return (HAL_UART_Receive(&huart1, b, 1U, timeout_ms) == HAL_OK) ? 0 : -1;
-}
-
-static uint16_t ym_crc16(const uint8_t *data, uint32_t len)
-{
-    uint16_t crc = 0U;
-    for (uint32_t i = 0U; i < len; i++) {
-        crc ^= (uint16_t)data[i] << 8;
-        for (int j = 0; j < 8; j++)
-            crc = (crc & 0x8000U) ? (uint16_t)((crc << 1) ^ 0x1021U)
-                                  : (uint16_t)(crc << 1);
-    }
-    return crc;
-}
-
-/**
- * 构造并发送一个 Ymodem 包（128 B 或 1K）
- *
- * @param blk       块号（0 = 文件名包）
- * @param data      数据指针
- * @param data_len  实际有效字节（< pkt_sz 时用 0x1A 填充）
- * @param pkt_sz    YM_PKT_128 或 YM_PKT_1K
- * @return 0=ACK, -1=失败/取消
- */
-static int ym_send_packet(uint8_t blk, const uint8_t *data,
-                          uint32_t data_len, uint32_t pkt_sz)
-{
-    /* 组包：SOH/STX + blk + ~blk + data[pkt_sz] + CRC_H + CRC_L */
-    static uint8_t pkt[3 + YM_PKT_1K + 2];
-    memset(pkt, 0, sizeof(pkt));
-
-    pkt[0] = (pkt_sz == YM_PKT_1K) ? YM_STX : YM_SOH;
-    pkt[1] = blk;
-    pkt[2] = (uint8_t)(~blk);
-
-    if (data && data_len > 0U) {
-        uint32_t copy = (data_len < pkt_sz) ? data_len : pkt_sz;
-        memcpy(&pkt[3], data, copy);
-        /* 末尾填充 0x1A（Ctrl-Z）*/
-        if (copy < pkt_sz)
-            memset(&pkt[3 + copy], 0x1A, pkt_sz - copy);
+    lfs_file_t *file = (lfs_file_t *)user;
+    lfs_ssize_t nread = lfs_file_read(&lfs_ctx.lfs, file, buf,
+                                      (lfs_size_t)max_len);
+    if (nread < 0) {
+        shell_printf("LFS read error: %d\r\n", (int)nread);
+        return -1;
     }
 
-    uint16_t crc = ym_crc16(&pkt[3], pkt_sz);
-    pkt[3 + pkt_sz]     = (uint8_t)(crc >> 8);
-    pkt[3 + pkt_sz + 1] = (uint8_t)(crc & 0xFFU);
-
-    uint16_t total_len = (uint16_t)(3U + pkt_sz + 2U);
-
-    for (int retry = 0; retry < YM_RETRIES; retry++) {
-        ym_send_raw(pkt, total_len);
-
-        uint8_t resp;
-        if (ym_recv_byte(&resp, YM_TIMEOUT) < 0) continue;
-
-        if (resp == YM_ACK)  return 0;
-        if (resp == YM_CAN)  return -1;
-        /* NAK：重发 */
-    }
-    return -1;
+    *out_len = (uint32_t)nread;
+    return 0;
 }
 
 /**
@@ -237,101 +166,31 @@ int ymodem_send(uint8_t argc, char **argv)
     for (const char *p = path; *p; p++)
         if (*p == '/') fname = p + 1;
 
+    if (fsize > 0xFFFFFFFFLL) {
+        lfs_file_close(&lfs_ctx.lfs, &file);
+        shell_printf("File too large for Ymodem: %ld\r\n", (long)fsize);
+        return -1;
+    }
+
     shell_printf("Sending: %s  (%ld bytes)\r\n", fname, (long)fsize);
     shell_printf("Start Ymodem receiver on host side...\r\n");
 
-    /* ── 等待接收方首个 'C' ───────────────────────────────── */
-    uint8_t c;
-    int got_c = 0;
-    for (int i = 0; i < YM_RETRIES; i++) {
-        if (ym_recv_byte(&c, YM_TIMEOUT) == 0 && c == YM_C) {
-            got_c = 1; break;
-        }
-    }
-    if (!got_c) {
-        lfs_file_close(&lfs_ctx.lfs, &file);
-        shell_printf("Timeout: no 'C' from receiver.\r\n");
-        return -1;
-    }
+    ymodem_send_cfg_t send_cfg;
+    memset(&send_cfg, 0, sizeof(send_cfg));
+    send_cfg.filename      = fname;
+    send_cfg.filesize      = (uint32_t)fsize;
+    send_cfg.read_cb       = ymodem_read_cb;
+    send_cfg.read_user_ctx = &file;
 
-    /* ── 发送文件名包（块号 0）────────────────────────────── */
-    uint8_t hdr[YM_PKT_128];
-    memset(hdr, 0, sizeof(hdr));
-    /* 格式：filename\0size_decimal\0 */
-    int hlen = snprintf((char *)hdr, sizeof(hdr),
-                        "%s", fname);
-    snprintf((char *)hdr + hlen + 1,
-             sizeof(hdr) - (uint32_t)hlen - 1U,
-             "%ld", (long)fsize);
-
-    if (ym_send_packet(0, hdr, sizeof(hdr), YM_PKT_128) < 0) {
-        lfs_file_close(&lfs_ctx.lfs, &file);
-        shell_printf("Header packet rejected.\r\n");
-        return -1;
-    }
-
-    /* 接收方在 ACK 文件名包后再发一个 'C' 才开始数据 */
-    got_c = 0;
-    for (int i = 0; i < YM_RETRIES; i++) {
-        if (ym_recv_byte(&c, YM_TIMEOUT) == 0 && c == YM_C) {
-            got_c = 1; break;
-        }
-    }
-    if (!got_c) {
-        lfs_file_close(&lfs_ctx.lfs, &file);
-        shell_printf("No 'C' after header ACK.\r\n");
-        return -1;
-    }
-
-    /* ── 发送数据包（块号从 1 开始）──────────────────────── */
-    static uint8_t data_buf[YM_PKT_1K];
-    uint8_t blk       = 1U;
-    int     total_sent = 0;
-    int     ret        = 0;
-
-    while (1) {
-        lfs_ssize_t nread = lfs_file_read(&lfs_ctx.lfs, &file,
-                                          data_buf, YM_PKT_1K);
-        if (nread < 0) {
-            shell_printf("LFS read error: %d\r\n", (int)nread);
-            ret = -1;
-            break;
-        }
-        if (nread == 0) break;   /* 文件读完 */
-
-        uint32_t pkt_sz = ((uint32_t)nread > YM_PKT_128)
-                          ? YM_PKT_1K : YM_PKT_128;
-
-        if (ym_send_packet(blk, data_buf, (uint32_t)nread, pkt_sz) < 0) {
-            shell_printf("Packet %u rejected / cancelled.\r\n", blk);
-            ret = -1;
-            break;
-        }
-        total_sent += (int)nread;
-        blk++;
-    }
-
+    int sent = Proto_Start_Send(&send_cfg);
     lfs_file_close(&lfs_ctx.lfs, &file);
 
-    if (ret < 0) return -1;
-
-    /* ── EOT 握手 ─────────────────────────────────────────── */
-    for (int i = 0; i < YM_RETRIES; i++) {
-        uint8_t eot = YM_EOT;
-        ym_send_raw(&eot, 1U);
-        if (ym_recv_byte(&c, YM_TIMEOUT) == 0 && c == YM_ACK) break;
+    if (sent < 0) {
+        shell_printf("Ymodem send failed.\r\n");
+        return -1;
     }
 
-    /* ── 发送空文件名包（Ymodem 结束标志）────────────────── */
-    /* 接收方先发 'C' */
-    for (int i = 0; i < YM_RETRIES; i++) {
-        if (ym_recv_byte(&c, YM_TIMEOUT) == 0 && c == YM_C) break;
-    }
-    uint8_t empty[YM_PKT_128];
-    memset(empty, 0, sizeof(empty));
-    ym_send_packet(0, empty, sizeof(empty), YM_PKT_128);
-
-    shell_printf("Send complete: %d bytes\r\n", total_sent);
+    shell_printf("Send complete: %d bytes\r\n", sent);
     return 0;
 }
 

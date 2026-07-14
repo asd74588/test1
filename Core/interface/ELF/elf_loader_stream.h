@@ -138,7 +138,7 @@ typedef struct {
     uint32_t    sym_count;
 
     /* ── 重定向参数（elf_relocate_stream 填充）── */
-    uint32_t    offset;
+    int32_t    offset;
 
 } elf_ctx_stream_t;
 
@@ -173,7 +173,8 @@ int elf_parse_stream(elf_ctx_stream_t *ctx);
  * @param writeback     重定向后写回回调
  */
 int elf_relocate_stream(elf_ctx_stream_t *ctx,
-                        uint32_t          offset,
+                        uint32_t          link_base,
+                        int32_t          offset,
                         uint32_t          app_max_size,
                         elf_writeback_fn  writeback);
 

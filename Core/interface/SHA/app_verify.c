@@ -37,16 +37,22 @@ int test_ota_sha256()
 
 static int verify_ecdsa(const Firmware_Header_t *hdr)
 {
+    BL_INFO("SHA256 OK");
     uint8_t pubkey[64];
     memcpy(&pubkey[0],  FW_PUBKEY_X, 32);
     memcpy(&pubkey[32], FW_PUBKEY_Y, 32);
 
     cmox_ecc_handle_t ecc_ctx;
-    static uint8_t ecc_buf[3072];  // 放入 SRAM2
+    static uint8_t ecc_buf[4096];  // 放入 SRAM2
     uint32_t fault_check = 0;
+
+    BL_INFO("SHA256 OK");
+
 
     cmox_ecc_construct(&ecc_ctx, CMOX_MATH_FUNCS_FAST, ecc_buf, sizeof(ecc_buf));
 
+
+    BL_INFO("SHA256 OK");
     cmox_ecc_retval_t ret = cmox_ecdsa_verify(
         &ecc_ctx,
         CMOX_ECC_SECP256R1_HIGHMEM,
@@ -56,6 +62,8 @@ static int verify_ecdsa(const Firmware_Header_t *hdr)
         &fault_check
     );
 
+
+    BL_INFO("SHA256 OK");
     cmox_ecc_cleanup(&ecc_ctx);
 
     dbg_printf("ret=0x%X fault=0x%X\r\n", ret, fault_check);
@@ -124,6 +132,7 @@ int verify_firmware(const char *path)
         BL_INFO("SHA256 OK");
     }
 
+    BL_INFO("SHA256 OK");
     /* 4. 校验ECDSA签名 */
     if (verify_ecdsa(&hdr) != 0) {
         BL_ERR("Signature verification failed");
