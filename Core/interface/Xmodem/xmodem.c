@@ -269,13 +269,13 @@ static int proto_handshake(uint8_t *first_byte)
  */
 static void detect_protocol(TransferCtx *ctx)
 {
-    if (ctx->pkt[0] == PROTO_SOH) {
-        ctx->protocol  = PROTO_XMODEM;
-        ctx->is_ymodem = 0;
-    } else if (ctx->pkt[1] == 0x00 && (uint8_t)(ctx->pkt[1] + ctx->pkt[2]) == 0xFF) {
-        /* STX + 块号 0 → Ymodem 文件名包 */
+    if (ctx->pkt[1] == 0x00 && (uint8_t)(ctx->pkt[1] + ctx->pkt[2]) == 0xFF) {
+        /* SOH/STX + 块号 0 -> Ymodem 文件名包 */
         ctx->protocol  = PROTO_YMODEM;
         ctx->is_ymodem = 1;
+    } else if (ctx->pkt[0] == PROTO_SOH) {
+        ctx->protocol  = PROTO_XMODEM;
+        ctx->is_ymodem = 0;
     } else {
         ctx->protocol  = PROTO_XMODEM_1K;
         ctx->is_ymodem = 0;
@@ -283,7 +283,7 @@ static void detect_protocol(TransferCtx *ctx)
 
     dbg_printf("Protocol detected: %s\r\n",
            ctx->protocol == PROTO_XMODEM    ? "Xmodem (128B)"    :
-           ctx->protocol == PROTO_XMODEM_1K ? "Xmodem-1K (1024B)" : "Ymodem (1024B)");
+           ctx->protocol == PROTO_XMODEM_1K ? "Xmodem-1K (1024B)" : "Ymodem");
 }
 
 /**

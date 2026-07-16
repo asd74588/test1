@@ -17,13 +17,17 @@
 /* ===== e_ident 索引 ===== */
 #define EI_CLASS    4   /* 文件类型：32/64-bit */
 #define EI_DATA     5   /* 字节序 */
+#define EI_VERSION  6   /* ELF header version */
 
 #define ELFCLASS32  1   /* 32-bit ELF */
 #define ELFDATA2LSB 1   /* 小端序 */
 
 /* ===== e_type ===== */
+#define ET_REL      1   /* relocatable file */
 #define ET_EXEC     2   /* 可执行文件 */
 #define ET_DYN      3   /* 共享对象（PIC）*/
+
+#define EV_CURRENT  1
 
 /* ===== e_machine ===== */
 #define EM_ARM      40  /* ARM 架构 */
@@ -36,6 +40,10 @@
 #define SHT_RELA        4   /* 带显式加数的重定向表 */
 #define SHT_NOBITS      8   /* .bss：文件中不占空间 */
 #define SHT_REL         9   /* 不带显式加数的重定向表 */
+#define SHT_INIT_ARRAY  14
+#define SHT_FINI_ARRAY  15
+#define SHT_PREINIT_ARRAY 16
+#define SHT_ARM_EXIDX   0x70000001U
 
 /* ===== Section header 标志 (sh_flags) ===== */
 #define SHF_WRITE       0x1   /* 可写 */
@@ -62,10 +70,25 @@
 /* ===== ARM 重定向类型 ===== */
 #define R_ARM_NONE          0
 #define R_ARM_ABS32         2
+#define R_ARM_REL32         3
+#define R_ARM_THM_PC8       11
 #define R_ARM_CALL          28
 #define R_ARM_JUMP24        29
 #define R_ARM_TARGET1       38
 #define R_ARM_V4BX          40
+#define R_ARM_PREL31        42
+#define R_ARM_MOVW_ABS_NC   43
+#define R_ARM_MOVT_ABS      44
+#define R_ARM_MOVW_PREL_NC  45
+#define R_ARM_MOVT_PREL     46
+#define R_ARM_THM_MOVW_ABS_NC 47
+#define R_ARM_THM_MOVT_ABS  48
+#define R_ARM_THM_MOVW_PREL_NC 49
+#define R_ARM_THM_MOVT_PREL 50
+#define R_ARM_THM_JUMP19    51
+#define R_ARM_THM_JUMP6     52
+#define R_ARM_THM_ALU_PREL_11_0 53
+#define R_ARM_THM_PC12      54
 #define R_ARM_RELATIVE      23
 #define R_ARM_THM_CALL      10
 #define R_ARM_THM_JUMP24    30

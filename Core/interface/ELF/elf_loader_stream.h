@@ -46,13 +46,6 @@ extern "C" {
  * 容量常量
  * =================================================================== */
 
-enum
-{
-    R_ARM_THM_MOVW_ABS_NC = 47,
-    R_ARM_THM_MOVT_ABS    = 48,
-};
-
-
 #define ELF_STREAM_MAX_SHDRS      64U
 #define ELF_STREAM_SHSTRTAB_MAX   4096U
 #define ELF_STREAM_META_BUF_MIN   \
@@ -168,7 +161,7 @@ int elf_parse_stream(elf_ctx_stream_t *ctx);
  *   write section 单遍。
  *
  * @param offset        运行时 Flash 起始地址与链接时基地址之差
- *                      例：链接在 0x08020000，运行在 0x08040000，offset = 0x20000
+ *                      例：链接在 0x0802B800，运行在 0x08040000，offset = 0x14800
  * @param app_max_size  Flash 分区大小（字节），用于值域过滤（路径 B）
  * @param writeback     重定向后写回回调
  */

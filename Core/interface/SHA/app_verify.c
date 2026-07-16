@@ -2,6 +2,7 @@
 #include "hash/cmox_hash.h"
 #include "global.h"
 #include "fw_pubkey.h"
+#include "app_verify.h"
 
 #include "cmox_ecc.h"
 #include "cmox_ecc_types.h"
@@ -77,26 +78,32 @@ static int verify_ecdsa(const Firmware_Header_t *hdr)
     return 0;
 }
 
-int verify_firmware(const char *path)
+firmware_verify_status_t verify_firmware(const char *path)
 {
     Firmware_Header_t hdr;
     int err;
+
+    if (path == NULL) {
+        return FIRMWARE_VERIFY_ERR_PARAM;
+    }
 
     /* 1. 打开文件读Header */
     err = lfs_file_open(&lfs_ctx.lfs, &lfs_ctx.file, path, LFS_O_RDONLY);
     if (err < 0) {
         BL_ERR("open failed: %d", err);
-        return -1;
+        return FIRMWARE_VERIFY_ERR_OPEN;
     }
 
     if (lfs_file_read(&lfs_ctx.lfs, &lfs_ctx.file, &hdr, sizeof(hdr)) != sizeof(hdr)) {
         BL_ERR("header read failed");
+        err = FIRMWARE_VERIFY_ERR_HEADER;
         goto fail;
     }
 
     /* 2. 校验Magic */
     if (hdr.magic != 0xAABBCCDD) {
         BL_ERR("bad magic: 0x%08X", hdr.magic);
+        err = FIRMWARE_VERIFY_ERR_MAGIC;
         goto fail;
     }
     BL_INFO("Version: %lu", hdr.version);
@@ -110,7 +117,12 @@ int verify_firmware(const char *path)
         size_t hash_len;
         cmox_sha256_handle_t ctx;
 
-        lfs_file_seek(&lfs_ctx.lfs, &lfs_ctx.file, sizeof(Firmware_Header_t), LFS_SEEK_SET);
+        if (lfs_file_seek(&lfs_ctx.lfs, &lfs_ctx.file,
+                          sizeof(Firmware_Header_t), LFS_SEEK_SET) < 0) {
+            BL_ERR("payload seek failed");
+            err = FIRMWARE_VERIFY_ERR_SEEK;
+            goto fail;
+        }
 
         cmox_sha256_construct(&ctx);
         cmox_hash_init((cmox_hash_handle_t *)&ctx);
@@ -120,6 +132,12 @@ int verify_firmware(const char *path)
             total += rd;
             cmox_hash_append((cmox_hash_handle_t *)&ctx, buf, (size_t)rd);
         }
+        if (rd < 0) {
+            BL_ERR("payload read failed: %d", rd);
+            cmox_hash_cleanup((cmox_hash_handle_t *)&ctx);
+            err = FIRMWARE_VERIFY_ERR_READ;
+            goto fail;
+        }
         cmox_hash_generateTag((cmox_hash_handle_t *)&ctx, calc_hash, &hash_len);
         cmox_hash_cleanup((cmox_hash_handle_t *)&ctx);
 
@@ -127,6 +145,7 @@ int verify_firmware(const char *path)
 
         if (memcmp(calc_hash, hdr.sha256, 32) != 0) {
             BL_ERR("SHA256 mismatch");
+            err = FIRMWARE_VERIFY_ERR_SHA256;
             goto fail;
         }
         BL_INFO("SHA256 OK");
@@ -136,15 +155,16 @@ int verify_firmware(const char *path)
     /* 4. 校验ECDSA签名 */
     if (verify_ecdsa(&hdr) != 0) {
         BL_ERR("Signature verification failed");
+        err = FIRMWARE_VERIFY_ERR_SIGNATURE;
         goto fail;
     }
 
     lfs_file_close(&lfs_ctx.lfs, &lfs_ctx.file);
-    return 0;
+    return FIRMWARE_VERIFY_OK;
 
 fail:
     lfs_file_close(&lfs_ctx.lfs, &lfs_ctx.file);
-    return -1;
+    return (firmware_verify_status_t)err;
 }
 
 

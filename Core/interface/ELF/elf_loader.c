@@ -1,1002 +1,992 @@
 /**
- * elf_loader_stream.c — 流式 ELF 解析与重定向实现
- *
- * ── AXF 实测校验结论（LED.axf / ARMCC 6.19 / STM32L431）──
- *
- *   1. exec section sh_addr = 0x08020000（非 0），原 scan_exec 条件
- *      `sh_addr == 0U` 会导致整个 exec section 被跳过。
- *      修正：exec 判断改为 `is_exec && !is_write`。
- *
- *   2. AXF 含完整 REL 表（243 条），类型分布：
- *        R_ARM_ABS32           (type=2)  ×81  — 向量表 + literal pool 绝对地址
- *        R_ARM_THM_CALL        (type=10) ×120 — BL 指令，PC-relative，自校正
- *        R_ARM_THM_MOVW_ABS_NC (type=47) ×20  — MOVW 绝对低16位，需重定向
- *        R_ARM_THM_MOVT_ABS    (type=48) ×20  — MOVT 绝对高16位，需重定向
- *        R_ARM_THM_MOVW_PREL   (type=54) ×1   — PC-relative，忽略
- *        R_ARM_THM_ALU_PREL    (type=102)×1   — PC-relative，忽略
- *
- *   3. MOVW/MOVT 目标地址：4 对指向 Flash（0x08022xxx），16 对指向 RAM，
- *      Flash 目标必须重定向；RAM 目标（SRAM 地址不随 Flash offset 变化）
- *      按 REL 驱动处理，sym=0 时 addend=当前 imm16，offset 仅加到 Flash 范围。
- *      实现采用：解码 → 全值加 offset → 若结果落入运行时 Flash 则写回，否则保留。
- *
- *   4. LINK_MIN/LINK_END 在路径 B（值域猜测）中必须以实际链接基地址为基准，
- *      而非固定从 0 算起，否则 [LINK_MIN=0x100, LINK_END=app_max_size] 覆盖不到
- *      0x0802xxxx 的向量表条目。
- *
- *   5. write section 的 4 个 word 均为 RAM/常量（0x003d0900, 0x1, 0x10, 0），
- *      无需重定向，但代码流程仍正确通过并 writeback（zero-delta）。
- *
- * ── 内存开销（典型 256 KB 分区）──
- *
- *   meta_buf：~10 KB（可配置上限）
- *   work_buf：建议 4–16 KB；exec Pass-1 bitmap 占 256K/4/8 = 8 KB
- *             若 work_buf < 8 KB，bitmap 压缩到 work_buf 一半，chunk 变小但正确
- *
- * ── 两遍 exec 扫描说明 ──
- *
- *   Pass-1（build litpool bitmap）：
- *     以 half-word 分块扫描，识别 16-bit LDR Rn,[PC,#imm8*4] 和
- *     32-bit LDR Rn,[PC,#imm12]，在 bitmap 中标记 literal pool word 位置。
- *     需处理 32-bit LDR 跨块边界（上半字 0xF85F 在块尾）：pending_f85f 状态位。
- *
- *   Pass-2（relocate + writeback）：
- *     以 word 分块，携带 3-word carry 处理 scatter 跨块检测。
- *     scatter 处理优先（4-word 滑动窗口），其次向量表，再次 literal pool，
- *     最后函数体内部一律跳过。
+ * elf_loader.c - ELF32 full-buffer parser and in-place relocator
  */
 
-#include "elf_loader_stream.h"
-#include <string.h>
+#include "elf_loader.h"
+
+#include <limits.h>
 #include <stdio.h>
+#include <string.h>
 
-/* ===================================================================
- * 调试输出
- * =================================================================== */
+#define ELF_PREFIX "[elf] "
+#define ELF_INFO(fmt, ...) printf(ELF_PREFIX fmt "\r\n", ##__VA_ARGS__)
+#define ELF_WARN(fmt, ...) printf(ELF_PREFIX "WARN: " fmt "\r\n", ##__VA_ARGS__)
+#define ELF_ERR(fmt, ...)  printf(ELF_PREFIX "ERROR: " fmt "\r\n", ##__VA_ARGS__)
 
-#define ELF_LOG_LEVEL_INFO 1
-/* #define ELF_LOG_LEVEL_VERB 1 */
-#define ELF_LOG_LEVEL_WARN 1
+#define MIN_U32(a, b) ((a) < (b) ? (a) : (b))
 
-#define ELF_PREFIX "[elf_s] "
+typedef char elf_ehdr_size_check[(sizeof(elf32_ehdr) == 52U) ? 1 : -1];
+typedef char elf_shdr_size_check[(sizeof(elf32_shdr) == 40U) ? 1 : -1];
+typedef char elf_sym_size_check[(sizeof(elf32_sym) == 16U) ? 1 : -1];
 
-#ifdef ELF_LOG_LEVEL_INFO
-  #define ELF_INFO(fmt,...) printf(ELF_PREFIX fmt "\r\n",##__VA_ARGS__)
-#else
-  #define ELF_INFO(fmt,...) do{}while(0)
-#endif
-#ifdef ELF_LOG_LEVEL_VERB
-  #define ELF_VERB(fmt,...) printf(ELF_PREFIX "  " fmt "\r\n",##__VA_ARGS__)
-#else
-  #define ELF_VERB(fmt,...) do{}while(0)
-#endif
-#ifdef ELF_LOG_LEVEL_WARN
-  #define ELF_WARN(fmt,...) printf(ELF_PREFIX "WARN: " fmt "\r\n",##__VA_ARGS__)
-#else
-  #define ELF_WARN(fmt,...) do{}while(0)
-#endif
-#define ELF_ERR(fmt,...) printf(ELF_PREFIX "ERROR: " fmt "\r\n",##__VA_ARGS__)
+typedef struct {
+    uint32_t file_offset;
+    uint32_t symbol;
+    uint32_t half_index;
+    uint16_t upper;
+    uint16_t lower;
+    uint8_t  valid;
+} movw_pending_t;
 
-/* ===================================================================
- * 内部工具
- * =================================================================== */
-
-#ifndef MIN
-  #define MIN(a,b) ((a)<(b)?(a):(b))
-#endif
-
-/* RAM 范围 (STM32L431) */
-#define RELOC_RAM1_BASE 0x20000000U
-#define RELOC_RAM1_END  0x20010000U
-#define RELOC_RAM2_BASE 0x10000000U
-#define RELOC_RAM2_END  0x10004000U
-
-static inline int reloc_in_ram_s(uint32_t a) {
-    return (a>=RELOC_RAM1_BASE && a<RELOC_RAM1_END) ||
-           (a>=RELOC_RAM2_BASE && a<RELOC_RAM2_END);
-}
-
-static const char *shtype_name_s(uint32_t t) {
-    switch(t){
-    case SHT_NULL:     return "NULL";
-    case SHT_PROGBITS: return "PROGBITS";
-    case SHT_SYMTAB:   return "SYMTAB";
-    case SHT_STRTAB:   return "STRTAB";
-    case SHT_RELA:     return "RELA";
-    case SHT_NOBITS:   return "NOBITS";
-    case SHT_REL:      return "REL";
-    default:           return "OTHER";
-    }
-}
-
-/* ===================================================================
- * scatter 检测（与 elf_loader.c 完全一致）
- * =================================================================== */
-
-static int is_scatter_entry_s(const uint32_t *base, uint32_t w,
-                               uint32_t word_end, uint32_t link_end)
+static int range_valid(uint32_t total, uint32_t offset, uint32_t length)
 {
-    if (w+4U > word_end) return 0;
-    uint32_t src=base[w], dst=base[w+1], len=base[w+2], fn=base[w+3];
-    if (src==0||( src&3)!=0||src>=link_end)           return 0;
-    if (!reloc_in_ram_s(dst))                          return 0;
-    if (len==0||len>=0x10000U)                         return 0;
-    if (fn==0||(fn&3)!=0||fn>=link_end||fn==src)       return 0;
+    return offset <= total && length <= total - offset;
+}
+
+static int add_signed_offset(uint32_t value, int32_t offset, uint32_t *result)
+{
+    int64_t adjusted = (int64_t)(uint64_t)value + (int64_t)offset;
+
+    if (result == NULL || adjusted < 0 || adjusted > (int64_t)UINT32_MAX) {
+        return 0;
+    }
+
+    *result = (uint32_t)adjusted;
     return 1;
 }
 
-static void handle_scatter_entry_s(uint32_t *base, uint32_t w, uint32_t offset)
+static int is_power_of_two(uint32_t value)
 {
-    uint32_t old_src=base[w], old_fn=base[w+3];
-    base[w]   = old_src+offset;
-    base[w+3] = old_fn +offset;
-    ELF_INFO("scatter [w=%u] src:0x%08x->0x%08x  fn:0x%08x->0x%08x",
-             w, old_src, base[w], old_fn, base[w+3]);
+    return value != 0U && (value & (value - 1U)) == 0U;
 }
 
-/* ===================================================================
- * relocate_word_s() — 值域过滤 + 重定向（路径 B 专用）
- *
- * Fix-B1: LINK_MIN/LINK_END 以链接基地址（sh_addr）为基准
- * =================================================================== */
-static int relocate_word_s(uint32_t *slot,
-                            uint32_t  offset,
-                            uint32_t  LINK_MIN,
-                            uint32_t  LINK_END,
-                            uint32_t  LINK_END_STRICT,
-                            uint32_t  RT_BASE,
-                            uint32_t  RT_SIZE,
-                            uint32_t  w,
-                            uint32_t *skip_bounds,
-                            uint32_t *skip_align,
-                            uint32_t *skip_float,
-                            uint32_t *skip_thumb,
-                            uint32_t *skip_postchk)
+static uint16_t read_u16(const uint8_t *ptr)
 {
-    uint32_t val = *slot;
-
-    if (val<LINK_MIN || val>=LINK_END) { (*skip_bounds)++; return 0; }
-
-    if ((val&1U)==0U && (val&3U)!=0U) {
-        ELF_VERB("[%3u] skip 0x%08x not 4-aligned", w, val);
-        (*skip_align)++; return 0;
-    }
-
-    /* ④ IEEE 754 浮点排除
-     *
-     * 仅当 val < LINK_MIN 时浮点误判才成立。
-     * LINK_MIN 是 link_base + 0x100：
-     *   link_base = 0       (PIC/0-based)：LINK_MIN = 0x100，val 通过 bounds 才到这里，
-     *                        可能与 float 编码重叠，需要过滤。
-     *   link_base = 0x08020000 (ARMCC ET_EXEC)：LINK_MIN = 0x08020100，
-     *                        bits[30:23] 固定为 0x10，对所有 Flash 地址一律触发 IEEE754
-     *                        误判 → 完全跳过 float check（已由 bounds 保证 val 合法）。
-     * 判据：val < 0x01000000 才做 float check。
-     *   原因：ARM Cortex-M 实际使用的 Flash/SRAM 地址均 >= 0x08000000 / 0x20000000，
-     *   而真正可能与指针混淆的 float（如 1.0f = 0x3F800000）均 < 0x01000000 已被
-     *   bounds 拒绝，或在 [0x01000000, 0x08000000) 的过渡区中 float check 仍有意义。
-     */
-    if (val < 0x01000000U) {
-        uint32_t exp=(val>>23)&0xFFU, mant=val&0x7FFFFFU;
-        if ((exp>=0x01U&&exp<=0xFEU&&mant!=0U)||(exp>=0x7EU&&exp<=0x9EU&&mant==0U)){
-            ELF_VERB("[%3u] skip 0x%08x IEEE754", w, val);
-            (*skip_float)++; return 0;
-        }
-    }
-
-    if (val&1U) {
-        uint32_t stripped=val&~1U;
-        if (stripped==0U||stripped>=LINK_END_STRICT){
-            ELF_VERB("[%3u] skip 0x%08x Thumb OOB", w, val);
-            (*skip_thumb)++; return 0;
-        }
-    } else {
-        if (val>=LINK_END){ (*skip_thumb)++; return 0; }
-    }
-
-    uint32_t nv = val+offset;
-    {
-        uint32_t a=nv&~1U;
-        if (!(a>=RT_BASE&&a<RT_BASE+RT_SIZE)&&!reloc_in_ram_s(a)){
-            ELF_VERB("[%3u] skip 0x%08x postchk fail", w, val);
-            (*skip_postchk)++; return 0;
-        }
-    }
-
-    ELF_VERB("[%3u] FIX 0x%08x -> 0x%08x", w, val, nv);
-    *slot=nv; return 1;
+    uint16_t value;
+    memcpy(&value, ptr, sizeof(value));
+    return value;
 }
 
-/* ===================================================================
- * Thumb2 MOVW/MOVT 编解码
- *
- * 内存字节布局（小端）：
- *   addr+0,+1 : upper halfword（含 imm4, i, S 等）
- *   addr+2,+3 : lower halfword（含 imm3, Rd, imm8）
- *
- * imm16 = imm4[3:0] : i[10] : imm3[14:12] : imm8[7:0]
- *         (15:12)     (11)    (10:8)         (7:0)
- * =================================================================== */
+static uint32_t read_u32(const uint8_t *ptr)
+{
+    uint32_t value;
+    memcpy(&value, ptr, sizeof(value));
+    return value;
+}
 
-static uint16_t movw_decode_imm16(uint16_t upper, uint16_t lower)
+static void write_u16(uint8_t *ptr, uint16_t value)
+{
+    memcpy(ptr, &value, sizeof(value));
+}
+
+static void write_u32(uint8_t *ptr, uint32_t value)
+{
+    memcpy(ptr, &value, sizeof(value));
+}
+
+static const char *section_type_name(uint32_t type)
+{
+    switch (type) {
+    case SHT_NULL:          return "NULL";
+    case SHT_PROGBITS:      return "PROGBITS";
+    case SHT_SYMTAB:        return "SYMTAB";
+    case SHT_STRTAB:        return "STRTAB";
+    case SHT_RELA:          return "RELA";
+    case SHT_NOBITS:        return "NOBITS";
+    case SHT_REL:           return "REL";
+    case SHT_INIT_ARRAY:    return "INIT_ARRAY";
+    case SHT_FINI_ARRAY:    return "FINI_ARRAY";
+    case SHT_PREINIT_ARRAY: return "PREINIT_ARRAY";
+    case SHT_ARM_EXIDX:     return "ARM_EXIDX";
+    default:                return "OTHER";
+    }
+}
+
+static int is_load_section(const elf32_shdr *section)
+{
+    if (section == NULL ||
+        (section->sh_flags & SHF_ALLOC) == 0U ||
+        section->sh_size == 0U) {
+        return 0;
+    }
+
+    switch (section->sh_type) {
+    case SHT_PROGBITS:
+    case SHT_NOBITS:
+    case SHT_INIT_ARRAY:
+    case SHT_FINI_ARRAY:
+    case SHT_PREINIT_ARRAY:
+    case SHT_ARM_EXIDX:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static const char *section_name(const elf_ctx_t *ctx, const elf32_shdr *section)
+{
+    const char *name;
+    uint32_t remaining;
+
+    if (ctx == NULL || section == NULL || ctx->shstrtab == NULL ||
+        section->sh_name >= ctx->shstrtab_size) {
+        return "";
+    }
+
+    name = ctx->shstrtab + section->sh_name;
+    remaining = ctx->shstrtab_size - section->sh_name;
+    return memchr(name, '\0', remaining) != NULL ? name : "";
+}
+
+static int section_data_valid(const elf_ctx_t *ctx, const elf32_shdr *section)
+{
+    if (section->sh_type == SHT_NOBITS || section->sh_size == 0U) {
+        return 1;
+    }
+    return range_valid(ctx->file_size, section->sh_offset, section->sh_size);
+}
+
+static int address_in_region(uint32_t address, uint32_t base, uint32_t size)
+{
+    address &= ~1U;
+    return address >= base && address - base < size;
+}
+
+static int relocate_value(uint32_t *value,
+                          uint32_t  link_base,
+                          uint32_t  runtime_base,
+                          uint32_t  image_size,
+                          int32_t   offset)
+{
+    uint32_t old_value;
+    uint32_t new_value;
+
+    if (value == NULL) {
+        return -1;
+    }
+
+    old_value = *value;
+    if (old_value == 0U || !address_in_region(old_value, link_base, image_size)) {
+        return 0;
+    }
+
+    if ((old_value & 1U) == 0U && (old_value & 3U) != 0U) {
+        return 0;
+    }
+
+    if (!add_signed_offset(old_value, offset, &new_value) ||
+        !address_in_region(new_value, runtime_base, image_size)) {
+        return -1;
+    }
+
+    *value = new_value;
+    return 1;
+}
+
+static uint16_t mov_decode_imm16(uint16_t upper, uint16_t lower)
 {
     uint16_t imm4 = upper & 0x000FU;
-    uint16_t i    = (upper >> 10) & 0x0001U;
+    uint16_t i = (upper >> 10) & 0x0001U;
     uint16_t imm3 = (lower >> 12) & 0x0007U;
     uint16_t imm8 = lower & 0x00FFU;
-    return (uint16_t)((imm4<<12)|(i<<11)|(imm3<<8)|imm8);
+
+    return (uint16_t)((imm4 << 12) | (i << 11) | (imm3 << 8) | imm8);
 }
 
-/* movt_decode_imm16 与 movw 编码相同，复用 */
-#define movt_decode_imm16 movw_decode_imm16
-
-static void movw_encode_imm16(uint16_t imm16, uint16_t *upper, uint16_t *lower)
+static void mov_encode_imm16(uint16_t imm16, uint16_t *upper, uint16_t *lower)
 {
     uint16_t imm4 = (imm16 >> 12) & 0x000FU;
-    uint16_t i    = (imm16 >> 11) & 0x0001U;
-    uint16_t imm3 = (imm16 >>  8) & 0x0007U;
-    uint16_t imm8 =  imm16        & 0x00FFU;
-    *upper = (uint16_t)((*upper & 0xFBF0U) | (i<<10) | imm4);
-    *lower = (uint16_t)((*lower & 0x8F00U) | (imm3<<12) | imm8);
+    uint16_t i = (imm16 >> 11) & 0x0001U;
+    uint16_t imm3 = (imm16 >> 8) & 0x0007U;
+    uint16_t imm8 = imm16 & 0x00FFU;
+
+    *upper = (uint16_t)((*upper & 0xFBF0U) | (i << 10) | imm4);
+    *lower = (uint16_t)((*lower & 0x8F00U) | (imm3 << 12) | imm8);
 }
 
-#define movt_encode_imm16 movw_encode_imm16
-
-/* ===================================================================
- * litpool bitmap 更新（Pass-1 分块调用）
- *
- * @param h16          chunk 首 half-word 指针
- * @param chunk_halfs  本块 half-word 数
- * @param half_base    本块首 half 在 section 内的绝对 half 索引
- * @param sec_words    section 总 word 数
- * @param bitmap       位图缓冲区（已清零，全 section 大小）
- * @param pending_f85f 跨块状态：上块末尾遗留的 0xF85F 上半字
- * =================================================================== */
-static void litpool_bitmap_update(const uint16_t *h16,
-                                  uint32_t        chunk_halfs,
-                                  uint32_t        half_base,
-                                  uint32_t        sec_words,
-                                  uint8_t        *bitmap,
-                                  int            *pending_f85f)
+static int is_movw_or_movt_word(uint32_t value)
 {
-#define SET_LP(lp_w) do { \
-    uint32_t _w=(lp_w); \
-    if(_w<sec_words && !(( bitmap[_w/8U]>>(_w%8U))&1U)){ \
-        bitmap[_w/8U]|=(uint8_t)(1U<<(_w%8U)); \
-        ELF_VERB("litpool h=%u -> word[%u]",(unsigned)(half_base+i),_w); \
-    } \
-} while(0)
-
-    for (uint32_t i=0; i<chunk_halfs; i++) {
-        uint32_t h          = half_base + i;
-        uint32_t instr_byte = h * 2U;
-        uint32_t pc_align   = (instr_byte + 4U) & ~3U;
-
-        /* ── 处理跨块遗留的 0xF85F 上半字 ── */
-        if (*pending_f85f) {
-            *pending_f85f = 0;
-            uint32_t prev_pc = ((h-1U)*2U + 4U) & ~3U;
-            uint32_t imm     = (uint32_t)(h16[i] & 0x0FFFU);
-            SET_LP((prev_pc + imm) / 4U);
-            continue;
-        }
-
-        uint16_t instr = h16[i];
-
-        /* 16-bit LDR Rn,[PC,#imm8*4]  opcode[15:11]=01001 */
-        if ((instr & 0xF800U) == 0x4800U) {
-            uint32_t imm = (uint32_t)(instr & 0x00FFU) * 4U;
-            SET_LP((pc_align + imm) / 4U);
-            continue;
-        }
-
-        /* 32-bit LDR Rn,[PC,#imm12]  upper=0xF85F */
-        if (instr == 0xF85FU) {
-            if (i+1U < chunk_halfs) {
-                uint32_t imm = (uint32_t)(h16[i+1U] & 0x0FFFU);
-                SET_LP((pc_align + imm) / 4U);
-                i++;
-            } else {
-                *pending_f85f = 1;
-            }
-            continue;
-        }
-    }
-#undef SET_LP
+    uint16_t upper = (uint16_t)(value & 0xFFFFU);
+    return (upper & 0xFBF0U) == 0xF240U ||
+           (upper & 0xFBF0U) == 0xF2C0U;
 }
 
-/* ===================================================================
- * elf_parse_stream()
- * =================================================================== */
-int elf_parse_stream(elf_ctx_stream_t *ctx)
+int elf_parse(elf_ctx_t *ctx, uint8_t *buf, uint32_t file_size)
 {
-    if (!ctx || !ctx->io.read ||
-        !ctx->meta_buf || ctx->meta_buf_size < ELF_STREAM_META_BUF_MIN ||
-        !ctx->work_buf || ctx->work_buf_size < ELF_STREAM_WORK_BUF_MIN) {
-        ELF_ERR("invalid params");
+    elf32_ehdr *ehdr;
+    uint32_t shdr_bytes;
+    uint32_t i;
+
+    if (ctx == NULL || buf == NULL || file_size < sizeof(elf32_ehdr)) {
         return ELF_ERR_PARAM;
     }
 
-    memset(ctx->load_shidx, 0, sizeof(ctx->load_shidx));
-    memset(ctx->rel_shidx,  0, sizeof(ctx->rel_shidx));
-    ctx->load_count = ctx->rel_count = ctx->sym_count = ctx->offset = 0;
-    ctx->ehdr=NULL; ctx->shdrs=NULL; ctx->shstrtab=NULL;
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->buf = buf;
+    ctx->file_size = file_size;
+    ctx->link_base = UINT32_MAX;
 
-    uint8_t *meta = ctx->meta_buf;
-
-    /* ── 1. ELF header ── */
-    if (ctx->io.read(0U, meta, sizeof(elf32_ehdr), ctx->io.user) != 0) {
-        ELF_ERR("read ELF header failed"); return ELF_ERR_PARAM;
-    }
-    elf32_ehdr *ehdr = (elf32_ehdr *)meta;
+    ehdr = (elf32_ehdr *)buf;
     ctx->ehdr = ehdr;
 
-    if (*(uint32_t *)ehdr->e_ident != ELF_MAGIC){ ELF_ERR("bad magic"); return ELF_ERR_MAGIC; }
-    if (ehdr->e_ident[EI_CLASS] != ELFCLASS32)  { ELF_ERR("not 32-bit"); return ELF_ERR_CLASS; }
-    if (ehdr->e_machine != EM_ARM)              { ELF_ERR("not ARM"); return ELF_ERR_MACHINE; }
-    if (ehdr->e_shoff==0||ehdr->e_shnum==0)     { ELF_ERR("no shdrs"); return ELF_ERR_NO_SYMTAB; }
-    if (ehdr->e_shnum > ELF_STREAM_MAX_SHDRS)   {
-        ELF_ERR("too many shdrs (%u)", ehdr->e_shnum); return ELF_ERR_PARAM;
+    if (ehdr->e_ident[0] != 0x7FU || ehdr->e_ident[1] != 'E' ||
+        ehdr->e_ident[2] != 'L' || ehdr->e_ident[3] != 'F') {
+        ELF_ERR("bad ELF magic");
+        return ELF_ERR_MAGIC;
+    }
+    if (ehdr->e_ident[EI_CLASS] != ELFCLASS32) {
+        ELF_ERR("ELF is not 32-bit");
+        return ELF_ERR_CLASS;
+    }
+    if (ehdr->e_ident[EI_DATA] != ELFDATA2LSB) {
+        ELF_ERR("ELF is not little-endian");
+        return ELF_ERR_FORMAT;
+    }
+    if (ehdr->e_ident[EI_VERSION] != EV_CURRENT || ehdr->e_version != EV_CURRENT) {
+        ELF_ERR("unsupported ELF version");
+        return ELF_ERR_FORMAT;
+    }
+    if (ehdr->e_machine != EM_ARM) {
+        ELF_ERR("ELF machine is not ARM");
+        return ELF_ERR_MACHINE;
+    }
+    if (ehdr->e_type != ET_EXEC && ehdr->e_type != ET_DYN && ehdr->e_type != ET_REL) {
+        ELF_ERR("unsupported ELF type: %u", ehdr->e_type);
+        return ELF_ERR_FORMAT;
+    }
+    if (ehdr->e_ehsize != sizeof(elf32_ehdr) ||
+        ehdr->e_shentsize != sizeof(elf32_shdr) ||
+        ehdr->e_shoff == 0U || ehdr->e_shnum == 0U ||
+        (ehdr->e_shoff & 3U) != 0U) {
+        ELF_ERR("invalid ELF/section header layout");
+        return ELF_ERR_FORMAT;
     }
 
-    ELF_INFO("=== elf_parse_stream ===");
-    ELF_INFO("  e_entry=0x%08x  e_shnum=%u  e_flags=0x%08x",
-             ehdr->e_entry, ehdr->e_shnum, ehdr->e_flags);
-
-    /* ── 2. section header table ── */
-    uint8_t  *shdr_ptr  = meta + sizeof(elf32_ehdr);
-    uint32_t  shdr_size = (uint32_t)ehdr->e_shnum * (uint32_t)sizeof(elf32_shdr);
-    if ((uint32_t)sizeof(elf32_ehdr) + shdr_size > ctx->meta_buf_size) {
-        ELF_ERR("meta_buf too small"); return ELF_ERR_PARAM;
+    shdr_bytes = (uint32_t)ehdr->e_shnum * (uint32_t)sizeof(elf32_shdr);
+    if (!range_valid(file_size, ehdr->e_shoff, shdr_bytes)) {
+        ELF_ERR("section header table is outside the ELF buffer");
+        return ELF_ERR_BOUNDS;
     }
-    if (ctx->io.read(ehdr->e_shoff, shdr_ptr, shdr_size, ctx->io.user) != 0) {
-        ELF_ERR("read shdrs failed"); return ELF_ERR_PARAM;
-    }
-    elf32_shdr *shdrs = (elf32_shdr *)shdr_ptr;
-    ctx->shdrs = shdrs;
 
-    /* ── 3. shstrtab ── */
-    uint8_t *strtab_ptr = shdr_ptr + shdr_size;
-    uint32_t strtab_cap = ctx->meta_buf_size
-                          - (uint32_t)sizeof(elf32_ehdr) - shdr_size;
+    ctx->shdrs = (elf32_shdr *)(buf + ehdr->e_shoff);
 
-    if (ehdr->e_shstrndx != 0U && ehdr->e_shstrndx < ehdr->e_shnum) {
-        elf32_shdr *ss = &shdrs[ehdr->e_shstrndx];
-        if (ss->sh_size > 0U && ss->sh_size <= strtab_cap) {
-            if (ctx->io.read(ss->sh_offset, strtab_ptr,
-                             ss->sh_size, ctx->io.user) == 0) {
-                ctx->shstrtab = (const char *)strtab_ptr;
-            } else {
-                ELF_WARN("read shstrtab failed");
-            }
-        } else if (ss->sh_size > strtab_cap) {
-            ELF_WARN("shstrtab too large (%u > %u cap)", ss->sh_size, strtab_cap);
+    if (ehdr->e_shstrndx != SHN_UNDEF) {
+        elf32_shdr *strings;
+
+        if (ehdr->e_shstrndx >= ehdr->e_shnum) {
+            ELF_ERR("invalid e_shstrndx: %u", ehdr->e_shstrndx);
+            return ELF_ERR_FORMAT;
         }
-    } else {
-        ELF_WARN("no shstrtab (e_shstrndx=%u)", ehdr->e_shstrndx);
-    }
-
-    /* ── 4. 遍历 section table ── */
-    ELF_INFO("--- sections ---");
-    for (uint32_t i=0; i<ehdr->e_shnum; i++) {
-        elf32_shdr *s = &shdrs[i];
-        const char *name = (ctx->shstrtab && s->sh_name)
-                           ? ctx->shstrtab+s->sh_name : "(?)";
-
-        ELF_INFO("  [%2u] %-20s type=%-8s addr=0x%08x off=0x%06x size=%-6u flags=0x%x",
-                 i, name, shtype_name_s(s->sh_type),
-                 s->sh_addr, s->sh_offset, s->sh_size, s->sh_flags);
-
-        switch(s->sh_type) {
-        case SHT_SYMTAB:
-            ctx->sym_count = s->sh_size / (uint32_t)sizeof(elf32_sym);
-            ELF_INFO("        ^-- SYMTAB %u syms", ctx->sym_count);
-            break;
-        case SHT_REL: case SHT_RELA:
-            if (ctx->rel_count < ELF_STREAM_MAX_REL)
-                ctx->rel_shidx[ctx->rel_count++] = (uint16_t)i;
-            else ELF_WARN("too many REL/RELA, sec[%u] ignored", i);
-            break;
-        case SHT_PROGBITS: case SHT_NOBITS:
-            if ((s->sh_flags & SHF_ALLOC) && s->sh_size>0) {
-                if (ctx->load_count < ELF_STREAM_MAX_LOAD)
-                    ctx->load_shidx[ctx->load_count++]=(uint16_t)i;
-                else ELF_WARN("too many load secs, sec[%u] ignored", i);
-            }
-            break;
-        default: break;
+        strings = &ctx->shdrs[ehdr->e_shstrndx];
+        if (strings->sh_type != SHT_STRTAB ||
+            !range_valid(file_size, strings->sh_offset, strings->sh_size)) {
+            ELF_ERR("invalid section-name string table");
+            return ELF_ERR_BOUNDS;
+        }
+        ctx->shstrtab = (const char *)(buf + strings->sh_offset);
+        ctx->shstrtab_size = strings->sh_size;
+        if (ctx->shstrtab_size == 0U ||
+            ctx->shstrtab[ctx->shstrtab_size - 1U] != '\0') {
+            ELF_ERR("section-name string table is not terminated");
+            return ELF_ERR_FORMAT;
         }
     }
 
-    ELF_INFO("  load=%u  rel=%u  sym=%u  entry=0x%08x",
-             ctx->load_count, ctx->rel_count, ctx->sym_count, ehdr->e_entry);
-    ELF_INFO("=== elf_parse_stream done ===");
+    for (i = 0U; i < ehdr->e_shnum; ++i) {
+        elf32_shdr *section = &ctx->shdrs[i];
+        const char *name;
+
+        if (section->sh_addralign != 0U &&
+            !is_power_of_two(section->sh_addralign)) {
+            ELF_ERR("section[%u] has invalid alignment", i);
+            return ELF_ERR_FORMAT;
+        }
+        if (!section_data_valid(ctx, section)) {
+            ELF_ERR("section[%u] data is outside the ELF buffer", i);
+            return ELF_ERR_BOUNDS;
+        }
+        if (ctx->shstrtab != NULL && section->sh_name >= ctx->shstrtab_size) {
+            ELF_ERR("section[%u] has invalid name offset", i);
+            return ELF_ERR_FORMAT;
+        }
+        name = section_name(ctx, section);
+        if (ctx->shstrtab != NULL && section->sh_name != 0U && name[0] == '\0') {
+            ELF_ERR("section[%u] name is not terminated", i);
+            return ELF_ERR_FORMAT;
+        }
+
+        if (section->sh_type == SHT_SYMTAB) {
+            uint32_t entry_size = section->sh_entsize;
+
+            if (entry_size == 0U) {
+                entry_size = sizeof(elf32_sym);
+            }
+            if (entry_size != sizeof(elf32_sym) || section->sh_size % entry_size != 0U) {
+                ELF_ERR("invalid symbol table section[%u]", i);
+                return ELF_ERR_FORMAT;
+            }
+            if (ctx->symtab == NULL) {
+                ctx->symtab = (elf32_sym *)(buf + section->sh_offset);
+                ctx->sym_count = section->sh_size / entry_size;
+
+                if (section->sh_link < ehdr->e_shnum) {
+                    elf32_shdr *linked_strings = &ctx->shdrs[section->sh_link];
+                    if (linked_strings->sh_type == SHT_STRTAB &&
+                        section_data_valid(ctx, linked_strings)) {
+                        ctx->strtab = (const char *)(buf + linked_strings->sh_offset);
+                        ctx->strtab_size = linked_strings->sh_size;
+                    }
+                }
+            }
+        }
+
+        if (section->sh_type == SHT_REL || section->sh_type == SHT_RELA) {
+            uint32_t expected_size = section->sh_type == SHT_REL
+                                     ? (uint32_t)sizeof(elf32_rel)
+                                     : (uint32_t)sizeof(elf32_rela);
+            uint32_t entry_size = section->sh_entsize;
+
+            if (entry_size == 0U) {
+                entry_size = expected_size;
+            }
+            if (entry_size != expected_size || section->sh_size % entry_size != 0U ||
+                section->sh_info >= ehdr->e_shnum) {
+                ELF_ERR("invalid relocation section[%u]", i);
+                return ELF_ERR_FORMAT;
+            }
+            if (ctx->rel_count >= ELF_MAX_REL_SECTIONS) {
+                ELF_ERR("too many relocation sections");
+                return ELF_ERR_CAPACITY;
+            }
+            ctx->rel_shdrs[ctx->rel_count++] = section;
+        }
+
+        if (is_load_section(section)) {
+            if (ctx->load_count >= ELF_MAX_LOAD_SECTIONS) {
+                ELF_ERR("too many loadable sections");
+                return ELF_ERR_CAPACITY;
+            }
+            ctx->load_shdrs[ctx->load_count++] = section;
+            if (section->sh_addr < 0x10000000U && section->sh_addr < ctx->link_base) {
+                ctx->link_base = section->sh_addr;
+            }
+        }
+    }
+
+    if (ctx->load_count == 0U || ctx->link_base == UINT32_MAX) {
+        ELF_ERR("ELF has no loadable Flash section");
+        return ELF_ERR_FORMAT;
+    }
+
+    ELF_INFO("full-buffer parse: file=0x%08x size=%u", (uint32_t)(uintptr_t)buf,
+             file_size);
+    ELF_INFO("entry=0x%08x sections=%u load=%u rel=%u link_base=0x%08x",
+             ehdr->e_entry, ehdr->e_shnum, ctx->load_count, ctx->rel_count,
+             ctx->link_base);
+    elf_dump_sections(ctx);
     return ELF_OK;
 }
 
-/* ===================================================================
- * 路径 A — 精确 REL 重定向
- *
- * 支持的类型：
- *   R_ARM_ABS32 (2)         : *loc += offset  （向量表、literal pool 绝对指针）
- *   R_ARM_TARGET1 (23)      : 等同 ABS32
- *   R_ARM_THM_MOVW_ABS_NC(47)+R_ARM_THM_MOVT_ABS(48)：
- *                             decode imm16 → 加 offset → 若仍在合法范围则 encode 回写
- *   R_ARM_THM_CALL (10)     : BL/BLX PC-relative，目标 & 位置同步偏移，无需修改
- *   R_ARM_RELATIVE (43)     : *loc += offset（位置无关目标）
- *   其余 PC-relative 类型   : 忽略
- *
- * 重要：MOVW/MOVT 对的地址来自 REL 表，可能指向 Flash 或 RAM。
- *        只对结果落入运行时 Flash 范围的进行修改；RAM 地址不随 Flash offset 改变。
- *
- * @param ctx           已 parse 的上下文
- * @param offset        重定向偏移量
- * @param link_base     链接时 Flash 基地址（从 exec section sh_addr 推导）
- * @param rt_base       运行时 Flash 基地址 = link_base + offset
- * @param rt_size       Flash 分区大小
- * @param writeback     写回回调
- * =================================================================== */
-static int reloc_path_a(elf_ctx_stream_t *ctx,
-                        uint32_t          offset,
-                        uint32_t          link_base,
-                        uint32_t          rt_base,
-                        uint32_t          rt_size,
-                        elf_writeback_fn  writeback)
+static int relocation_target_offset(const elf32_shdr *target,
+                                    uint32_t          r_offset,
+                                    uint32_t         *section_offset)
 {
-    ELF_INFO("--- Path A: REL-driven relocation ---");
-
-    uint32_t total_abs32 = 0, total_movw = 0, total_call = 0,
-             total_skip  = 0, total_err  = 0;
-
-    for (uint32_t ri=0; ri<ctx->rel_count; ri++) {
-        elf32_shdr *rel_shdr = &ctx->shdrs[ctx->rel_shidx[ri]];
-
-        /* REL section 针对哪个 target section？ */
-        uint32_t target_idx = rel_shdr->sh_info;
-        if (target_idx >= ctx->ehdr->e_shnum) { total_skip++; continue; }
-        elf32_shdr *tgt = &ctx->shdrs[target_idx];
-
-        uint32_t entsize = rel_shdr->sh_entsize;
-        if (entsize < 8U) entsize = 8U;   /* REL entry = 8 bytes */
-        uint32_t n_entries = rel_shdr->sh_size / entsize;
-
-        ELF_INFO("  REL[%u]: %u entries -> sec[%u] addr=0x%08x",
-                 ri, n_entries, target_idx, tgt->sh_addr);
-
-#define REL_CHUNK 64U
-        {
-        uint8_t  rel_buf[REL_CHUNK * 8U];
-        uint32_t buf_start = (uint32_t)-1U;
-
-        for (uint32_t ei=0; ei<n_entries; ei++) {
-
-            uint32_t buf_lo = (ei / REL_CHUNK) * REL_CHUNK;
-            if (buf_lo != buf_start) {
-                uint32_t n = MIN(REL_CHUNK, n_entries - buf_lo);
-                if (ctx->io.read(rel_shdr->sh_offset + buf_lo * entsize,
-                                 rel_buf, n * entsize, ctx->io.user) != 0) {
-                    ELF_ERR("read REL entries failed"); return ELF_ERR_PARAM;
-                }
-                buf_start = buf_lo;
-            }
-
-            uint8_t *ep = rel_buf + (ei - buf_start) * entsize;
-            uint32_t r_offset, r_info;
-            memcpy(&r_offset, ep,     4);
-            memcpy(&r_info,   ep + 4, 4);
-            uint8_t r_type = (uint8_t)(r_info & 0xFFU);
-
-            /* r_offset 须在 target section 范围内 */
-            if (r_offset < tgt->sh_addr ||
-                r_offset >= tgt->sh_addr + tgt->sh_size) {
-                ELF_VERB("entry[%u] r_offset=0x%08x OOB", ei, r_offset);
-                total_skip++; continue;
-            }
-            uint32_t sec_byte = r_offset - tgt->sh_addr;
-            uint32_t file_off = tgt->sh_offset + sec_byte;
-
-            switch (r_type) {
-
-            /* ── ABS32 / TARGET1 ─────────────────── */
-            case R_ARM_ABS32:
-            case R_ARM_TARGET1: {
-                uint32_t val;
-                if (ctx->io.read(file_off, &val, 4, ctx->io.user)!=0){
-                    ELF_ERR("read ABS32 failed"); total_err++; break;
-                }
-                uint32_t nv = val + offset;
-                ELF_VERB("ABS32 @0x%08x  0x%08x -> 0x%08x", r_offset, val, nv);
-                if (writeback(file_off, &nv, 4, ctx->io.user)!=0){
-                    ELF_ERR("writeback ABS32 failed"); total_err++; break;
-                }
-                total_abs32++;
-                break;
-            }
-
-            /* ── RELATIVE ────────────────────────── */
-            case R_ARM_RELATIVE: {
-                uint32_t val;
-                if (ctx->io.read(file_off, &val, 4, ctx->io.user)!=0){
-                    ELF_ERR("read RELATIVE failed"); total_err++; break;
-                }
-                uint32_t nv = val + offset;
-                if (writeback(file_off, &nv, 4, ctx->io.user)!=0){
-                    ELF_ERR("writeback RELATIVE failed"); total_err++; break;
-                }
-                total_abs32++;
-                break;
-            }
-
-            /* ── THM_MOVW_ABS_NC + THM_MOVT_ABS ─── */
-            case R_ARM_THM_MOVW_ABS_NC:
-            case R_ARM_THM_MOVT_ABS: {
-                uint16_t upper, lower;
-                if (ctx->io.read(file_off,   &upper, 2, ctx->io.user)!=0 ||
-                    ctx->io.read(file_off+2U, &lower, 2, ctx->io.user)!=0) {
-                    ELF_ERR("read MOVW/T failed"); total_err++; break;
-                }
-
-                uint16_t imm16 = movw_decode_imm16(upper, lower);
-
-                /* 重建完整地址用于判断：需要配对的另一条记录。
-                 * 但 REL 表无 addend，且 MOVW/MOVT 各自独立记录。
-                 * 策略：对 imm16 加 offset 的低16位/高16位。
-                 * MOVW 记录：imm16 是目标地址低16位
-                 *   new_low16  = (full_addr + offset) & 0xFFFF
-                 *   full_addr  = (当前 MOVT imm16 << 16) | (当前 MOVW imm16)
-                 * 但两条记录独立出现，无法在单条里还原 full_addr。
-                 * 可行方案：保守做法，若 imm16 对应的"full 地址预测"
-                 *   落在 link Flash 范围，则 full_addr += offset 后写回对应16位。
-                 * 对 MOVT：高16位 = imm16，若 imm16 == link_base>>16，需要更新。
-                 * 对 MOVW：低16位 = imm16，无歧义，直接加 offset 低16位。
-                 *
-                 * 最稳妥：结合两者，但由于 REL 是顺序出现的 MOVW 后紧跟 MOVT，
-                 * 我们可以在 MOVW 时缓存 imm16，MOVT 时组合成完整地址再处理。
-                 * 此处采用简单独立处理：
-                 *   MOVW：new_imm16 = (uint16_t)((imm16 + (uint16_t)offset))
-                 *         但要考虑进位到高位；用 full_addr 来处理。
-                 * 最终采用：读取 MOVW 时保存，等到 MOVT 时一并处理（状态机）。
-                 * 此处实现简化版：逐条处理，依赖 MOVW/MOVT 严格相邻。
-                 */
-
-                /* 简单且正确的做法：
-                 * MOVW/MOVT 通常成对且 MOVT 紧跟 MOVW。
-                 * 对 MOVW 记录（type=47）：仅写入低16位
-                 *   new_full = (last_movt_imm16<<16|imm16) + offset
-                 *   新 MOVW  = new_full & 0xFFFF
-                 * 需要 lookahead。替代方案：
-                 *   MOVW 记录：存入 state machine
-                 *   MOVT 记录：组合后一次性更新两条
-                 * 为避免状态机复杂度，改用最简原则：
-                 *   单独处理每条，MOVW 加 offset 低16位（含进位），
-                 *   MOVT 加 offset 高16位（+进位来自 MOVW）。
-                 *   由于 MOVW 必然先于 MOVT，且我们按顺序遍历，
-                 *   可以用 static 变量记录 MOVW 进位。
-                 *
-                 * 但 static 在多实例并发下不安全。
-                 * 最佳做法：预读下一条，若当前=MOVW，下一条=MOVT，组合处理。
-                 */
-
-                /* === 实现：lookahead 组合 MOVW+MOVT === */
-                if (r_type == R_ARM_THM_MOVW_ABS_NC) {
-                    /* 缓存当前 MOVW，等待 MOVT（下一条 REL entry）*/
-                    /* 此处保存 file_off 和 upper/lower，在下次循环处理 */
-                    /* 用 work_buf 前 12 字节作为跨条目临时状态 */
-                    uint32_t *state = (uint32_t *)ctx->work_buf;
-                    state[0] = file_off;          /* MOVW file offset */
-                    state[1] = (uint32_t)upper | ((uint32_t)lower<<16);
-                    state[2] = 0xF00DF00DU;       /* magic: 有待处理的 MOVW */
-                    ELF_VERB("MOVW @0x%08x imm16=0x%04x (buffered)", r_offset, imm16);
-                    total_movw++;
-                    break;
-                }
-
-                /* r_type == R_ARM_THM_MOVT_ABS */
-                {
-                    uint32_t *state = (uint32_t *)ctx->work_buf;
-                    uint16_t movw_upper, movw_lower;
-                    uint32_t movw_foff = 0;
-                    int have_movw = (state[2] == 0xF00DF00DU);
-
-                    if (have_movw) {
-                        movw_foff  = state[0];
-                        movw_upper = (uint16_t)(state[1] & 0xFFFFU);
-                        movw_lower = (uint16_t)(state[1] >> 16);
-                        state[2]   = 0U;  /* 消费 */
-
-                        uint16_t w_imm16 = movw_decode_imm16(movw_upper, movw_lower);
-                        uint16_t t_imm16 = imm16;  /* 当前 MOVT */
-
-                        uint32_t full_addr = ((uint32_t)t_imm16<<16) | w_imm16;
-                        uint32_t new_full  = full_addr + offset;
-
-                        /* 仅当 full_addr 在 link Flash 范围内才更新 */
-                        uint32_t link_size = rt_size;
-                        int needs_reloc = (full_addr >= link_base &&
-                                           full_addr <  link_base + link_size);
-
-                        if (needs_reloc) {
-                            uint16_t new_w = (uint16_t)(new_full & 0xFFFFU);
-                            uint16_t new_t = (uint16_t)(new_full >> 16);
-
-                            uint16_t wu = movw_upper, wl = movw_lower;
-                            movw_encode_imm16(new_w, &wu, &wl);
-                            if (writeback(movw_foff,   &wu, 2, ctx->io.user)!=0 ||
-                                writeback(movw_foff+2U,&wl, 2, ctx->io.user)!=0) {
-                                ELF_ERR("writeback MOVW failed"); total_err++; break;
-                            }
-
-                            uint16_t tu=upper, tl=lower;
-                            movt_encode_imm16(new_t, &tu, &tl);
-                            if (writeback(file_off,   &tu, 2, ctx->io.user)!=0 ||
-                                writeback(file_off+2U,&tl, 2, ctx->io.user)!=0) {
-                                ELF_ERR("writeback MOVT failed"); total_err++; break;
-                            }
-
-                            ELF_VERB("MOVW/T @0x%08x/0x%08x  0x%08x -> 0x%08x",
-                                     movw_foff, file_off, full_addr, new_full);
-                            total_movw++;
-                        } else {
-                            ELF_VERB("MOVW/T @0x%08x skip (0x%08x RAM/other)",
-                                     movw_foff, full_addr);
-                            total_skip++;
-                        }
-                    } else {
-                        /* 孤立的 MOVT，不常见，跳过 */
-                        ELF_WARN("orphan MOVT @0x%08x, skip", r_offset);
-                        total_skip++;
-                    }
-                }
-                break;
-            }
-
-            /* ── THM_CALL / CALL / JUMP24 ────────── */
-            case R_ARM_THM_CALL:
-            case R_ARM_CALL:
-            case R_ARM_JUMP24:
-                /* BL/BLX PC-relative：目标与位置同步偏移，相对距离不变，无需修改 */
-                total_call++;
-                break;
-
-            /* ── V4BX ────────────────────────────── */
-            case R_ARM_V4BX:
-                total_skip++;
-                break;
-
-            /* ── PC-relative MOVW/ALU PREL ───────── */
-            case 54:   /* R_ARM_THM_MOVW_PREL_NC */
-            case 102:  /* R_ARM_THM_ALU_PREL_11_0 */
-                total_skip++;
-                break;
-
-            case R_ARM_NONE:
-                break;
-
-            default:
-                ELF_VERB("unhandled reloc type=%u @0x%08x", r_type, r_offset);
-                total_skip++;
-                break;
-            }
-        } /* for ei */
-        } /* rel_buf block */
-#undef REL_CHUNK
+    if (r_offset >= target->sh_addr && r_offset - target->sh_addr < target->sh_size) {
+        *section_offset = r_offset - target->sh_addr;
+        return 1;
     }
-
-    ELF_INFO("  ABS32/REL=%u  MOVW/T pairs=%u  CALL(skip)=%u  other_skip=%u  err=%u",
-             total_abs32, total_movw/2U, total_call, total_skip, total_err);
-    return total_err ? ELF_ERR_PARAM : ELF_OK;
+    if (r_offset < target->sh_size) {
+        *section_offset = r_offset;
+        return 1;
+    }
+    return 0;
 }
 
-/* ===================================================================
- * 路径 B — 值域猜测重定向（无 REL 表时使用）
- *
- * Fix-B1: scan_exec 去掉 sh_addr==0 限制，改为仅检查 is_exec && !is_write
- * Fix-B2: LINK_MIN/LINK_END 以 sh_addr（链接基地址）为基准
- *         LINK_MIN = sh_addr + 0x100（最小合法偏移）
- *         LINK_END = sh_addr + app_max_size
- * =================================================================== */
-static int reloc_path_b(elf_ctx_stream_t *ctx,
-                        uint32_t          offset,
-                        uint32_t          app_max_size,
-                        elf_writeback_fn  writeback)
+static int relocate_word_at(elf_ctx_t *ctx,
+                            uint32_t   file_offset,
+                            uint32_t   runtime_base,
+                            uint32_t   image_size,
+                            int32_t    offset)
 {
-    ELF_INFO("--- Path B: value-range relocation (no REL table) ---");
+    uint32_t value;
+    int result;
 
-    uint32_t e_entry_stripped = ctx->ehdr->e_entry & ~1U;
-
-    /* 实际代码上界 */
-    uint32_t actual_code_end = 0U;
-    for (uint32_t i=0; i<ctx->load_count; i++) {
-        elf32_shdr *s = &ctx->shdrs[ctx->load_shidx[i]];
-        if ((s->sh_flags & SHF_EXECINSTR) && !(s->sh_flags & SHF_WRITE)) {
-            uint32_t end = s->sh_addr + s->sh_size;
-            if (end > actual_code_end) actual_code_end = end;
-        }
+    if (!range_valid(ctx->file_size, file_offset, sizeof(value))) {
+        return -1;
     }
-    if (actual_code_end == 0U) actual_code_end = app_max_size;
 
-    uint32_t total_scanned=0, total_fixed=0;
-    uint32_t skip_section=0, skip_bounds=0, skip_align=0;
-    uint32_t skip_float=0, skip_thumb=0, skip_litpool=0, skip_postchk=0;
-    uint32_t scatter_entries=0;
+    value = read_u32(ctx->buf + file_offset);
+    result = relocate_value(&value, ctx->link_base, runtime_base,
+                            image_size, offset);
+    if (result > 0) {
+        write_u32(ctx->buf + file_offset, value);
+    }
+    return result;
+}
 
-    for (uint32_t i=0; i<ctx->load_count; i++) {
-        elf32_shdr *shdr = &ctx->shdrs[ctx->load_shidx[i]];
-        if (shdr->sh_type == SHT_NOBITS) continue;
+static int relocate_mov_pair(elf_ctx_t          *ctx,
+                             const movw_pending_t *movw,
+                             uint32_t            movt_file_offset,
+                             uint16_t            movt_upper,
+                             uint16_t            movt_lower,
+                             uint32_t            runtime_base,
+                             uint32_t            image_size,
+                             int32_t             offset)
+{
+    uint32_t full_address;
+    uint32_t new_address;
+    uint16_t movw_upper;
+    uint16_t movw_lower;
 
-        uint32_t flags    = shdr->sh_flags;
-        int is_exec  = (flags & SHF_EXECINSTR) != 0;
-        int is_write = (flags & SHF_WRITE)     != 0;
-        int is_alloc = (flags & SHF_ALLOC)     != 0;
-        if (!is_alloc) continue;
+    full_address = ((uint32_t)mov_decode_imm16(movt_upper, movt_lower) << 16) |
+                   mov_decode_imm16(movw->upper, movw->lower);
+    if (!address_in_region(full_address, ctx->link_base, image_size)) {
+        return 0;
+    }
+    if (!add_signed_offset(full_address, offset, &new_address) ||
+        !address_in_region(new_address, runtime_base, image_size)) {
+        return -1;
+    }
 
-        const char *name = (ctx->shstrtab && shdr->sh_name)
-                           ? ctx->shstrtab + shdr->sh_name : "(?)";
+    movw_upper = movw->upper;
+    movw_lower = movw->lower;
+    mov_encode_imm16((uint16_t)new_address, &movw_upper, &movw_lower);
+    mov_encode_imm16((uint16_t)(new_address >> 16), &movt_upper, &movt_lower);
 
-        /* Fix-B1: 去掉 sh_addr==0 限制 */
-        int scan_exec  = (is_exec  && !is_write);
-        int scan_write = (is_write && !is_exec);
+    write_u16(ctx->buf + movw->file_offset, movw_upper);
+    write_u16(ctx->buf + movw->file_offset + 2U, movw_lower);
+    write_u16(ctx->buf + movt_file_offset, movt_upper);
+    write_u16(ctx->buf + movt_file_offset + 2U, movt_lower);
+    return 1;
+}
 
-        if (!scan_exec && !scan_write) {
-            ELF_INFO("  [skip] \"%s\"", name);
-            skip_section += shdr->sh_size / 4U;
+static int reloc_type_is_pc_relative(uint8_t type)
+{
+    switch (type) {
+    case R_ARM_REL32:
+    case R_ARM_THM_PC8:
+    case R_ARM_THM_CALL:
+    case R_ARM_CALL:
+    case R_ARM_JUMP24:
+    case R_ARM_THM_JUMP24:
+    case R_ARM_V4BX:
+    case R_ARM_PREL31:
+    case R_ARM_MOVW_PREL_NC:
+    case R_ARM_MOVT_PREL:
+    case R_ARM_THM_MOVW_PREL_NC:
+    case R_ARM_THM_MOVT_PREL:
+    case R_ARM_THM_JUMP19:
+    case R_ARM_THM_JUMP6:
+    case R_ARM_THM_ALU_PREL_11_0:
+    case R_ARM_THM_PC12:
+    case 102U: /* Legacy ARMCC PC-relative relocation. */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int relocate_from_tables(elf_ctx_t *ctx,
+                                uint32_t   runtime_base,
+                                uint32_t   image_size,
+                                int32_t    offset)
+{
+    uint32_t fixed_words = 0U;
+    uint32_t fixed_mov_pairs = 0U;
+    uint32_t skipped = 0U;
+    uint32_t rel_index;
+
+    ELF_INFO("relocation mode: ELF relocation tables");
+
+    for (rel_index = 0U; rel_index < ctx->rel_count; ++rel_index) {
+        elf32_shdr *rel_section = ctx->rel_shdrs[rel_index];
+        elf32_shdr *target = &ctx->shdrs[rel_section->sh_info];
+        uint32_t entry_size = rel_section->sh_entsize;
+        uint32_t entry_count;
+        uint32_t entry_index;
+        movw_pending_t pending[16];
+
+        if ((target->sh_flags & SHF_ALLOC) == 0U) {
+            continue;
+        }
+        if (target->sh_type == SHT_NOBITS) {
+            ELF_WARN("relocation targets NOBITS section \"%s\"; skipped",
+                     section_name(ctx, target));
             continue;
         }
 
-        uint32_t sec_words = shdr->sh_size / 4U;
-
-        /* Fix-B2: 以 sh_addr 为基准计算 LINK 范围 */
-        uint32_t LINK_BASE   = shdr->sh_addr;                 /* 链接时该 section 起始地址 */
-        uint32_t LINK_MIN    = LINK_BASE + 0x100U;            /* 最小有效地址偏移 */
-        uint32_t LINK_END    = LINK_BASE + app_max_size;      /* 链接分区上界 */
-        uint32_t LINK_STRICT = actual_code_end;               /* Thumb 指针上界 */
-        uint32_t RT_BASE     = offset;                        /* 运行时基地址 */
-        uint32_t RT_SIZE     = app_max_size;
-
-        uint32_t sec_fixed = 0U;
-
-        /* ────────────────────────────────── exec section ── */
-        if (scan_exec) {
-            uint32_t bmp_bytes = (sec_words + 7U) / 8U;
-            if (bmp_bytes >= ctx->work_buf_size) {
-                ELF_ERR("work_buf too small for bitmap"); return ELF_ERR_PARAM;
-            }
-            uint8_t  *bitmap      = ctx->work_buf;
-            uint8_t  *chunk_buf   = ctx->work_buf + bmp_bytes;
-            uint32_t  chunk_cap   = ctx->work_buf_size - bmp_bytes;
-            uint32_t  chunk_words = chunk_cap / 4U;
-            uint32_t  chunk_halfcap = chunk_cap / 2U;
-
-            if (chunk_words == 0U) {
-                ELF_ERR("work_buf chunk empty"); return ELF_ERR_PARAM;
-            }
-            memset(bitmap, 0, bmp_bytes);
-
-            ELF_INFO("  exec \"%s\": %u words bmp=%u chunk=%u",
-                     name, sec_words, bmp_bytes, chunk_words);
-
-            /* ── Pass-1: build litpool bitmap ── */
-            {
-                int pending = 0;
-                uint32_t half_end = sec_words * 2U;
-                for (uint32_t hoff=0; hoff<half_end; ) {
-                    uint32_t nh = MIN(chunk_halfcap, half_end-hoff);
-                    if (ctx->io.read(shdr->sh_offset + hoff*2U,
-                                     chunk_buf, nh*2U, ctx->io.user) != 0) {
-                        ELF_ERR("Pass-1 read failed"); return ELF_ERR_PARAM;
-                    }
-                    litpool_bitmap_update((const uint16_t *)chunk_buf,
-                                         nh, hoff, sec_words, bitmap, &pending);
-                    hoff += nh;
-                }
-            }
-
-            /* ── Pass-2: reloc + writeback，携带 3-word carry ── */
-            {
-                uint32_t carry[3] = {0,0,0};
-                uint32_t carry_n  = 0;
-                uint32_t word_off = 0;
-                uint32_t sec_scatter = 0;
-
-                /* e_entry_stripped - sh_addr = 向量表字节长度（无符号安全）*/
-                uint32_t vec_end_byte = (e_entry_stripped > LINK_BASE)
-                                        ? e_entry_stripped - LINK_BASE
-                                        : 0U;
-
-                while (word_off < sec_words || carry_n > 0U) {
-                    uint32_t *wbuf   = (uint32_t *)chunk_buf;
-                    uint32_t  avail  = chunk_words;
-
-                    for (uint32_t c=0; c<carry_n; c++) wbuf[c]=carry[c];
-
-                    uint32_t new_words = 0U;
-                    if (word_off < sec_words) {
-                        new_words = MIN(avail-carry_n, sec_words-word_off);
-                        if (ctx->io.read(shdr->sh_offset + word_off*4U,
-                                         (uint8_t *)(wbuf+carry_n),
-                                         new_words*4U, ctx->io.user) != 0) {
-                            ELF_ERR("Pass-2 read failed"); return ELF_ERR_PARAM;
-                        }
-                    }
-                    uint32_t total_in = carry_n + new_words;
-                    if (total_in == 0U) break;
-
-                    uint32_t abs_base = (carry_n>0&&word_off>0) ? word_off-carry_n : 0U;
-                    uint32_t wb_start = carry_n;
-                    uint32_t sc_start = (carry_n>=3U) ? carry_n-3U : 0U;
-
-                    uint32_t w = sc_start;
-                    while (w < total_in) {
-                        uint32_t abs_w = abs_base + w;
-                        total_scanned++;
-
-                        if (is_scatter_entry_s(wbuf, w, total_in, LINK_END)) {
-                            handle_scatter_entry_s(wbuf, w, offset);
-                            total_fixed+=2; sec_fixed+=2; scatter_entries++; sec_scatter++;
-                            /* carry 区域被修改则补写 */
-                            for (uint32_t si=0; si<4U; si++) {
-                                if (w+si < carry_n) {
-                                    uint32_t co = shdr->sh_offset+(abs_base+w+si)*4U;
-                                    if (writeback(co,&wbuf[w+si],4U,ctx->io.user)!=0){
-                                        ELF_ERR("carry writeback failed"); return ELF_ERR_PARAM;
-                                    }
-                                }
-                            }
-                            w+=4U; continue;
-                        }
-
-                        if (abs_w==0U) { skip_litpool++; w++; continue; }
-
-                        int in_vec = (abs_w*4U < vec_end_byte+4U);
-                        int in_lp  = (int)((bitmap[abs_w/8U]>>(abs_w%8U))&1U);
-
-                        if (!in_vec && !in_lp) { skip_litpool++; w++; continue; }
-
-                        if (in_vec && (wbuf[w]&1U)==0U) {
-                            skip_litpool++; w++; continue;
-                        }
-
-                        int fixed = relocate_word_s(
-                            &wbuf[w], offset, LINK_MIN, LINK_END, LINK_STRICT,
-                            RT_BASE, RT_SIZE, abs_w,
-                            &skip_bounds, &skip_align, &skip_float,
-                            &skip_thumb, &skip_postchk);
-                        if (fixed) { sec_fixed++; total_fixed++; }
-                        w++;
-                    }
-
-                    if (wb_start < total_in) {
-                        uint32_t wb_off = shdr->sh_offset+(abs_base+wb_start)*4U;
-                        if (writeback(wb_off, &wbuf[wb_start],
-                                      (total_in-wb_start)*4U, ctx->io.user)!=0){
-                            ELF_ERR("writeback failed"); return ELF_ERR_PARAM;
-                        }
-                    }
-
-                    carry_n = MIN(3U, total_in);
-                    for (uint32_t c=0; c<carry_n; c++)
-                        carry[c]=wbuf[total_in-carry_n+c];
-                    word_off+=new_words;
-                    if (new_words==0U) break;
-                }
-                ELF_INFO("    exec \"%s\": fixed=%u scatter=%u", name, sec_fixed, sec_scatter);
-            }
+        if (entry_size == 0U) {
+            entry_size = rel_section->sh_type == SHT_REL
+                         ? (uint32_t)sizeof(elf32_rel)
+                         : (uint32_t)sizeof(elf32_rela);
         }
 
-        /* ────────────────────────────────── write section ── */
-        else {
-            uint32_t cw  = ctx->work_buf_size/4U;
-            uint32_t *wb = (uint32_t *)ctx->work_buf;
+        memset(pending, 0, sizeof(pending));
+        entry_count = rel_section->sh_size / entry_size;
+        ELF_INFO("  %s: %u entries -> %s", section_name(ctx, rel_section),
+                 entry_count, section_name(ctx, target));
 
-            ELF_INFO("  write \"%s\": %u words LINK=[0x%08x,0x%08x)",
-                     name, sec_words, LINK_MIN, LINK_END);
+        for (entry_index = 0U; entry_index < entry_count; ++entry_index) {
+            uint8_t *entry = ctx->buf + rel_section->sh_offset + entry_index * entry_size;
+            uint32_t r_offset = read_u32(entry);
+            uint32_t r_info = read_u32(entry + 4U);
+            uint32_t symbol = ELF32_R_SYM(r_info);
+            uint8_t type = ELF32_R_TYPE(r_info);
+            uint32_t section_offset;
+            uint32_t file_offset;
+            int result;
 
-            for (uint32_t woff=0; woff<sec_words; ) {
-                uint32_t n = MIN(cw, sec_words-woff);
-                uint32_t fo = shdr->sh_offset+woff*4U;
-                if (ctx->io.read(fo,(uint8_t*)wb,n*4U,ctx->io.user)!=0){
-                    ELF_ERR("write-sec read failed"); return ELF_ERR_PARAM;
-                }
-                for (uint32_t w=0; w<n; w++) {
-                    total_scanned++;
-                    uint32_t val=wb[w];
-                    /* Fix-B3: 偶数地址高16位检测以 LINK_BASE 为基准 */
-                    if ((val&1U)==0U && (val>>16)!=(LINK_BASE>>16)){
-                        skip_bounds++; continue;
-                    }
-                    int fixed=relocate_word_s(
-                        &wb[w], offset, LINK_MIN, LINK_END, LINK_STRICT,
-                        RT_BASE, RT_SIZE, woff+w,
-                        &skip_bounds,&skip_align,&skip_float,
-                        &skip_thumb,&skip_postchk);
-                    if (fixed){ sec_fixed++; total_fixed++; }
-                }
-                if (writeback(fo,(const uint8_t*)wb,n*4U,ctx->io.user)!=0){
-                    ELF_ERR("write-sec writeback failed"); return ELF_ERR_PARAM;
-                }
-                woff+=n;
+            if (!relocation_target_offset(target, r_offset, &section_offset)) {
+                ELF_ERR("relocation offset 0x%08x is outside section \"%s\"",
+                        r_offset, section_name(ctx, target));
+                return ELF_ERR_RELOC;
             }
-            ELF_INFO("    write \"%s\": fixed=%u", name, sec_fixed);
+            file_offset = target->sh_offset + section_offset;
+
+            switch (type) {
+            case R_ARM_NONE:
+                break;
+
+            case R_ARM_ABS32:
+            case R_ARM_TARGET1:
+            case R_ARM_RELATIVE:
+                result = relocate_word_at(ctx, file_offset, runtime_base,
+                                          image_size, offset);
+                if (result < 0) {
+                    ELF_ERR("invalid 32-bit relocation at file+0x%08x", file_offset);
+                    return ELF_ERR_RELOC;
+                }
+                if (result > 0) {
+                    ++fixed_words;
+                } else {
+                    ++skipped;
+                }
+                break;
+
+            case R_ARM_THM_MOVW_ABS_NC:
+            case R_ARM_THM_MOVT_ABS: {
+                uint16_t upper;
+                uint16_t lower;
+                uint32_t rd;
+
+                if (!range_valid(ctx->file_size, file_offset, 4U)) {
+                    return ELF_ERR_BOUNDS;
+                }
+                upper = read_u16(ctx->buf + file_offset);
+                lower = read_u16(ctx->buf + file_offset + 2U);
+                rd = (lower >> 8) & 0xFU;
+
+                if (type == R_ARM_THM_MOVW_ABS_NC) {
+                    pending[rd].file_offset = file_offset;
+                    pending[rd].symbol = symbol;
+                    pending[rd].upper = upper;
+                    pending[rd].lower = lower;
+                    pending[rd].valid = 1U;
+                } else if (pending[rd].valid != 0U &&
+                           pending[rd].symbol == symbol) {
+                    result = relocate_mov_pair(ctx, &pending[rd], file_offset,
+                                               upper, lower, runtime_base,
+                                               image_size, offset);
+                    pending[rd].valid = 0U;
+                    if (result < 0) {
+                        ELF_ERR("invalid MOVW/MOVT relocation at file+0x%08x",
+                                file_offset);
+                        return ELF_ERR_RELOC;
+                    }
+                    if (result > 0) {
+                        ++fixed_mov_pairs;
+                    } else {
+                        ++skipped;
+                    }
+                } else {
+                    ELF_WARN("orphan MOVT relocation at file+0x%08x", file_offset);
+                    ++skipped;
+                }
+                break;
+            }
+
+            case R_ARM_MOVW_ABS_NC:
+            case R_ARM_MOVT_ABS:
+                ELF_ERR("ARM-state MOVW/MOVT relocation is unsupported on Cortex-M");
+                return ELF_ERR_RELOC;
+
+            default:
+                if (reloc_type_is_pc_relative(type)) {
+                    ++skipped;
+                    break;
+                }
+                ELF_ERR("unsupported relocation type %u in section \"%s\"",
+                        type, section_name(ctx, target));
+                return ELF_ERR_RELOC;
+            }
         }
     }
 
-    ELF_INFO("Path B done: scanned=%u fixed=%u scatter=%u",
-             total_scanned, total_fixed, scatter_entries);
-    ELF_INFO("  skip: bounds=%u align=%u float=%u thumb=%u litpool=%u postchk=%u",
-             skip_bounds, skip_align, skip_float, skip_thumb, skip_litpool, skip_postchk);
+    ELF_INFO("relocation tables done: words=%u mov-pairs=%u skipped=%u",
+             fixed_words, fixed_mov_pairs, skipped);
     return ELF_OK;
 }
 
-/* ===================================================================
- * elf_relocate_stream() — 主入口
- *
- * 路径选择：
- *   有 REL section → Path A（精确）
- *   无 REL section → Path B（值域猜测）
- * =================================================================== */
-int elf_relocate_stream(elf_ctx_stream_t *ctx,
-                        uint32_t          offset,
-                        uint32_t          app_max_size,
-                        elf_writeback_fn  writeback)
+static void mark_literal_word(const elf32_shdr *section,
+                              uint32_t          address,
+                              uint8_t          *bitmap,
+                              uint32_t          word_count)
 {
-    if (!ctx||!ctx->ehdr||!ctx->shdrs||!ctx->io.read||!writeback){
-        ELF_ERR("invalid params"); return ELF_ERR_PARAM;
+    uint32_t byte_offset;
+    uint32_t word_index;
+
+    if (address < section->sh_addr || address - section->sh_addr >= section->sh_size) {
+        return;
     }
-    if (!ctx->work_buf||ctx->work_buf_size<ELF_STREAM_WORK_BUF_MIN){
-        ELF_ERR("work_buf too small"); return ELF_ERR_PARAM;
+
+    byte_offset = address - section->sh_addr;
+    if ((byte_offset & 3U) != 0U) {
+        return;
+    }
+
+    word_index = byte_offset / 4U;
+    if (word_index < word_count) {
+        bitmap[word_index / 8U] |= (uint8_t)(1U << (word_index % 8U));
+    }
+}
+
+static void build_literal_bitmap(const elf_ctx_t *ctx,
+                                 const elf32_shdr *section,
+                                 uint8_t          *bitmap,
+                                 uint32_t          word_count)
+{
+    const uint8_t *data = ctx->buf + section->sh_offset;
+    uint32_t half_count = section->sh_size / 2U;
+    uint32_t half_index = 0U;
+
+    while (half_index < half_count) {
+        uint32_t instruction_offset = half_index * 2U;
+        uint32_t pc = (section->sh_addr + instruction_offset + 4U) & ~3U;
+        uint16_t upper = read_u16(data + instruction_offset);
+
+        if ((upper & 0xF800U) == 0x4800U) {
+            uint32_t immediate = (uint32_t)(upper & 0x00FFU) * 4U;
+            mark_literal_word(section, pc + immediate, bitmap, word_count);
+            ++half_index;
+            continue;
+        }
+
+        if ((upper == 0xF8DFU || upper == 0xF85FU) && half_index + 1U < half_count) {
+            uint16_t lower = read_u16(data + instruction_offset + 2U);
+            uint32_t immediate = upper == 0xF8DFU
+                                 ? (uint32_t)(lower & 0x0FFFU)
+                                 : (uint32_t)(lower & 0x00FFU);
+            if (upper == 0xF8DFU) {
+                mark_literal_word(section, pc + immediate, bitmap, word_count);
+            } else if (immediate <= pc) {
+                mark_literal_word(section, pc - immediate, bitmap, word_count);
+            }
+            half_index += 2U;
+            continue;
+        }
+
+        ++half_index;
+    }
+}
+
+static int is_scatter_entry(const elf_ctx_t *ctx,
+                            const elf32_shdr *section,
+                            uint32_t          word_index,
+                            uint32_t          word_count,
+                            uint32_t          image_size)
+{
+    const uint8_t *entry;
+    uint32_t source;
+    uint32_t destination;
+    uint32_t length;
+    uint32_t function;
+
+    if (word_index + 4U > word_count) {
+        return 0;
+    }
+
+    entry = ctx->buf + section->sh_offset + word_index * 4U;
+    source = read_u32(entry);
+    destination = read_u32(entry + 4U);
+    length = read_u32(entry + 8U);
+    function = read_u32(entry + 12U);
+
+    return address_in_region(source, ctx->link_base, image_size) &&
+           address_in_region(function, ctx->link_base, image_size) &&
+           (source & 3U) == 0U && (function & 3U) == 0U &&
+           destination >= 0x10000000U && destination < 0x40000000U &&
+           length != 0U && length < 0x10000U && function != source;
+}
+
+static int relocate_scatter_entry(elf_ctx_t *ctx,
+                                  const elf32_shdr *section,
+                                  uint32_t          word_index,
+                                  uint32_t          runtime_base,
+                                  uint32_t          image_size,
+                                  int32_t           offset)
+{
+    uint32_t file_offset = section->sh_offset + word_index * 4U;
+    uint32_t source = read_u32(ctx->buf + file_offset);
+    uint32_t function = read_u32(ctx->buf + file_offset + 12U);
+
+    if (!add_signed_offset(source, offset, &source) ||
+        !add_signed_offset(function, offset, &function) ||
+        !address_in_region(source, runtime_base, image_size) ||
+        !address_in_region(function, runtime_base, image_size)) {
+        return ELF_ERR_RELOC;
+    }
+
+    write_u32(ctx->buf + file_offset, source);
+    write_u32(ctx->buf + file_offset + 12U, function);
+    return ELF_OK;
+}
+
+static int relocate_mov_pairs_by_scan(elf_ctx_t *ctx,
+                                      const elf32_shdr *section,
+                                      uint32_t          runtime_base,
+                                      uint32_t          image_size,
+                                      int32_t           offset,
+                                      uint32_t         *fixed_count)
+{
+    uint8_t *data = ctx->buf + section->sh_offset;
+    uint32_t half_count = section->sh_size / 2U;
+    uint32_t half_index = 0U;
+    movw_pending_t pending[16];
+
+    memset(pending, 0, sizeof(pending));
+
+    while (half_index < half_count) {
+        uint16_t upper = read_u16(data + half_index * 2U);
+
+        if ((upper >> 11U) >= 0x1DU && half_index + 1U < half_count) {
+            uint16_t lower = read_u16(data + half_index * 2U + 2U);
+            uint32_t rd = (lower >> 8) & 0xFU;
+
+            if ((upper & 0xFBF0U) == 0xF240U) {
+                pending[rd].file_offset = section->sh_offset + half_index * 2U;
+                pending[rd].half_index = half_index;
+                pending[rd].upper = upper;
+                pending[rd].lower = lower;
+                pending[rd].valid = 1U;
+            } else if ((upper & 0xFBF0U) == 0xF2C0U &&
+                       pending[rd].valid != 0U &&
+                       half_index - pending[rd].half_index <= 256U) {
+                int result = relocate_mov_pair(ctx, &pending[rd],
+                                               section->sh_offset + half_index * 2U,
+                                               upper, lower, runtime_base,
+                                               image_size, offset);
+                pending[rd].valid = 0U;
+                if (result < 0) {
+                    return ELF_ERR_RELOC;
+                }
+                if (result > 0) {
+                    ++(*fixed_count);
+                }
+            }
+            half_index += 2U;
+        } else {
+            ++half_index;
+        }
+    }
+
+    return ELF_OK;
+}
+
+static int relocate_by_scan(elf_ctx_t *ctx,
+                            uint32_t   runtime_base,
+                            uint32_t   image_size,
+                            int32_t    offset,
+                            uint8_t   *scratch,
+                            uint32_t   scratch_size)
+{
+    uint32_t section_index;
+    uint32_t fixed_words = 0U;
+    uint32_t fixed_scatter = 0U;
+    uint32_t fixed_mov_pairs = 0U;
+    uint32_t entry_address = ctx->ehdr->e_entry & ~1U;
+
+    if (scratch == NULL || scratch_size == 0U) {
+        ELF_ERR("fallback relocation needs a scratch bitmap");
+        return ELF_ERR_PARAM;
+    }
+
+    ELF_WARN("ELF has no relocation table; using conservative value scan");
+
+    for (section_index = 0U; section_index < ctx->load_count; ++section_index) {
+        elf32_shdr *section = ctx->load_shdrs[section_index];
+        uint32_t flags = section->sh_flags;
+        int is_exec = (flags & SHF_EXECINSTR) != 0U;
+        int is_write = (flags & SHF_WRITE) != 0U;
+        uint32_t word_count;
+        uint32_t word_index;
+
+        if (section->sh_type == SHT_NOBITS) {
+            continue;
+        }
+
+        word_count = section->sh_size / 4U;
+
+        if (is_exec && !is_write) {
+            uint32_t bitmap_size = (word_count + 7U) / 8U;
+
+            if (bitmap_size > scratch_size) {
+                ELF_ERR("scratch bitmap too small: need %u, have %u",
+                        bitmap_size, scratch_size);
+                return ELF_ERR_CAPACITY;
+            }
+
+            memset(scratch, 0, bitmap_size);
+            build_literal_bitmap(ctx, section, scratch, word_count);
+
+            for (word_index = 0U; word_index < word_count;) {
+                uint32_t file_offset = section->sh_offset + word_index * 4U;
+                uint32_t value = read_u32(ctx->buf + file_offset);
+                uint32_t word_address = section->sh_addr + word_index * 4U;
+                int in_vectors = section->sh_addr == ctx->link_base &&
+                                 word_index != 0U && word_address <= entry_address;
+                int in_literal_pool =
+                    (scratch[word_index / 8U] & (uint8_t)(1U << (word_index % 8U))) != 0U;
+                int result;
+
+                if (is_scatter_entry(ctx, section, word_index, word_count, image_size)) {
+                    result = relocate_scatter_entry(ctx, section, word_index,
+                                                    runtime_base, image_size, offset);
+                    if (result != ELF_OK) {
+                        return result;
+                    }
+                    ++fixed_scatter;
+                    fixed_words += 2U;
+                    word_index += 4U;
+                    continue;
+                }
+
+                if ((!in_vectors && !in_literal_pool) ||
+                    (in_vectors && (value & 1U) == 0U) ||
+                    is_movw_or_movt_word(value)) {
+                    ++word_index;
+                    continue;
+                }
+
+                result = relocate_value(&value, ctx->link_base, runtime_base,
+                                        image_size, offset);
+                if (result < 0) {
+                    return ELF_ERR_RELOC;
+                }
+                if (result > 0) {
+                    write_u32(ctx->buf + file_offset, value);
+                    ++fixed_words;
+                }
+                ++word_index;
+            }
+
+            if (relocate_mov_pairs_by_scan(ctx, section, runtime_base, image_size,
+                                           offset, &fixed_mov_pairs) != ELF_OK) {
+                return ELF_ERR_RELOC;
+            }
+        } else if (is_write && !is_exec) {
+            for (word_index = 0U; word_index < word_count; ++word_index) {
+                uint32_t file_offset = section->sh_offset + word_index * 4U;
+                uint32_t value = read_u32(ctx->buf + file_offset);
+                int result;
+
+                if (is_movw_or_movt_word(value)) {
+                    continue;
+                }
+                result = relocate_value(&value, ctx->link_base, runtime_base,
+                                        image_size, offset);
+                if (result < 0) {
+                    return ELF_ERR_RELOC;
+                }
+                if (result > 0) {
+                    write_u32(ctx->buf + file_offset, value);
+                    ++fixed_words;
+                }
+            }
+        }
+    }
+
+    ELF_INFO("fallback relocation done: words=%u scatter=%u mov-pairs=%u",
+             fixed_words, fixed_scatter, fixed_mov_pairs);
+    return ELF_OK;
+}
+
+int elf_relocate(elf_ctx_t *ctx,
+                 int32_t    offset,
+                 uint32_t   app_max_size,
+                 uint8_t   *scratch,
+                 uint32_t   scratch_size)
+{
+    uint32_t runtime_base;
+    int result;
+
+    if (ctx == NULL || ctx->buf == NULL || ctx->ehdr == NULL ||
+        ctx->shdrs == NULL || app_max_size == 0U) {
+        return ELF_ERR_PARAM;
+    }
+    if (!add_signed_offset(ctx->link_base, offset, &runtime_base)) {
+        return ELF_ERR_RELOC;
     }
 
     ctx->offset = offset;
+    ELF_INFO("relocate: link=0x%08x runtime=0x%08x offset=%d size=0x%08x",
+             ctx->link_base, runtime_base, offset, app_max_size);
 
-    /* 推导链接基地址：取第一个 exec section 的 sh_addr */
-    uint32_t link_base = 0U;
-    for (uint32_t i=0; i<ctx->load_count; i++) {
-        elf32_shdr *s = &ctx->shdrs[ctx->load_shidx[i]];
-        if ((s->sh_flags & SHF_EXECINSTR) && !(s->sh_flags & SHF_WRITE)) {
-            link_base = s->sh_addr;
-            break;
-        }
+    if (offset == 0) {
+        ELF_INFO("relocation skipped: image already uses the target address");
+        return ELF_OK;
     }
-    uint32_t rt_base = link_base + offset;
 
-    ELF_INFO("=== elf_relocate_stream ===");
-    ELF_INFO("  offset=0x%08x  app_max=0x%08x  link_base=0x%08x  rt_base=0x%08x",
-             offset, app_max_size, link_base, rt_base);
-    ELF_INFO("  REL sections=%u  -> %s",
-             ctx->rel_count, ctx->rel_count>0 ? "Path A" : "Path B");
-
-    int rc;
-    if (ctx->rel_count > 0U) {
-        rc = reloc_path_a(ctx, offset, link_base, rt_base, app_max_size, writeback);
+    if (ctx->rel_count != 0U) {
+        result = relocate_from_tables(ctx, runtime_base, app_max_size, offset);
     } else {
-        rc = reloc_path_b(ctx, offset, app_max_size, writeback);
+        result = relocate_by_scan(ctx, runtime_base, app_max_size, offset,
+                                  scratch, scratch_size);
+    }
+    return result;
+}
+
+uint32_t elf_get_entry(const elf_ctx_t *ctx)
+{
+    uint32_t entry;
+
+    if (ctx == NULL || ctx->ehdr == NULL) {
+        return 0U;
     }
 
-    ELF_INFO("=== elf_relocate_stream done (rc=%d) ===", rc);
-    return rc;
+    entry = ctx->ehdr->e_entry;
+    if (entry < 0x10000000U && !add_signed_offset(entry, ctx->offset, &entry)) {
+        return 0U;
+    }
+    return entry;
 }
 
-/* ===================================================================
- * 辅助接口
- * =================================================================== */
-
-uint32_t elf_stream_get_entry(const elf_ctx_stream_t *ctx)
+int elf_get_section(const elf_ctx_t *ctx,
+                    uint32_t         idx,
+                    elf_section_info_t *info)
 {
-    if (!ctx||!ctx->ehdr) return 0U;
-    return ctx->ehdr->e_entry + ctx->offset;
-}
+    elf32_shdr *section;
 
-int elf_stream_get_section(const elf_ctx_stream_t *ctx,
-                           uint32_t idx, elf_section_info_t *info)
-{
-    if (!ctx||!info||idx>=ctx->load_count) return ELF_ERR_PARAM;
-    elf32_shdr *s = &ctx->shdrs[ctx->load_shidx[idx]];
-    info->load_addr = (s->sh_addr < 0x10000000U)
-                      ? s->sh_addr + ctx->offset : s->sh_addr;
-    info->size   = s->sh_size;
-    info->is_bss = (s->sh_type == SHT_NOBITS) ? 1 : 0;
-    info->name   = (ctx->shstrtab && s->sh_name) ? ctx->shstrtab+s->sh_name : "";
-    info->data   = NULL;
+    if (ctx == NULL || info == NULL || idx >= ctx->load_count) {
+        return ELF_ERR_PARAM;
+    }
+
+    section = ctx->load_shdrs[idx];
+    info->load_addr = section->sh_addr;
+    if (section->sh_addr < 0x10000000U &&
+        !add_signed_offset(section->sh_addr, ctx->offset, &info->load_addr)) {
+        return ELF_ERR_RELOC;
+    }
+    info->size = section->sh_size;
+    info->is_bss = section->sh_type == SHT_NOBITS ? 1U : 0U;
+    info->data = info->is_bss != 0U ? NULL : ctx->buf + section->sh_offset;
+    info->name = section_name(ctx, section);
     return ELF_OK;
 }
 
+void elf_dump_sections(const elf_ctx_t *ctx)
+{
+    uint32_t i;
+
+    if (ctx == NULL || ctx->ehdr == NULL || ctx->shdrs == NULL) {
+        return;
+    }
+
+    ELF_INFO("sections:");
+    for (i = 0U; i < ctx->ehdr->e_shnum; ++i) {
+        const elf32_shdr *section = &ctx->shdrs[i];
+        ELF_INFO("  [%2u] %-20s type=%-11s addr=0x%08x off=0x%06x size=%-6u flags=0x%x",
+                 i, section_name(ctx, section), section_type_name(section->sh_type),
+                 section->sh_addr, section->sh_offset, section->sh_size,
+                 section->sh_flags);
+    }
+}

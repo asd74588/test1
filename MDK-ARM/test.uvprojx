@@ -278,7 +278,7 @@
               <OCR_RVCT4>
                 <Type>1</Type>
                 <StartAddress>0x8000000</StartAddress>
-                <Size>0x19000</Size>
+                <Size>0x18000</Size>
               </OCR_RVCT4>
               <OCR_RVCT5>
                 <Type>1</Type>
@@ -998,9 +998,9 @@
               <FilePath>..\Core\interface\ELF\elf_loader.h</FilePath>
             </File>
             <File>
-              <FileName>elf_loader_stream.c</FileName>
+              <FileName>elf_loader.c</FileName>
               <FileType>1</FileType>
-              <FilePath>..\Core\interface\ELF\elf_loader_stream.c</FilePath>
+              <FilePath>..\Core\interface\ELF\elf_loader.c</FilePath>
             </File>
             <File>
               <FileName>ota_state_machine.c</FileName>

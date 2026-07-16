@@ -5,7 +5,8 @@
  * 架构分层：
  *   guard_fn   —— 纯谓词，只读状态，无副作用，可独立单元测试
  *   handler_fn —— 执行本状态业务逻辑，返回下一个请求状态
- *   fsm_transition —— 唯一写EEPROM入口，保证持久化原子性
+ *   fsm_transition —— 常规状态迁移与持久化入口
+ *   commit_verified_target —— 新镜像装载完成后的提交入口
  *   ota_dispatch —— 遍历表，调用guard/handler，驱动转换
  *
  * 新增状态只需在 s_ota_table[] 追加一行，dispatch逻辑不变。
@@ -38,6 +39,7 @@ static ota_state_t handle_revert   (ota_ctx_t *ctx);
 static void        fsm_transition  (ota_ctx_t *ctx, ota_state_t next);
 static void        fsm_ctx_init    (ota_ctx_t *ctx);
 static void        ota_dispatch(ota_ctx_t *ctx);
+static int         commit_verified_target(ota_ctx_t *ctx);
 /* ================================================================
  * 状态表（唯一扩展点）
  * 新增状态：追加一行，guard/handler独立实现，dispatch不变
@@ -108,18 +110,39 @@ static void ota_dispatch(ota_ctx_t *ctx)
 }
 
 /* ================================================================
- * 状态迁移（唯一写EEPROM入口）
+ * 常规状态迁移
  * ================================================================ */
 
 /**
  * @brief  执行状态迁移：更新内存ctx + 持久化写EEPROM
- * @note   所有 Write_Flag(EE_VAR_OTA_STATE, ...) 必须经此函数，禁止在handler内直接写
+ * @note   普通状态迁移经此函数；VERIFYING 成功提交由 commit_verified_target() 处理
  */
 static void fsm_transition(ota_ctx_t *ctx, ota_state_t next)
 {
     dbg_printf("[FSM] %u -> %u\r\n", ctx->state, next);
     ctx->state = next;
     Write_Flag(EE_VAR_OTA_STATE, (uint32_t)next);
+}
+
+/*
+ * 先写 BOOT、后写 active。若两次写入之间掉电，设备仍会按旧 active
+ * 启动；新镜像可能暂时不生效，但不会把未提交的 target 当作活动固件。
+ */
+static int commit_verified_target(ota_ctx_t *ctx)
+{
+    if (Write_Flag(EE_VAR_OTA_STATE, OTA_STATE_BOOT) != HAL_OK) {
+        dbg_printf("[VERIFYING] failed to persist BOOT state\r\n");
+        return -1;
+    }
+
+    if (Write_Flag(EE_VAR_ACTIVE_SLOT, ctx->target_slot) != HAL_OK) {
+        dbg_printf("[VERIFYING] failed to persist active slot\r\n");
+        return -1;
+    }
+
+    ctx->state = OTA_STATE_BOOT;
+    ctx->active_slot = ctx->target_slot;
+    return 0;
 }
 
 /* ================================================================
@@ -182,13 +205,15 @@ static uint8_t guard_boot(const ota_ctx_t *ctx)
 /** UPGRADING：target必须合法 */
 static uint8_t guard_upgrading(const ota_ctx_t *ctx)
 {
-    return (ctx->target_slot == SLOT_A || ctx->target_slot == SLOT_B) ? 1U : 0U;
+    return ((ctx->target_slot == SLOT_A || ctx->target_slot == SLOT_B) &&
+            ctx->target_slot != ctx->active_slot) ? 1U : 0U;
 }
 
 /** VERIFYING：target必须合法 */
 static uint8_t guard_verifying(const ota_ctx_t *ctx)
 {
-    return (ctx->target_slot == SLOT_A || ctx->target_slot == SLOT_B) ? 1U : 0U;
+    return ((ctx->target_slot == SLOT_A || ctx->target_slot == SLOT_B) &&
+            ctx->target_slot != ctx->active_slot) ? 1U : 0U;
 }
 
 /** REVERT：无附加前置条件，总允许进入 */
@@ -263,6 +288,7 @@ static ota_state_t handle_boot(ota_ctx_t *ctx)
  */
 static ota_state_t handle_upgrading(ota_ctx_t *ctx)
 {
+    firmware_verify_status_t verify_status;
     uint32_t write_addr  = (ctx->target_slot == SLOT_B) ? APP_B_START_ADDR
                                                          : APP_A_START_ADDR;
     uint32_t active_addr = (ctx->active_slot == SLOT_B) ? APP_B_START_ADDR
@@ -331,9 +357,10 @@ static ota_state_t handle_upgrading(ota_ctx_t *ctx)
         lfs_file_close(&fs->lfs, &fs->file);
         fs->file_open = 0U;
         
-        if(verify_firmware(OTA_FILE_PATH) != 0)
+        verify_status = verify_firmware(OTA_FILE_PATH);
+        if (verify_status != FIRMWARE_VERIFY_OK)
         {
-            dbg_printf("Failed to verify firmware\r\n");
+            dbg_printf("Failed to verify firmware: %d\r\n", (int)verify_status);
             Write_Flag(EE_VAR_REVERT_REASON,
                        ctx->active_valid ? REVERT_ACTIVE_VALID : REVERT_BOTH_INVALID);
             return ctx->active_valid ? OTA_STATE_REVERT : OTA_STATE_UPGRADING;
@@ -346,28 +373,49 @@ static ota_state_t handle_upgrading(ota_ctx_t *ctx)
 
 /**
  * @brief  VERIFYING handler
- *         校验新分区 → 通过：切active跳转 APP；失败：写reason转REVERT
+ *         验签 → ELF装载 → 校验目标分区 → 提交active → 跳转
  */
 static ota_state_t handle_verifying(ota_ctx_t *ctx)
 {
+    firmware_verify_status_t verify_status;
+    bootloader_load_status_t load_status;
     uint32_t active_addr = (ctx->active_slot == SLOT_B) ? APP_B_START_ADDR
                                                          : APP_A_START_ADDR;
+    uint32_t target_addr = (ctx->target_slot == SLOT_B) ? APP_B_START_ADDR
+                                                         : APP_A_START_ADDR;
 
-    if (verify_firmware(OTA_FILE_PATH) == 0) 
-    {
-        dbg_printf("[VERIFYING] slot %s verified OK -> now active\r\n",
-                SLOT_NAME(ctx->target_slot));
-        ctx->active_slot = ctx->target_slot;
-        Write_Flag(EE_VAR_ACTIVE_SLOT, ctx->target_slot);
-        /* OTA_STATE_BOOT写入由fsm_transition完成，此处仅需跳转 */
-        Write_Flag(EE_VAR_OTA_STATE, OTA_STATE_BOOT);
-
-        bootloader_load_and_jump();
-        //Jump_To_App_Flash(ctx->resource_ctx, new_addr);
-        /* NOTREACHED */
+    verify_status = verify_firmware(OTA_FILE_PATH);
+    if (verify_status != FIRMWARE_VERIFY_OK) {
+        dbg_printf("[VERIFYING] firmware verification failed: %d\r\n",
+                   (int)verify_status);
+        goto load_failed;
     }
 
-    dbg_printf("[VERIFYING] slot %s FAILED, -> REVERT\r\n", SLOT_NAME(ctx->target_slot));
+    load_status = bootloader_load_target((uint8_t)ctx->target_slot);
+    if (load_status != BOOTLOADER_LOAD_OK) {
+        dbg_printf("[VERIFYING] target load failed: %d\r\n", (int)load_status);
+        goto load_failed;
+    }
+
+    if (commit_verified_target(ctx) != 0) {
+        dbg_printf("[VERIFYING] target commit failed\r\n");
+        goto load_failed;
+    }
+
+    dbg_printf("[VERIFYING] slot %s committed, jumping to App\r\n",
+               SLOT_NAME(ctx->active_slot));
+    if (Jump_To_App_Flash(ctx->resource_ctx, target_addr) == 0) {
+        /* 目标已提交后若跳转前复检异常，REVERT_OTHER_VALID 会切回旧分区。 */
+        ctx->revert_reason = (Verify_APP_Integrity_Flash(active_addr) != 0)
+                             ? REVERT_OTHER_VALID : REVERT_BOTH_INVALID;
+        Write_Flag(EE_VAR_REVERT_REASON, ctx->revert_reason);
+        return OTA_STATE_REVERT;
+    }
+
+    /* NOTREACHED */
+    return OTA_STATE_SAME;
+
+load_failed:
     ctx->revert_reason = (Verify_APP_Integrity_Flash(active_addr) != 0)
                          ? REVERT_ACTIVE_VALID : REVERT_BOTH_INVALID;
     Write_Flag(EE_VAR_REVERT_REASON, ctx->revert_reason);
@@ -406,8 +454,8 @@ static ota_state_t handle_revert(ota_ctx_t *ctx)
         default:
             /* REVERT_BOTH_INVALID 或异常值 */
             dbg_printf("[REVERT] both invalid, -> UPGRADING\r\n");
-            ctx->target_slot = SLOT_B;
-            Write_Flag(EE_VAR_TARGET_SLOT, SLOT_B);
+            ctx->target_slot = OPPOSITE_SLOT(ctx->active_slot);
+            Write_Flag(EE_VAR_TARGET_SLOT, ctx->target_slot);
             return OTA_STATE_UPGRADING;
     }
 }

@@ -11,7 +11,7 @@ SHF_W = 0x1; SHF_A = 0x2; SHF_X = 0x4
 
 def main():
     axf = sys.argv[1] if len(sys.argv) > 1 else r"C:\Users\zyw\Desktop\OTA\USART\USART\MDK-ARM\USART\USART.axf"
-    target_base = int(sys.argv[2], 0) if len(sys.argv) > 2 else 0x08020000
+    target_base = int(sys.argv[2], 0) if len(sys.argv) > 2 else 0x0802B800
 
     with open(axf, 'rb') as f:
         data = f.read()

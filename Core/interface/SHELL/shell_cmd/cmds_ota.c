@@ -11,8 +11,8 @@
  *   5. 复位
  *
  * Flash 分区地址（根据实际 scatter 文件调整）：
- *   Slot A: 0x08000000  （bootloader 所在，不允许从 App 端写）
- *   Slot B: 0x08020000  128 KB
+ *   Slot A: APP_A_START_ADDR  APP_A_SIZE
+ *   Slot B: APP_B_START_ADDR  APP_B_SIZE
  */
 
 #include "cmds.h"
@@ -25,8 +25,8 @@ extern HAL_StatusTypeDef Write_Flag(uint16_t virt_addr, uint32_t value);
 extern lfs_ctx_t lfs_ctx;
 
 /* ---- Flash 分区表（根据实际芯片/scatter 调整）---------------- */
-#define SLOT_B_FLASH_ADDR   0x08020000U
-#define SLOT_B_FLASH_SIZE   (128U * 1024U)
+#define SLOT_B_FLASH_ADDR   APP_B_START_ADDR
+#define SLOT_B_FLASH_SIZE   APP_B_SIZE
 #define SHELL_FLASH_PAGE_SIZE  2048U   /* STM32L431 每页 2KB */
 
 static int parse_slot_arg(const char *arg, uint32_t *slot)

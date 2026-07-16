@@ -7,12 +7,12 @@
  *   2. Write_Buffer_To_Flash()    将任意长度数据写入 Flash（8字节对齐处理）
  *   3. Verify_APP_Integrity_Flash() 校验 Flash 中是否有合法固件
  *   4. Jump_To_App_Flash()        清理外设并跳转到 App
- *   5. bootloader_load_and_jump() 完整主流程：读ELF→解析→重定向→烧写→跳转
+ *   5. bootloader_load_target()   读ELF→解析→重定向→烧写→校验目标分区
  */
 
 #include "flash_bootloader.h"
 #include "eeprom_emul.h"
-#include "elf_loader_stream.h"
+#include "elf_loader.h"
 #include "global.h"
 #include "lfs_config.h"
 #include "lfs.h"
@@ -28,23 +28,16 @@
 #define BL_WARN(fmt, ...)  printf(BL_PREFIX "WARN: "  fmt "\r\n", ##__VA_ARGS__)
 
 /* ===================================================================
- * RAM / Flash 布局
+ * Internal RAM buffers
  *
- * RAM 64KB (0x20000000 ~ 0x20010000):
- *   0x20000000 ~ 0x200017FF   6KB   Bootloader .data/.bss + 栈
- *   0x20001800 ~ 0x2000B7FF  40KB   ELF 文件 buffer (elf_buf)
- *   0x2000B800 ~ 0x2000FFFF  18KB   App .data/.bss 运行区
- *
- * 注意：App 链接脚本的 RAM ORIGIN 必须与 APP_RAM_BASE 一致。
+ * elf_buf and elf_reloc_scratch are ordinary .bss objects. The scatter
+ * linker places them in SRAM1/SRAM2; no fixed RAM address is required.
+ * Their memory can be reused by the App after the bootloader jumps.
  * =================================================================== */
-#define BL_RAM_BASE    0x20000000UL
-#define BL_RAM_SIZE    (6U  * 1024U)
-
-#define ELF_BUF_BASE   (BL_RAM_BASE + BL_RAM_SIZE)   /* 0x20001800 */
 #define ELF_BUF_SIZE   (40U * 1024U)
 
-#define APP_RAM_BASE   (ELF_BUF_BASE + ELF_BUF_SIZE) /* 0x2000B800 */
-#define APP_RAM_SIZE   (18U * 1024U)
+/* One bitmap bit per 32-bit ELF word for fallback relocation scanning. */
+#define ELF_RELOC_SCRATCH_SIZE  ((ELF_BUF_SIZE + 31U) / 32U)
 
 /* LittleFS 中 App ELF 的路径 */
 #define APP_ELF_PATH   "a.elf"
@@ -53,29 +46,8 @@
  * ELF buffer（全局 .bss，启动时已清零，4字节对齐）
  * =================================================================== */
 static uint8_t elf_buf[ELF_BUF_SIZE] __attribute__((aligned(4)));
-
-/* ===================================================================
- * Stream I/O 回调 — 以 elf_buf 为后端存储
- * =================================================================== */
-
-/** elf_buf 内实际 ELF 文件大小（read_elf_from_lfs 写入后设置） */
-static uint32_t s_elf_file_size = 0U;
-
-static int elf_buf_read(uint32_t file_offset, void *dst, uint32_t len, void *user)
-{
-    (void)user;
-    if (len > s_elf_file_size || file_offset > s_elf_file_size - len) return -1;
-    memcpy(dst, elf_buf + file_offset, len);
-    return 0;
-}
-
-static int elf_buf_writeback(uint32_t file_offset, const void *src, uint32_t len, void *user)
-{
-    (void)user;
-    if (len > s_elf_file_size || file_offset > s_elf_file_size - len) return -1;
-    memcpy(elf_buf + file_offset, src, len);
-    return 0;
-}
+static uint8_t elf_reloc_scratch[ELF_RELOC_SCRATCH_SIZE]
+    __attribute__((aligned(4)));
 
 /* ===================================================================
  * 尾字节暂存（Write_Buffer_To_Flash 跨包拼接用）
@@ -266,23 +238,34 @@ HAL_StatusTypeDef Flush_Tail_To_Flash(uint32_t *startaddr)
  * Verify_APP_Integrity_Flash() — 检查 Flash 中是否有合法 App
  *
  * 规则：
- *   1. 向量表[0]（初始 MSP）必须在 STM32L431 RAM 范围内
- *   2. 向量表[1]（Reset_Handler）必须在 Flash 范围内，且 bit0=1（Thumb）
+ *   1. 向量表[0]（初始 MSP）必须在 STM32L431 SRAM1/SRAM2 范围内
+ *   2. 向量表[1]（Reset_Handler）必须在当前 App 分区内，且 bit0=1（Thumb）
  *
  * @param appaddr  App 分区起始地址（向量表地址）
  * @return 1 合法，0 非法
  */
 int Verify_APP_Integrity_Flash(uint32_t appaddr)
 {
-    uint32_t msp           = *(__IO uint32_t *)(appaddr);
-    uint32_t reset_handler = *(__IO uint32_t *)(appaddr + 4U);
+    uint32_t app_size;
+    uint32_t msp;
+    uint32_t reset_handler;
 
-    /* MSP 应在 STM32L431 整片 RAM 范围内
-     * RAM1: 0x20000000 ~ 0x20010000 (64KB)
-     * RAM2: 0x10000000 ~ 0x10004000 (16KB CCM)
-     * 只要落在任意一块 RAM 里就合法 */
-    int msp_valid = (msp >= 0x20000000U && msp <= 0x20010000U) ||
-                    (msp >= 0x10000000U && msp <= 0x10004000U);
+    if (appaddr == APP_A_START_ADDR) {
+        app_size = APP_A_SIZE;
+    } else if (appaddr == APP_B_START_ADDR) {
+        app_size = APP_B_SIZE;
+    } else {
+        BL_WARN("  unsupported App base 0x%08x", appaddr);
+        return 0;
+    }
+
+    msp           = *(__IO uint32_t *)(appaddr);
+    reset_handler = *(__IO uint32_t *)(appaddr + 4U);
+
+    /* 初始 MSP 允许等于 RAM 尾地址，因为栈按递减方向生长。 */
+    int msp_valid = (((msp > 0x20000000U && msp <= 0x2000C000U) ||
+                      (msp > 0x10000000U && msp <= 0x10004000U)) &&
+                     ((msp & 0x7U) == 0U));
 
     if (!msp_valid) {
         BL_WARN("  invalid MSP 0x%08x (not in RAM)", msp);
@@ -295,9 +278,9 @@ int Verify_APP_Integrity_Flash(uint32_t appaddr)
     }
 
     uint32_t handler_addr = reset_handler & ~0x1U;
-    if (handler_addr < FLASH_BASE_ADDR ||
-        handler_addr > (FLASH_BASE_ADDR + FLASH_TOTAL_SIZE)) {
-        BL_WARN("  Reset_Handler 0x%08x out of Flash range", reset_handler);
+    if (handler_addr < appaddr || handler_addr >= (appaddr + app_size)) {
+        BL_WARN("  Reset_Handler 0x%08x out of App range 0x%08x~0x%08x",
+                reset_handler, appaddr, appaddr + app_size - 1U);
         return 0;
     }
 
@@ -412,6 +395,12 @@ static int read_elf_from_lfs(const char *path,
                               uint32_t   *out_size)
 {
     int err;
+    uint32_t total_read = 0U;
+
+    if (path == NULL || buf == NULL || out_size == NULL || buf_size == 0U) {
+        return -1;
+    }
+    *out_size = 0U;
 
     BL_INFO("opening \"%s\" from LittleFS...", path);
 
@@ -435,8 +424,14 @@ static int read_elf_from_lfs(const char *path,
         return -1;
     }
 
-    /* 跳过 Header，只读 payload */
-    lfs_file_seek(&lfs_ctx.lfs, &lfs_ctx.file, sizeof(Firmware_Header_t), LFS_SEEK_SET);
+    /* Skip the OTA header. The remaining payload is one complete ELF file. */
+    if (lfs_file_seek(&lfs_ctx.lfs, &lfs_ctx.file,
+                      sizeof(Firmware_Header_t), LFS_SEEK_SET) < 0) {
+        BL_ERR("failed to seek to ELF payload");
+        lfs_file_close(&lfs_ctx.lfs, &lfs_ctx.file);
+        lfs_ctx.file_open = 0U;
+        return -1;
+    }
 
     lfs_soff_t payload_size = fsize - (lfs_soff_t)sizeof(Firmware_Header_t);
     BL_INFO("payload size = %d bytes", (int)payload_size);
@@ -448,19 +443,32 @@ static int read_elf_from_lfs(const char *path,
         return -1;
     }
 
-    BL_INFO("reading to RAM 0x%08X...", (uint32_t)(uintptr_t)buf);
+    BL_INFO("reading complete ELF to internal RAM 0x%08X...",
+            (uint32_t)(uintptr_t)buf);
 
-    lfs_ssize_t nread = lfs_file_read(&lfs_ctx.lfs, &lfs_ctx.file,
-                                       buf, (lfs_size_t)payload_size);
+    while (total_read < (uint32_t)payload_size) {
+        lfs_size_t request = (lfs_size_t)((uint32_t)payload_size - total_read);
+        lfs_ssize_t nread = lfs_file_read(&lfs_ctx.lfs, &lfs_ctx.file,
+                                           buf + total_read, request);
+        if (nread <= 0) {
+            BL_ERR("read stopped at %u / %u bytes (err=%d)", total_read,
+                   (uint32_t)payload_size, (int)nread);
+            lfs_file_close(&lfs_ctx.lfs, &lfs_ctx.file);
+            lfs_ctx.file_open = 0U;
+            return -1;
+        }
+        total_read += (uint32_t)nread;
+    }
     lfs_file_close(&lfs_ctx.lfs, &lfs_ctx.file);
     lfs_ctx.file_open = 0U;
 
-    if (nread != payload_size) {
-        BL_ERR("read incomplete: %d / %d bytes", (int)nread, (int)payload_size);
+    if (total_read != (uint32_t)payload_size) {
+        BL_ERR("read incomplete: %u / %u bytes", total_read,
+               (uint32_t)payload_size);
         return -1;
     }
 
-    *out_size = (uint32_t)nread;
+    *out_size = total_read;
     BL_INFO("read OK: %u bytes", *out_size);
     return 0;
 }
@@ -468,7 +476,7 @@ static int read_elf_from_lfs(const char *path,
 
 
 
-static int write_sections_to_flash(elf_ctx_stream_t *ctx, uint8_t slot)
+static int write_sections_to_flash(elf_ctx_t *ctx, uint8_t slot)
 {
     uint32_t flash_start = (slot == SLOT_B) ? APP_B_START_ADDR : APP_A_START_ADDR;
     uint32_t flash_size  = (slot == SLOT_B) ? APP_B_SIZE       : APP_A_SIZE;
@@ -494,7 +502,7 @@ static int write_sections_to_flash(elf_ctx_stream_t *ctx, uint8_t slot)
     uint32_t    last_written = flash_start;   /* 用于最终打印 */
 
     for (uint32_t i = 0; i < ctx->load_count; i++) {
-        elf32_shdr *shdr = &ctx->shdrs[ctx->load_shidx[i]];
+        elf32_shdr *shdr = ctx->load_shdrs[i];
 
         /* SHT_NOBITS (.bss) 不占文件空间，无需写 Flash */
         if (shdr->sh_type == SHT_NOBITS) continue;
@@ -557,7 +565,8 @@ static int write_sections_to_flash(elf_ctx_stream_t *ctx, uint8_t slot)
         }
 
         /* Flash 范围检查 */
-        if (dst < flash_start || dst + shdr->sh_size > flash_end) {
+        if (dst < flash_start || dst >= flash_end ||
+            shdr->sh_size > (flash_end - dst)) {
             BL_ERR("section \"%s\" out of flash: dst=0x%08x size=%u end=0x%08x",
                    name, dst, shdr->sh_size, flash_end);
             return -1;
@@ -598,17 +607,20 @@ static int write_sections_to_flash(elf_ctx_stream_t *ctx, uint8_t slot)
 }
 
 /* ===================================================================
- * 第六部分：主流程
+ * 第六部分：目标分区装载流程
  * =================================================================== */
 
 /**
- * bootloader_load_and_jump() — 完整加载并跳转流程
+ * bootloader_load_target() — 将 LittleFS 中的 ELF 装载到目标分区
  *
  * 调用前提：
  *   - lfs_ctx 已挂载
  *   - UART/printf 可用
+ *
+ * 本函数只执行仍可能失败的步骤，不修改 OTA active/state，也不跳转。
+ * 状态机必须在本函数返回成功后再提交 active，然后调用跳转接口。
  */
-int bootloader_load_and_jump(void)
+bootloader_load_status_t bootloader_load_target(uint8_t target_slot)
 {
     BL_INFO("elf_buf actual address: 0x%08x", (uint32_t)(uintptr_t)elf_buf);
     /* ---- 打印上次复位原因，便于定位 APP 是否触发了复位 ---- */
@@ -625,15 +637,18 @@ int bootloader_load_and_jump(void)
     int      ret;
     uint32_t elf_size = 0U;
     uint32_t entry    = 0U;
-    uint32_t avail_after = 0U;
-    uint8_t *meta_buf_ptr = NULL, *work_buf_ptr = NULL;
-    elf_ctx_stream_t ctx;
-    int load_ok = 0;
+    elf_ctx_t ctx;
+    uint32_t link_base = UINT32_MAX;
+    int32_t reloc_offset = 0;
+    uint32_t app_max = 0U;
 
-    /* 从 EEPROM 仿真读取目标 slot（SLOT_A=1，SLOT_B=2）*/
-    uint32_t stored_slot = Read_Flag(EE_VAR_TARGET_SLOT);
-    uint8_t target_slot = (stored_slot == SLOT_B) ? SLOT_B : SLOT_A;
+    if (target_slot != SLOT_A && target_slot != SLOT_B) {
+        BL_ERR("invalid target slot: %u", target_slot);
+        return BOOTLOADER_LOAD_ERR_SLOT;
+    }
+
     uint32_t app_start  = (target_slot == SLOT_B) ? APP_B_START_ADDR : APP_A_START_ADDR;
+    uint32_t app_size   = (target_slot == SLOT_B) ? APP_B_SIZE : APP_A_SIZE;
 
     BL_INFO("=========================================");
     BL_INFO("  STM32L431 Bootloader");
@@ -642,10 +657,11 @@ int bootloader_load_and_jump(void)
             app_start,
             app_start + ((target_slot == SLOT_B) ? APP_B_SIZE : APP_A_SIZE) - 1U,
             ((target_slot == SLOT_B) ? APP_B_SIZE : APP_A_SIZE) / 1024U);
-    BL_INFO("  RAM layout:");
-    BL_INFO("    Bootloader : 0x%08x  %uKB", BL_RAM_BASE,  BL_RAM_SIZE  / 1024U);
-    BL_INFO("    ELF buffer : 0x%08x  %uKB", ELF_BUF_BASE, ELF_BUF_SIZE / 1024U);
-    BL_INFO("    App RAM    : 0x%08x  %uKB", APP_RAM_BASE, APP_RAM_SIZE  / 1024U);
+    BL_INFO("  RAM buffers (linker managed):");
+    BL_INFO("    ELF buffer : 0x%08x  %uKB",
+            (uint32_t)(uintptr_t)elf_buf, ELF_BUF_SIZE / 1024U);
+    BL_INFO("    ELF scratch: 0x%08x  %u bytes",
+            (uint32_t)(uintptr_t)elf_reloc_scratch, ELF_RELOC_SCRATCH_SIZE);
     BL_INFO("=========================================");
 
     /* ---- Step 1: 从 LittleFS 读 ELF ---- */
@@ -653,74 +669,39 @@ int bootloader_load_and_jump(void)
 
     ret = read_elf_from_lfs(APP_ELF_PATH, elf_buf, ELF_BUF_SIZE, &elf_size);
     if (ret != 0) {
-        BL_WARN("no valid ELF in LittleFS (err=%d), trying existing App...", ret);
-        goto try_existing;
+        BL_ERR("failed to read ELF from LittleFS: %d", ret);
+        return BOOTLOADER_LOAD_ERR_READ;
     }
-    s_elf_file_size = elf_size;
-
-    /* ---- Step 2: 解析 ELF（stream 模式）---- */
+    /* ---- Step 2: Parse the complete ELF directly from internal RAM. ---- */
     BL_INFO("[2/5] parsing ELF...");
 
-    /*
-     * meta_buf / work_buf 分配策略：
-     *   ELF 文件已读入 elf_buf[40KB]，重定向时 writeback 直接修改 elf_buf。
-     *   meta_buf（~10KB）和 work_buf（~4KB）共约 14KB，放在栈上会溢出，
-     *   所以复用 elf_buf 中 ELF 文件末尾之后的空闲区域。
-     *   只要 ELF 文件 < 40KB - 14KB = 26KB 就安全（实际 AXF 通常 < 20KB）。
-     */
-    avail_after = (elf_size < ELF_BUF_SIZE) ? (ELF_BUF_SIZE - elf_size) : 0U;
-
-    if (avail_after >= ELF_STREAM_META_BUF_MIN + 4096U) {
-        meta_buf_ptr = elf_buf + elf_size;
-        work_buf_ptr = meta_buf_ptr + ELF_STREAM_META_BUF_MIN;
-    } else {
-        BL_ERR("ELF too large, no room for stream buffers");
-        goto try_existing;
-    }
-
-    memset(&ctx, 0, sizeof(ctx));
-    ctx.io.read       = elf_buf_read;
-    ctx.io.user       = NULL;
-    ctx.meta_buf      = meta_buf_ptr;
-    ctx.meta_buf_size = ELF_STREAM_META_BUF_MIN;
-    ctx.work_buf      = work_buf_ptr;
-    ctx.work_buf_size = avail_after - ELF_STREAM_META_BUF_MIN;
-
-    ret = elf_parse_stream(&ctx);
+    ret = elf_parse(&ctx, elf_buf, elf_size);
     if (ret != ELF_OK) {
-        BL_ERR("elf_parse_stream failed: %d", ret);
-        goto try_existing;
+        BL_ERR("elf_parse failed: %d", ret);
+        return BOOTLOADER_LOAD_ERR_PARSE;
     }
 
    /* ---- Step 3: 重定向 ---- */
-    /* 取所有可分配 section 的最小 sh_addr 作为链接基地址 */
-    uint32_t link_base = UINT32_MAX;
-    for (uint32_t si = 0; si < ctx.load_count; si++) {
-        elf32_shdr *s = &ctx.shdrs[ctx.load_shidx[si]];
-        if (s->sh_addr < link_base)
-            link_base = s->sh_addr;
-    }
-    if (link_base == UINT32_MAX) {
-        BL_ERR("no allocatable section found, cannot relocate");
-        goto try_existing;
-    }
+    link_base = ctx.link_base;
 
-    int32_t reloc_offset = (int32_t)app_start - (int32_t)link_base;
-    uint32_t app_max = (target_slot == SLOT_B) ? APP_B_SIZE : APP_A_SIZE;
+    reloc_offset = (int32_t)app_start - (int32_t)link_base;
+    app_max = (target_slot == SLOT_B) ? APP_B_SIZE : APP_A_SIZE;
 
     BL_INFO("[3/5] relocating (link_base=0x%08x offset=%d)...", link_base, reloc_offset);
 
-    ret = elf_relocate_stream(&ctx, link_base, reloc_offset, app_max, elf_buf_writeback);
+    ret = elf_relocate(&ctx, reloc_offset, app_max,
+                       elf_reloc_scratch, ELF_RELOC_SCRATCH_SIZE);
     if (ret != ELF_OK) {
-        BL_ERR("elf_relocate_stream failed: %d", ret);
-        goto try_existing;
+        BL_ERR("elf_relocate failed: %d", ret);
+        return BOOTLOADER_LOAD_ERR_RELOCATE;
     }
 
     /* 入口地址 */
-    entry = elf_stream_get_entry(&ctx);
-    if (entry == 0U) {
-        BL_ERR("invalid entry point (e_entry=0)");
-        goto try_existing;
+    entry = elf_get_entry(&ctx);
+    if ((entry & 0x1U) == 0U || (entry & ~1U) < app_start ||
+        (entry & ~1U) >= (app_start + app_size)) {
+        BL_ERR("invalid entry point: 0x%08x", entry);
+        return BOOTLOADER_LOAD_ERR_ENTRY;
     }
     BL_INFO("entry point: 0x%08x", entry);
 
@@ -730,39 +711,20 @@ int bootloader_load_and_jump(void)
     ret = write_sections_to_flash(&ctx, target_slot);
     if (ret != 0) {
         BL_ERR("write_sections_to_flash FAILED! App Flash may be corrupted.");
-        while (1) {}   /* Flash 写失败不应跳转，等看门狗复位重试 */
+        return BOOTLOADER_LOAD_ERR_FLASH;
     }
 
     /* 写入成功后可删除 LittleFS 中的 ELF（节省空间，可选）*/
     /* lfs_remove(&lfs_ctx.lfs, APP_ELF_PATH); */
 
-    load_ok = 1;
-
-try_existing:
-    if (!load_ok) {
-        /* ---- 降级：跳转到 Flash 中已有的 App ---- */
-        BL_WARN("[4/5] skip Flash write, trying existing App at 0x%08x...", app_start);
-
-        if (!Verify_APP_Integrity_Flash(app_start)) {
-            while (1) {}
-        }
-
-        entry = *(__IO uint32_t *)(app_start + 4U);
-        BL_INFO("fallback entry: 0x%08x", entry);
+    /* ---- Step 5: 写入后的目标 App 合法性检查 ---- */
+    BL_INFO("[5/5] validating target App at 0x%08x...", app_start);
+    if (Verify_APP_Integrity_Flash(app_start) == 0) {
+        BL_ERR("target App integrity check failed after loading");
+        return BOOTLOADER_LOAD_ERR_APP_INVALID;
     }
 
-    /* ---- Step 5: 跳转（通过 Jump_To_App_Flash 统一清理）---- */
-    BL_INFO("[5/5] jumping to App at 0x%08x...", entry);
-
-    /*
-     * Jump_To_App_Flash 内部会再次校验合法性、关闭 LittleFS、
-     * 反初始化外设、清 NVIC、设置 VTOR/MSP，最后跳转。
-     * 正常情况下不会返回。
-     */
-    Jump_To_App_Flash(&lfs_ctx, app_start);
-
-    /* 仅在校验失败时返回到这里 */
-    BL_ERR("Jump_To_App_Flash returned unexpectedly");
-    while (1) {}
+    BL_INFO("target slot %s is ready to boot", target_slot == SLOT_B ? "B" : "A");
+    return BOOTLOADER_LOAD_OK;
 }
 

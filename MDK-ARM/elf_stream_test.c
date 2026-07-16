@@ -3,7 +3,7 @@
  *
  * 用法 (MinGW/MSVC):
  *   gcc -o elf_stream_test.exe elf_stream_test.c -I..\Core\interface\ELF
- *   elf_stream_test.exe USART.axf 0x08020000
+ *   elf_stream_test.exe USART.axf 0x0802B800
  *
  * 模拟 bootloader 流程：
  *   1. 读取 AXF 到 buffer
@@ -156,7 +156,7 @@ int main(int argc, char **argv)
 {
     if (argc < 3) {
         fprintf(stderr, "Usage: %s <axf_file> <target_base_hex>\n", argv[0]);
-        fprintf(stderr, "  e.g. %s USART.axf 0x08020000\n", argv[0]);
+        fprintf(stderr, "  e.g. %s USART.axf 0x0802B800\n", argv[0]);
         return 1;
     }
 

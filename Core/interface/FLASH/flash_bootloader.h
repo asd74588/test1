@@ -30,8 +30,19 @@ int Verify_APP_Integrity_Flash(uint32_t appaddr);
 //跳转到指定位置执行烧录的bin文件
 int Jump_To_App_Flash(void *resource_ctx, uint32_t appaddr);
 
+typedef enum {
+    BOOTLOADER_LOAD_OK             = 0,
+    BOOTLOADER_LOAD_ERR_SLOT       = -1,
+    BOOTLOADER_LOAD_ERR_READ       = -2,
+    BOOTLOADER_LOAD_ERR_PARSE      = -3,
+    BOOTLOADER_LOAD_ERR_RELOCATE   = -4,
+    BOOTLOADER_LOAD_ERR_ENTRY      = -5,
+    BOOTLOADER_LOAD_ERR_FLASH      = -6,
+    BOOTLOADER_LOAD_ERR_APP_INVALID = -7,
+} bootloader_load_status_t;
 
-int bootloader_load_and_jump(void);
+//解析并写入目标分区；成功返回前保证目标分区具备合法向量表
+bootloader_load_status_t bootloader_load_target(uint8_t target_slot);
 
 
 #endif

@@ -8,13 +8,13 @@
 #define FLASH_TOTAL_SIZE         (256U * 1024U)
 
 #define BOOT_START_ADDR          0x08000000U
-#define BOOT_SIZE                (48U * 1024U)    /* 原 32KB + 原 PARAM 区 4KB */
+#define BOOT_SIZE                (96U * 1024U)
 
-#define APP_A_START_ADDR         0x0800C000U      /* A区：原 APP 区，搬运后执行 */
-#define APP_A_SIZE               (80U * 1024U)
+#define APP_A_START_ADDR         0x08018000U
+#define APP_A_SIZE               (78U * 1024U)
 
-#define APP_B_START_ADDR         0x08020000U      /* B区：原 UPGRADE 区，直接执行，不搬运 */
-#define APP_B_SIZE               (124U * 1024U)   /* 原 124KB，末尾 4KB 划给 EEPROM */
+#define APP_B_START_ADDR         0x0802B800U
+#define APP_B_SIZE               (78U * 1024U)
 
 #define EEPROM_START_ADDR        0x0803F000U       /* EEPROM 模拟区，占用最后 2 页共 4KB */
 

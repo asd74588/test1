@@ -3,7 +3,7 @@
  *
  * ── AXF 实测校验结论（LED.axf / ARMCC 6.19 / STM32L431）──
  *
- *   1. exec section sh_addr = 0x08020000（非 0），原 scan_exec 条件
+ *   1. exec section sh_addr = 0x0802B800（非 0），原 scan_exec 条件
  *      `sh_addr == 0U` 会导致整个 exec section 被跳过。
  *      修正：exec 判断改为 `is_exec && !is_write`。
  *
@@ -174,7 +174,7 @@ static int relocate_word_s(uint32_t *slot,
      * LINK_MIN 是 link_base + 0x100：
      *   link_base = 0       (PIC/0-based)：LINK_MIN = 0x100，val 通过 bounds 才到这里，
      *                        可能与 float 编码重叠，需要过滤。
-     *   link_base = 0x08020000 (ARMCC ET_EXEC)：LINK_MIN = 0x08020100，
+     *   link_base = 0x0802B800 (ARMCC ET_EXEC)：LINK_MIN = 0x0802B900，
      *                        bits[30:23] 固定为 0x10，对所有 Flash 地址一律触发 IEEE754
      *                        误判 → 完全跳过 float check（已由 bounds 保证 val 合法）。
      * 判据：val < 0x01000000 才做 float check。
@@ -1034,7 +1034,7 @@ static int reloc_path_b(elf_ctx_stream_t *ctx,
                                  * 小整数常量的误判，但 MOVW/MOVT 只在编译器生成
                                  * 真正地址时才出现，不会与 [0, 0x100) 的小整数混淆，
                                  * 因此直接用 LINK_BASE 即可，也允许重定向低地址如
-                                 * 向量表前几项（0x08020000 ~ 0x080200FF）。 */
+                                 * 向量表前几项（0x0802B800 ~ 0x0802B8FF）。 */
                                 if (fa >= LINK_BASE && fa < LINK_END) {
                                     uint32_t nf = (uint32_t)((int32_t)fa + offset);
                                     uint16_t wu = mtrack[rd].upper, wl = mtrack[rd].lower;
