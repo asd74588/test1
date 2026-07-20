@@ -6,6 +6,37 @@
  */
 
 #include "cmds.h"
+#include "fs_cmd.h"
+
+static int shell_fs_ls(uint8_t argc, char **argv)
+{
+    return fs_cmd_ls((int)argc, argv);
+}
+
+static int shell_fs_cat(uint8_t argc, char **argv)
+{
+    return fs_cmd_cat((int)argc, argv);
+}
+
+static int shell_fs_write(uint8_t argc, char **argv)
+{
+    return fs_cmd_write((int)argc, argv);
+}
+
+static int shell_fs_rm(uint8_t argc, char **argv)
+{
+    return fs_cmd_rm((int)argc, argv);
+}
+
+static int shell_fs_mkdir(uint8_t argc, char **argv)
+{
+    return fs_cmd_mkdir((int)argc, argv);
+}
+
+static int shell_fs_free(uint8_t argc, char **argv)
+{
+    return fs_cmd_free((int)argc, argv);
+}
 
 struct cmd cmd_table[] = {
     /* 系统 */
@@ -16,6 +47,13 @@ struct cmd cmd_table[] = {
     /* 文件传输 */
     { "rz",          ymodem_receive,  "rz [path]         receive file via Ymodem"  },
     { "sz",          ymodem_send,     "sz <path>         send file via Ymodem"     },
+    /* 文件系统 */
+    { "ls",          shell_fs_ls,      "ls [path]         list LittleFS files"      },
+    { "cat",         shell_fs_cat,     "cat <path>        print LittleFS file"      },
+    { "write",       shell_fs_write,   "write <file> <data> write LittleFS file"   },
+    { "rm",          shell_fs_rm,      "rm <path>         remove LittleFS file"     },
+    { "mkdir",       shell_fs_mkdir,   "mkdir <path>      create LittleFS dir"      },
+    { "free",        shell_fs_free,    "show LittleFS usage"                       },
     /* 设备配置 */
     { "cfg get",     cmd_cfg_get,     "cfg get <addr>        read EEPROM var"    },
     { "cfg set",     cmd_cfg_set,     "cfg set <addr> <val>  write EEPROM var"   },
@@ -28,9 +66,9 @@ struct cmd cmd_table[] = {
     /* OTA */
     { "ota status",  cmd_ota_status,  "show OTA and device info"                 },
     { "ota slot",    cmd_ota_slot,    "ota slot <0|1>        set target slot"    },
-    { "ota confirm", cmd_ota_confirm, "confirm new fw, clear CONFIRM state"      },
+    { "ota boot",    cmd_ota_boot,    "experimental: set OTA state to BOOT"      },
     { "ota revert",  cmd_ota_revert,  "revert to previous slot and reboot"       },
-    { "ota trigger", cmd_ota_trigger, "set PENDING and reboot to bootloader"     },
+    { "ota trigger", cmd_ota_trigger, "set UPGRADING and reboot to bootloader"   },
     { "ota start",   cmd_ota_start,   "ota start <path> [slot]  flash & reboot"  },
 };
 

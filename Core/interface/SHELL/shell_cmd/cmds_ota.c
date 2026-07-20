@@ -1,13 +1,13 @@
 /**
  * @file  cmds_ota.c
- * @brief OTA 命令：ota status / slot / confirm / revert / trigger / start
+ * @brief OTA 命令：ota status / slot / boot / revert / trigger / start
  *        以及设备信息：sys_get_version / sys_get_sn
  *
  * ota_start 流程：
  *   1. 解析目标 slot（从参数或 EE_VAR_TARGET_SLOT）
  *   2. 打开 LittleFS 上的固件文件
  *   3. 读取文件内容写入目标 slot 的 Flash 分区
- *   4. 写 EE_VAR_OTA_STATE = PENDING，触发 bootloader 搬运
+ *   4. 写 EE_VAR_OTA_STATE = UPGRADING，触发 bootloader 搬运
  *   5. 复位
  *
  * Flash 分区地址（根据实际 scatter 文件调整）：
@@ -143,11 +143,11 @@ static int flash_write_slot(uint32_t flash_addr,
 static const char *ota_state_name(uint32_t s)
 {
     switch (s) {
-    case OTA_STATE_IDLE:    return "IDLE";
-    case OTA_STATE_PENDING: return "PENDING";
-    case OTA_STATE_CONFIRM: return "CONFIRM";
-    case OTA_STATE_REVERT:  return "REVERT";
-    default:                return "UNKNOWN";
+    case OTA_STATE_BOOT:      return "BOOT";
+    case OTA_STATE_UPGRADING: return "UPGRADING";
+    case OTA_STATE_VERIFYING: return "VERIFYING";
+    case OTA_STATE_REVERT:    return "REVERT";
+    default:                  return "UNKNOWN";
     }
 }
 
@@ -197,19 +197,19 @@ int cmd_ota_slot(uint8_t argc, char **argv)
     return 0;
 }
 
-int cmd_ota_confirm(uint8_t argc, char **argv)
+int cmd_ota_boot(uint8_t argc, char **argv)
 {
     (void)argc; (void)argv;
     uint32_t state = Read_Flag(EE_VAR_OTA_STATE);
-    if (state != OTA_STATE_CONFIRM)
-        shell_printf("WARN: ota_state = %u (%s), not CONFIRM\r\n",
+    if (state != OTA_STATE_VERIFYING)
+        shell_printf("WARN: ota_state = %u (%s), not VERIFYING\r\n",
                      state, ota_state_name(state));
 
-    if (Write_Flag(EE_VAR_OTA_STATE, OTA_STATE_IDLE) != HAL_OK) {
+    if (Write_Flag(EE_VAR_OTA_STATE, OTA_STATE_BOOT) != HAL_OK) {
         shell_printf("ERROR: write failed\r\n");
         return -1;
     }
-    shell_printf("OTA confirmed -> IDLE\r\n");
+    shell_printf("ota_state -> BOOT (experimental command)\r\n");
     return 0;
 }
 
@@ -236,11 +236,11 @@ int cmd_ota_trigger(uint8_t argc, char **argv)
 {
     (void)argc; (void)argv;
     uint32_t target = Read_Flag(EE_VAR_TARGET_SLOT);
-    if (Write_Flag(EE_VAR_OTA_STATE, OTA_STATE_PENDING) != HAL_OK) {
+    if (Write_Flag(EE_VAR_OTA_STATE, OTA_STATE_UPGRADING) != HAL_OK) {
         shell_printf("ERROR: write failed\r\n");
         return -1;
     }
-    shell_printf("OTA trigger: target=Slot%s, ota_state->PENDING. Rebooting...\r\n",
+    shell_printf("OTA trigger: target=Slot%s, ota_state->UPGRADING. Rebooting...\r\n",
                  target == SLOT_A ? "A" : "B");
     HAL_Delay(50U);
     NVIC_SystemReset();
@@ -251,7 +251,7 @@ int cmd_ota_trigger(uint8_t argc, char **argv)
  * ota start <path> [slot]
  *
  * 从 LittleFS 读取固件文件，烧写到目标 slot 的 Flash，
- * 然后设置 PENDING 并复位，由 bootloader 完成切换。
+ * 然后设置 UPGRADING 并复位，由 bootloader 完成切换。
  *
  * 示例：
  *   ota start /fw/app_v2.bin        → 烧写到 EE_VAR_TARGET_SLOT 指定的 slot
@@ -365,9 +365,9 @@ int cmd_ota_start(uint8_t argc, char **argv)
 
     /* ── 写 EEPROM，触发 bootloader ──────────────────────── */
     Write_Flag(EE_VAR_TARGET_SLOT, target_slot);
-    Write_Flag(EE_VAR_OTA_STATE,   OTA_STATE_PENDING);
+    Write_Flag(EE_VAR_OTA_STATE,   OTA_STATE_UPGRADING);
 
-    shell_printf("ota_state -> PENDING. Rebooting...\r\n");
+    shell_printf("ota_state -> UPGRADING. Rebooting...\r\n");
     HAL_Delay(50U);
     NVIC_SystemReset();
     return 0;

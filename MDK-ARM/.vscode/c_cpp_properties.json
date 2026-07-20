@@ -27,6 +27,7 @@
                 "c:\\Users\\zyw\\Desktop\\OTA\\test\\Core\\interface\\SHA",
                 "c:\\Users\\zyw\\Desktop\\OTA\\test\\Core\\interface\\SHELL\\shell_cmd",
                 "c:\\Users\\zyw\\Desktop\\OTA\\test\\Core\\interface\\BSP_WIFI",
+                "c:\\Users\\zyw\\Desktop\\OTA\\test\\Core\\interface\\ESP8266",
                 "c:\\Users\\zyw\\Desktop\\OTA\\test\\MDK-ARM",
                 "c:\\Users\\zyw\\Desktop\\OTA\\test\\Core\\Src",
                 "c:\\Users\\zyw\\Desktop\\OTA\\test\\Drivers\\STM32L4xx_HAL_Driver\\Src"
@@ -36,7 +37,6 @@
                 "STM32L431xx",
                 "NDEBUG",
                 "OTA_TEST_UPGRADING",
-                "Debug",
                 "__CC_ARM",
                 "__arm__",
                 "__align(x)=",

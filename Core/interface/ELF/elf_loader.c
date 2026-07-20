@@ -3,15 +3,22 @@
  */
 
 #include "elf_loader.h"
+#include "log_config.h"
 
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
 
 #define ELF_PREFIX "[elf] "
+#if LOG_ELF_LOADER_ENABLE
 #define ELF_INFO(fmt, ...) printf(ELF_PREFIX fmt "\r\n", ##__VA_ARGS__)
 #define ELF_WARN(fmt, ...) printf(ELF_PREFIX "WARN: " fmt "\r\n", ##__VA_ARGS__)
 #define ELF_ERR(fmt, ...)  printf(ELF_PREFIX "ERROR: " fmt "\r\n", ##__VA_ARGS__)
+#else
+#define ELF_INFO(fmt, ...) do{}while(0)
+#define ELF_WARN(fmt, ...) do{}while(0)
+#define ELF_ERR(fmt, ...)  do{}while(0)
+#endif
 
 #define MIN_U32(a, b) ((a) < (b) ? (a) : (b))
 
@@ -74,6 +81,7 @@ static void write_u32(uint8_t *ptr, uint32_t value)
     memcpy(ptr, &value, sizeof(value));
 }
 
+#if LOG_ELF_LOADER_ENABLE
 static const char *section_type_name(uint32_t type)
 {
     switch (type) {
@@ -91,6 +99,7 @@ static const char *section_type_name(uint32_t type)
     default:                return "OTHER";
     }
 }
+#endif
 
 static int is_load_section(const elf32_shdr *section)
 {
@@ -975,6 +984,7 @@ int elf_get_section(const elf_ctx_t *ctx,
 
 void elf_dump_sections(const elf_ctx_t *ctx)
 {
+#if LOG_ELF_LOADER_ENABLE
     uint32_t i;
 
     if (ctx == NULL || ctx->ehdr == NULL || ctx->shdrs == NULL) {
@@ -989,4 +999,7 @@ void elf_dump_sections(const elf_ctx_t *ctx)
                  section->sh_addr, section->sh_offset, section->sh_size,
                  section->sh_flags);
     }
+#else
+    (void)ctx;
+#endif
 }

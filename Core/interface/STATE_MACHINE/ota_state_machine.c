@@ -19,8 +19,17 @@
 #include "data_storage.h"
 #include "flash_bootloader.h"
 #include "app_verify.h"
+#include "log_config.h"
+
+#if LOG_OTA_STATE_MACHINE_ENABLE
+#include <stdio.h>
+#define dbg_printf(format,args...) printf(format, ##args)
+#else
+#define dbg_printf(format,args...) do{}while(0)
+#endif
 
 #define OTA_FILE_PATH "a.elf"
+#define OTA_MAX_PROTOCOL_PADDING  1023U
 
 extern const struct lfs_file_config lfs_file_cfg;
 /* ================================================================
@@ -40,6 +49,9 @@ static void        fsm_transition  (ota_ctx_t *ctx, ota_state_t next);
 static void        fsm_ctx_init    (ota_ctx_t *ctx);
 static void        ota_dispatch(ota_ctx_t *ctx);
 static int         commit_verified_target(ota_ctx_t *ctx);
+static int         normalize_received_package(lfs_ctx_t *fs,
+                                              int received,
+                                              const YmodemFileInfo *file_info);
 /* ================================================================
  * 状态表（唯一扩展点）
  * 新增状态：追加一行，guard/handler独立实现，dispatch不变
@@ -143,6 +155,105 @@ static int commit_verified_target(ota_ctx_t *ctx)
     ctx->state = OTA_STATE_BOOT;
     ctx->active_slot = ctx->target_slot;
     return 0;
+}
+
+/*
+ * 将协议写入的物理文件规范为 Firmware_Header_t + hdr.size。
+ * Xmodem 的最后一帧可能包含 0x1A 填充，因此物理文件允许比逻辑包长
+ * 多至一个帧尾；任何短包、额外有效数据或非法填充都在这里拒绝。
+ */
+static int normalize_received_package(lfs_ctx_t *fs,
+                                      int received,
+                                      const YmodemFileInfo *file_info)
+{
+    Firmware_Header_t hdr;
+    lfs_soff_t stored_size = -1;
+    uint32_t expected_size = 0U;
+    uint32_t padding_size;
+    int err;
+    int result = -1;
+
+    if (fs == NULL || received <= 0) {
+        return -1;
+    }
+
+    if (fs->file_open != 0U) {
+        err = lfs_file_close(&fs->lfs, &fs->file);
+        fs->file_open = 0U;
+        if (err != LFS_ERR_OK) {
+            return -1;
+        }
+    }
+
+    err = lfs_file_opencfg(&fs->lfs, &fs->file, OTA_FILE_PATH,
+                           LFS_O_RDWR, &lfs_file_cfg);
+    if (err != LFS_ERR_OK) {
+        return -1;
+    }
+    fs->file_open = 1U;
+
+    stored_size = lfs_file_size(&fs->lfs, &fs->file);
+    if (stored_size < (lfs_soff_t)sizeof(Firmware_Header_t)) {
+        goto out;
+    }
+
+    if (lfs_file_seek(&fs->lfs, &fs->file, 0, LFS_SEEK_SET) < 0 ||
+        lfs_file_read(&fs->lfs, &fs->file, &hdr, sizeof(hdr)) != sizeof(hdr)) {
+        goto out;
+    }
+
+    if (hdr.magic != FW_MAGIC) {
+        goto out;
+    }
+
+    if (hdr.size == 0U ||
+        hdr.size > ((uint32_t)LFS_FILE_MAX - (uint32_t)sizeof(Firmware_Header_t))) {
+        goto out;
+    }
+
+    expected_size = (uint32_t)sizeof(Firmware_Header_t) + hdr.size;
+    if (stored_size < (lfs_soff_t)expected_size) {
+        goto out;
+    }
+
+    if (file_info != NULL && file_info->filesize != 0U &&
+        file_info->filesize != expected_size) {
+        goto out;
+    }
+
+    if ((uint32_t)received > expected_size) {
+        goto out;
+    }
+
+    if ((uint32_t)received < expected_size) {
+        uint32_t recovered = expected_size - (uint32_t)received;
+        if ((file_info != NULL && file_info->filesize != 0U) ||
+            recovered > 1024U) {
+            goto out;
+        }
+    }
+
+    /* received 已剥除末尾连续 0x1A，因此额外物理字节只可能是末帧填充。 */
+    padding_size = (uint32_t)stored_size - expected_size;
+    if (padding_size > OTA_MAX_PROTOCOL_PADDING) {
+        goto out;
+    }
+
+    err = lfs_file_truncate(&fs->lfs, &fs->file, (lfs_off_t)expected_size);
+    if (err != LFS_ERR_OK) {
+        goto out;
+    }
+
+    result = 0;
+
+out:
+    err = lfs_file_close(&fs->lfs, &fs->file);
+    fs->file_open = 0U;
+    if (err != LFS_ERR_OK) {
+        result = -1;
+    }
+
+    return result;
 }
 
 /* ================================================================
@@ -289,8 +400,12 @@ static ota_state_t handle_boot(ota_ctx_t *ctx)
 static ota_state_t handle_upgrading(ota_ctx_t *ctx)
 {
     firmware_verify_status_t verify_status;
+    YmodemFileInfo file_info;
     uint32_t write_addr  = (ctx->target_slot == SLOT_B) ? APP_B_START_ADDR
                                                          : APP_A_START_ADDR;
+#if !LOG_OTA_STATE_MACHINE_ENABLE
+    (void)write_addr;
+#endif
     uint32_t active_addr = (ctx->active_slot == SLOT_B) ? APP_B_START_ADDR
                                                          : APP_A_START_ADDR;
     lfs_ctx_t *fs = (lfs_ctx_t *)ctx->resource_ctx;
@@ -305,7 +420,6 @@ static ota_state_t handle_upgrading(ota_ctx_t *ctx)
            ctx->active_valid ? "valid" : "invalid");
 
     ctx->xmodem_retry = 0U;
-    Erase_App_Flash(ctx->target_slot);
 
     while (1) 
     {
@@ -328,34 +442,36 @@ static ota_state_t handle_upgrading(ota_ctx_t *ctx)
         }
         fs->file_open = 1U;
 
-        int received = ctx->transfer_cfg->receive_cb(ctx->transfer_cfg->recv_user_ctx, NULL);
+        memset(&file_info, 0, sizeof(file_info));
+        int received = ctx->transfer_cfg->receive_cb(ctx->transfer_cfg->recv_user_ctx,
+                                                     &file_info);
 
         if (received > 0) {
-            dbg_printf("[TEST][PASS] Xmodem received=%d bytes\r\n", received);
+            dbg_printf("[UPGRADING] received=%d bytes\r\n", received);
+        } else if (received == 0) {
+            dbg_printf("[UPGRADING] no new firmware received\r\n");
+            if (fs->file_open) {
+                lfs_file_close(&fs->lfs, &fs->file);
+                fs->file_open = 0U;
+            }
+            lfs_remove(&fs->lfs, OTA_FILE_PATH);
+            return ctx->active_valid ? OTA_STATE_BOOT : OTA_STATE_UPGRADING;
         } else {
-            dbg_printf("[TEST][FAIL] Xmodem failed, ret=%d\r\n", received);
-            lfs_file_close(&fs->lfs, &fs->file);
-            fs->file_open = 0U;
+            dbg_printf("[UPGRADING] transfer failed, ret=%d\r\n", received);
+            if (fs->file_open) {
+                lfs_file_close(&fs->lfs, &fs->file);
+                fs->file_open = 0U;
+            }
+            lfs_remove(&fs->lfs, OTA_FILE_PATH);
             return ctx->active_valid ? OTA_STATE_BOOT : OTA_STATE_UPGRADING;
         }
 
-        int err = lfs_file_truncate(&fs->lfs, &fs->file, received);
-        if (err == 0) {
-             dbg_printf("truncate file to %d bytes\r\n", received);
-        } else {
-            dbg_printf("truncate failed: %d\r\n", err);
+        if (normalize_received_package(fs, received, &file_info) != 0) {
+            dbg_printf("[UPGRADING] received package length validation failed\r\n");
+            Write_Flag(EE_VAR_REVERT_REASON,
+                       ctx->active_valid ? REVERT_ACTIVE_VALID : REVERT_BOTH_INVALID);
+            return ctx->active_valid ? OTA_STATE_REVERT : OTA_STATE_UPGRADING;
         }
-
-        lfs_soff_t file_size = lfs_file_size(&fs->lfs, &fs->file);
-        if (file_size == received) {
-            dbg_printf("file size after truncate: %d bytes\r\n", (int)file_size);
-        } else {
-            dbg_printf("file size mismatch after truncate: %d bytes\r\n", (int)file_size);
-        }
-        
-
-        lfs_file_close(&fs->lfs, &fs->file);
-        fs->file_open = 0U;
         
         verify_status = verify_firmware(OTA_FILE_PATH);
         if (verify_status != FIRMWARE_VERIFY_OK)

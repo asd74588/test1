@@ -15,13 +15,6 @@
 extern "C" {
 #endif
 
-
-/* OTA 状态值 */
-#define OTA_STATE_IDLE          OTA_STATE_BOOT
-#define OTA_STATE_PENDING       OTA_STATE_UPGRADING
-#define OTA_STATE_CONFIRM       OTA_STATE_VERIFYING
-
-
 /* ================================================================
  * 设备信息（cmds_ota.c）
  * ================================================================ */
@@ -48,7 +41,7 @@ int cmd_cfg_dump(uint8_t argc, char **argv);
  * ================================================================ */
 int cmd_ota_status (uint8_t argc, char **argv);
 int cmd_ota_slot   (uint8_t argc, char **argv);
-int cmd_ota_confirm(uint8_t argc, char **argv);
+int cmd_ota_boot   (uint8_t argc, char **argv);
 int cmd_ota_revert (uint8_t argc, char **argv);
 int cmd_ota_trigger(uint8_t argc, char **argv);
 int cmd_ota_start  (uint8_t argc, char **argv);

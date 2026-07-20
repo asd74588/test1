@@ -19,12 +19,6 @@
 #define EEPROM_START_ADDR        0x0803F000U       /* EEPROM 模拟区，占用最后 2 页共 4KB */
 
 
-#ifdef Debug
-#define dbg_printf(format,args...) printf(format, ##args)
-#else
-#define dbg_printf(format,args...) do{}while(0)
-#endif
-
 typedef struct {
     lfs_t        lfs;
     lfs_file_t   file;

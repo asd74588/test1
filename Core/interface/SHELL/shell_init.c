@@ -43,18 +43,14 @@ void Shell_Process(void)
     }
 }
 
-/* ---- UART 中断回调 ---- */
-
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+void Shell_UartRxCpltCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == huart1.Instance) {
-        /* 压入 ring buffer */
         uint16_t next = (s_rx_head + 1U) % SHELL_RX_BUF_SIZE;
-        if (next != s_rx_tail) {          /* 满则丢弃 */
+        if (next != s_rx_tail) {
             s_rx_buf[s_rx_head] = s_rx_byte;
             s_rx_head = next;
         }
-        /* 立即重新开启接收（不等待 shell 处理） */
         HAL_UART_Receive_IT(&huart1, &s_rx_byte, 1U);
     }
 }
@@ -65,7 +61,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
  * STM32 HAL 在发生 ORE 等错误后不会自动重开接收中断，
  * 必须在此回调中清理错误标志并重新启动接收，否则 shell 卡死。
  */
-void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+void Shell_UartErrorCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == huart1.Instance) {
         __HAL_UART_CLEAR_OREFLAG(huart);

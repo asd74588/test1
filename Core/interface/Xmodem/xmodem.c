@@ -13,8 +13,15 @@
 
 #include "xmodem.h"
 #include "usart.h"
+#include "log_config.h"
 #include <string.h>
 #include <stdio.h>
+
+#if LOG_XMODEM_ENABLE
+#define dbg_printf(format,args...) printf(format, ##args)
+#else
+#define dbg_printf(format,args...) do{}while(0)
+#endif
 
 /* ============================================================
  *  常量
@@ -399,8 +406,11 @@ static int flush_prev_buf(TransferCtx *ctx)
 }
 
 /**
- * @brief 处理最后一包（收到 EOT 时调用）：
- *        剥离 0x1A 填充 → 精确截断（Ymodem 文件大小）→ 写 Flash
+ * @brief 处理最后一包（收到 EOT 时调用）
+ *
+ * Ymodem 有明确文件长度，只写有效字节。Xmodem 没有长度字段，
+ * 因此保留完整末包；上层若有自己的文件头，可据此恢复以 0x1A
+ * 结尾的有效数据，再按逻辑长度裁剪。
  * @return 0=成功, -1=写失败
  */
 static int flush_last_buf(TransferCtx *ctx)
@@ -408,24 +418,31 @@ static int flush_last_buf(TransferCtx *ctx)
     if (!ctx->has_prev) return 0;
 
     int valid = ctx->prev_len;
+    int write_len = ctx->prev_len;
 
     if (ctx->file_info && ctx->file_info->filesize > 0) {
-        // Ymodem：精确截断
-        int remaining = (int)ctx->file_info->filesize - ctx->total_recv;
-        if (remaining > 0 && remaining < valid)
-            valid = remaining;
+        uint32_t total = (uint32_t)ctx->total_recv;
+        uint32_t remaining;
+
+        if (ctx->file_info->filesize <= total) {
+            return -1;
+        }
+
+        remaining = ctx->file_info->filesize - total;
+        if (remaining > (uint32_t)ctx->prev_len) {
+            return -1;
+        }
+
+        valid = (int)remaining;
+        write_len = valid;
     } else {
-        // Xmodem/Xmodem-1K：剥离 0x1A
+        /* 返回推断的有效长度，但原样保存末包供上层按包头精确裁剪。 */
         while (valid > 0 && (uint8_t)ctx->prev_buf[valid - 1] == 0x1A)
             valid--;
     }
 
-    if (valid <= 0) return 0;
-
-    /* 尾部补 0xFF（Flash 擦除态），保持块对齐写入 */
-    memset(&ctx->prev_buf[valid], 0xFF, (size_t)(ctx->prev_len - valid));
-
-    if (write_to_storage(ctx->transfer_cfg, ctx->prev_buf, (size_t)ctx->prev_len) < 0)
+    if (write_len > 0 &&
+        write_to_storage(ctx->transfer_cfg, ctx->prev_buf, (size_t)write_len) < 0)
         return -1;
     ctx->total_recv += valid;
     return 0;

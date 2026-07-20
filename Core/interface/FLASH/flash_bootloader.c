@@ -16,6 +16,7 @@
 #include "global.h"
 #include "lfs_config.h"
 #include "lfs.h"
+#include "log_config.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -23,9 +24,15 @@
  * 调试输出
  * =================================================================== */
 #define BL_PREFIX  "[boot] "
+#if LOG_BOOTLOADER_ENABLE
 #define BL_INFO(fmt, ...)  printf(BL_PREFIX fmt "\r\n", ##__VA_ARGS__)
 #define BL_ERR(fmt, ...)   printf(BL_PREFIX "ERROR: " fmt "\r\n", ##__VA_ARGS__)
 #define BL_WARN(fmt, ...)  printf(BL_PREFIX "WARN: "  fmt "\r\n", ##__VA_ARGS__)
+#else
+#define BL_INFO(fmt, ...)  do{}while(0)
+#define BL_ERR(fmt, ...)   do{}while(0)
+#define BL_WARN(fmt, ...)  do{}while(0)
+#endif
 
 /* ===================================================================
  * Internal RAM buffers
@@ -394,6 +401,7 @@ static int read_elf_from_lfs(const char *path,
                               uint32_t    buf_size,
                               uint32_t   *out_size)
 {
+    Firmware_Header_t hdr;
     int err;
     uint32_t total_read = 0U;
 
@@ -417,14 +425,32 @@ static int read_elf_from_lfs(const char *path,
     lfs_soff_t fsize = lfs_file_size(&lfs_ctx.lfs, &lfs_ctx.file);
     BL_INFO("file size = %d bytes", (int)fsize);
 
-    if (fsize <= (lfs_soff_t)sizeof(Firmware_Header_t)) {
+    if (fsize < (lfs_soff_t)sizeof(Firmware_Header_t)) {
         BL_ERR("file too small: %d bytes", (int)fsize);
         lfs_file_close(&lfs_ctx.lfs, &lfs_ctx.file);
         lfs_ctx.file_open = 0U;
         return -1;
     }
 
-    /* Skip the OTA header. The remaining payload is one complete ELF file. */
+    if (lfs_file_seek(&lfs_ctx.lfs, &lfs_ctx.file, 0, LFS_SEEK_SET) < 0 ||
+        lfs_file_read(&lfs_ctx.lfs, &lfs_ctx.file, &hdr, sizeof(hdr)) != sizeof(hdr)) {
+        BL_ERR("failed to read firmware header");
+        lfs_file_close(&lfs_ctx.lfs, &lfs_ctx.file);
+        lfs_ctx.file_open = 0U;
+        return -1;
+    }
+
+    if (hdr.magic != FW_MAGIC || hdr.size == 0U ||
+        hdr.size > ((uint32_t)LFS_FILE_MAX - (uint32_t)sizeof(Firmware_Header_t)) ||
+        fsize != (lfs_soff_t)((uint32_t)sizeof(Firmware_Header_t) + hdr.size)) {
+        BL_ERR("invalid header/file size: payload=%lu file=%d",
+               (unsigned long)hdr.size, (int)fsize);
+        lfs_file_close(&lfs_ctx.lfs, &lfs_ctx.file);
+        lfs_ctx.file_open = 0U;
+        return -1;
+    }
+
+    /* hdr.size is the exact ELF boundary established by package verification. */
     if (lfs_file_seek(&lfs_ctx.lfs, &lfs_ctx.file,
                       sizeof(Firmware_Header_t), LFS_SEEK_SET) < 0) {
         BL_ERR("failed to seek to ELF payload");
@@ -433,11 +459,12 @@ static int read_elf_from_lfs(const char *path,
         return -1;
     }
 
-    lfs_soff_t payload_size = fsize - (lfs_soff_t)sizeof(Firmware_Header_t);
-    BL_INFO("payload size = %d bytes", (int)payload_size);
+    uint32_t payload_size = hdr.size;
+    BL_INFO("payload size from header = %lu bytes", (unsigned long)payload_size);
 
-    if ((uint32_t)payload_size > buf_size) {
-        BL_ERR("payload too large: %d > %u bytes", (int)payload_size, buf_size);
+    if (payload_size > buf_size) {
+        BL_ERR("payload too large: %lu > %u bytes",
+               (unsigned long)payload_size, buf_size);
         lfs_file_close(&lfs_ctx.lfs, &lfs_ctx.file);
         lfs_ctx.file_open = 0U;
         return -1;
@@ -446,13 +473,13 @@ static int read_elf_from_lfs(const char *path,
     BL_INFO("reading complete ELF to internal RAM 0x%08X...",
             (uint32_t)(uintptr_t)buf);
 
-    while (total_read < (uint32_t)payload_size) {
-        lfs_size_t request = (lfs_size_t)((uint32_t)payload_size - total_read);
+    while (total_read < payload_size) {
+        lfs_size_t request = (lfs_size_t)(payload_size - total_read);
         lfs_ssize_t nread = lfs_file_read(&lfs_ctx.lfs, &lfs_ctx.file,
                                            buf + total_read, request);
         if (nread <= 0) {
             BL_ERR("read stopped at %u / %u bytes (err=%d)", total_read,
-                   (uint32_t)payload_size, (int)nread);
+                   payload_size, (int)nread);
             lfs_file_close(&lfs_ctx.lfs, &lfs_ctx.file);
             lfs_ctx.file_open = 0U;
             return -1;
@@ -462,9 +489,9 @@ static int read_elf_from_lfs(const char *path,
     lfs_file_close(&lfs_ctx.lfs, &lfs_ctx.file);
     lfs_ctx.file_open = 0U;
 
-    if (total_read != (uint32_t)payload_size) {
+    if (total_read != payload_size) {
         BL_ERR("read incomplete: %u / %u bytes", total_read,
-               (uint32_t)payload_size);
+               payload_size);
         return -1;
     }
 
@@ -512,6 +539,9 @@ static int write_sections_to_flash(elf_ctx_t *ctx, uint8_t slot)
 
         const char *name = (ctx->shstrtab && shdr->sh_name)
                            ? ctx->shstrtab + shdr->sh_name : "(?)";
+#if !LOG_BOOTLOADER_ENABLE
+        (void)name;
+#endif
 
         /* -------------------------------------------------------
          * 判断 Flash section 还是 RAM section

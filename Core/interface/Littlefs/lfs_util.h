@@ -8,6 +8,23 @@
 #ifndef LFS_UTIL_H
 #define LFS_UTIL_H
 
+#include "log_config.h"
+
+#if !LOG_LITTLEFS_ENABLE
+#ifndef LFS_NO_DEBUG
+#define LFS_NO_DEBUG
+#endif
+#ifndef LFS_NO_WARN
+#define LFS_NO_WARN
+#endif
+#ifndef LFS_NO_ERROR
+#define LFS_NO_ERROR
+#endif
+#ifdef LFS_YES_TRACE
+#undef LFS_YES_TRACE
+#endif
+#endif
+
 #define LFS_STRINGIZE(x) LFS_STRINGIZE2(x)
 #define LFS_STRINGIZE2(x) #x
 

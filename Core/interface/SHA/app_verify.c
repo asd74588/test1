@@ -3,16 +3,162 @@
 #include "global.h"
 #include "fw_pubkey.h"
 #include "app_verify.h"
+#include "log_config.h"
 
 #include "cmox_ecc.h"
 #include "cmox_ecc_types.h"
 #include "cmox_ecdsa.h"
+#include <stdio.h>
+#include <string.h>
 extern lfs_ctx_t lfs_ctx;
 
 #define BL_PREFIX  "[boot] "
+#if LOG_APP_VERIFY_ENABLE
 #define BL_INFO(fmt, ...)  printf(BL_PREFIX fmt "\r\n", ##__VA_ARGS__)
 #define BL_ERR(fmt, ...)   printf(BL_PREFIX "ERROR: " fmt "\r\n", ##__VA_ARGS__)
 #define BL_WARN(fmt, ...)  printf(BL_PREFIX "WARN: "  fmt "\r\n", ##__VA_ARGS__)
+#define dbg_printf(format,args...) printf(format, ##args)
+#else
+#define BL_INFO(fmt, ...)  do{}while(0)
+#define BL_ERR(fmt, ...)   do{}while(0)
+#define BL_WARN(fmt, ...)  do{}while(0)
+#define dbg_printf(format,args...) do{}while(0)
+#endif
+
+static int hex_char_to_value(char ch)
+{
+    if (ch >= '0' && ch <= '9') {
+        return ch - '0';
+    }
+
+    if (ch >= 'a' && ch <= 'f') {
+        return ch - 'a' + 10;
+    }
+
+    if (ch >= 'A' && ch <= 'F') {
+        return ch - 'A' + 10;
+    }
+
+    return -1;
+}
+
+static int sha256_hex_to_bytes(const char *hex, uint8_t *out)
+{
+    uint16_t i;
+
+    if (hex == NULL || out == NULL || strlen(hex) != 64U) {
+        return -1;
+    }
+
+    for (i = 0U; i < 32U; i++) {
+        int high = hex_char_to_value(hex[i * 2U]);
+        int low = hex_char_to_value(hex[i * 2U + 1U]);
+
+        if (high < 0 || low < 0) {
+            return -2;
+        }
+
+        out[i] = (uint8_t)((high << 4) | low);
+    }
+
+    return 0;
+}
+
+static void sha256_bytes_to_hex(const uint8_t *hash, char *hex, uint16_t hex_size)
+{
+    static const char digits[] = "0123456789abcdef";
+    uint16_t i;
+
+    if (hash == NULL || hex == NULL || hex_size < 65U) {
+        return;
+    }
+
+    for (i = 0U; i < 32U; i++) {
+        hex[i * 2U] = digits[(hash[i] >> 4) & 0x0FU];
+        hex[i * 2U + 1U] = digits[hash[i] & 0x0FU];
+    }
+    hex[64] = '\0';
+}
+
+firmware_verify_status_t verify_lfs_file_sha256(lfs_ctx_t *fs,
+                                                const char *path,
+                                                const char *expected_hex,
+                                                uint32_t expected_size,
+                                                char *calc_hex,
+                                                uint16_t calc_hex_size)
+{
+    lfs_file_t file;
+    lfs_soff_t file_size;
+    uint8_t expected_hash[32];
+    uint8_t calc_hash[32];
+    uint8_t buf[512];
+    size_t hash_len = 0U;
+    cmox_sha256_handle_t ctx;
+    uint32_t total = 0U;
+    int err;
+
+    if (fs == NULL || path == NULL || expected_hex == NULL || fs->mounted == 0U) {
+        return FIRMWARE_VERIFY_ERR_PARAM;
+    }
+
+    if (sha256_hex_to_bytes(expected_hex, expected_hash) != 0) {
+        return FIRMWARE_VERIFY_ERR_SHA256;
+    }
+
+    err = lfs_file_open(&fs->lfs, &file, path, LFS_O_RDONLY);
+    if (err < 0) {
+        return FIRMWARE_VERIFY_ERR_OPEN;
+    }
+
+    file_size = lfs_file_size(&fs->lfs, &file);
+    if (file_size < 0) {
+        lfs_file_close(&fs->lfs, &file);
+        return FIRMWARE_VERIFY_ERR_READ;
+    }
+
+    if (expected_size != 0U && file_size != (lfs_soff_t)expected_size) {
+        lfs_file_close(&fs->lfs, &file);
+        return FIRMWARE_VERIFY_ERR_SIZE;
+    }
+
+    cmox_sha256_construct(&ctx);
+    cmox_hash_init((cmox_hash_handle_t *)&ctx);
+    cmox_hash_setTagLen((cmox_hash_handle_t *)&ctx, 32);
+
+    while (1) {
+        int rd = lfs_file_read(&fs->lfs, &file, buf, sizeof(buf));
+        if (rd < 0) {
+            cmox_hash_cleanup((cmox_hash_handle_t *)&ctx);
+            lfs_file_close(&fs->lfs, &file);
+            return FIRMWARE_VERIFY_ERR_READ;
+        }
+
+        if (rd == 0) {
+            break;
+        }
+
+        cmox_hash_append((cmox_hash_handle_t *)&ctx, buf, (size_t)rd);
+        total += (uint32_t)rd;
+    }
+
+    cmox_hash_generateTag((cmox_hash_handle_t *)&ctx, calc_hash, &hash_len);
+    cmox_hash_cleanup((cmox_hash_handle_t *)&ctx);
+    lfs_file_close(&fs->lfs, &file);
+
+    if (calc_hex != NULL && calc_hex_size >= 65U) {
+        sha256_bytes_to_hex(calc_hash, calc_hex, calc_hex_size);
+    }
+
+    if (total != (uint32_t)file_size || hash_len != 32U) {
+        return FIRMWARE_VERIFY_ERR_READ;
+    }
+
+    if (memcmp(calc_hash, expected_hash, sizeof(calc_hash)) != 0) {
+        return FIRMWARE_VERIFY_ERR_SHA256;
+    }
+
+    return FIRMWARE_VERIFY_OK;
+}
 
 
 int test_ota_sha256()
@@ -81,6 +227,8 @@ static int verify_ecdsa(const Firmware_Header_t *hdr)
 firmware_verify_status_t verify_firmware(const char *path)
 {
     Firmware_Header_t hdr;
+    lfs_soff_t file_size;
+    uint32_t package_size;
     int err;
 
     if (path == NULL) {
@@ -106,13 +254,38 @@ firmware_verify_status_t verify_firmware(const char *path)
         err = FIRMWARE_VERIFY_ERR_MAGIC;
         goto fail;
     }
+
+    file_size = lfs_file_size(&lfs_ctx.lfs, &lfs_ctx.file);
+    if (file_size < 0) {
+        BL_ERR("file size read failed: %d", (int)file_size);
+        err = FIRMWARE_VERIFY_ERR_READ;
+        goto fail;
+    }
+
+    if (hdr.size == 0U ||
+        hdr.size > ((uint32_t)LFS_FILE_MAX - (uint32_t)sizeof(Firmware_Header_t))) {
+        BL_ERR("invalid payload size: %lu", (unsigned long)hdr.size);
+        err = FIRMWARE_VERIFY_ERR_SIZE;
+        goto fail;
+    }
+
+    package_size = (uint32_t)sizeof(Firmware_Header_t) + hdr.size;
+    if (file_size != (lfs_soff_t)package_size) {
+        BL_ERR("package size mismatch: header=%lu actual=%d",
+               (unsigned long)package_size, (int)file_size);
+        err = FIRMWARE_VERIFY_ERR_SIZE;
+        goto fail;
+    }
+
     BL_INFO("Version: %lu", hdr.version);
     BL_INFO("Size   : %lu", hdr.size);
 
     /* 3. 校验SHA256 */
     {
         uint8_t buf[512];
-        int rd, total = 0;
+        int rd;
+        uint32_t total = 0U;
+        uint32_t remaining = hdr.size;
         uint8_t calc_hash[32];
         size_t hash_len;
         cmox_sha256_handle_t ctx;
@@ -128,20 +301,27 @@ firmware_verify_status_t verify_firmware(const char *path)
         cmox_hash_init((cmox_hash_handle_t *)&ctx);
         cmox_hash_setTagLen((cmox_hash_handle_t *)&ctx, 32);
 
-        while ((rd = lfs_file_read(&lfs_ctx.lfs, &lfs_ctx.file, buf, sizeof(buf))) > 0) {
-            total += rd;
+        while (remaining > 0U) {
+            lfs_size_t request = (remaining < (uint32_t)sizeof(buf))
+                                 ? (lfs_size_t)remaining
+                                 : (lfs_size_t)sizeof(buf);
+            rd = lfs_file_read(&lfs_ctx.lfs, &lfs_ctx.file, buf, request);
+            if (rd <= 0) {
+                BL_ERR("payload read stopped at %lu / %lu bytes (err=%d)",
+                       (unsigned long)total, (unsigned long)hdr.size, rd);
+                cmox_hash_cleanup((cmox_hash_handle_t *)&ctx);
+                err = FIRMWARE_VERIFY_ERR_READ;
+                goto fail;
+            }
+
             cmox_hash_append((cmox_hash_handle_t *)&ctx, buf, (size_t)rd);
-        }
-        if (rd < 0) {
-            BL_ERR("payload read failed: %d", rd);
-            cmox_hash_cleanup((cmox_hash_handle_t *)&ctx);
-            err = FIRMWARE_VERIFY_ERR_READ;
-            goto fail;
+            total += (uint32_t)rd;
+            remaining -= (uint32_t)rd;
         }
         cmox_hash_generateTag((cmox_hash_handle_t *)&ctx, calc_hash, &hash_len);
         cmox_hash_cleanup((cmox_hash_handle_t *)&ctx);
 
-        BL_INFO("Hashed %d bytes", total);
+        BL_INFO("Hashed %lu bytes", (unsigned long)total);
 
         if (memcmp(calc_hash, hdr.sha256, 32) != 0) {
             BL_ERR("SHA256 mismatch");

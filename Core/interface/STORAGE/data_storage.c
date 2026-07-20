@@ -1,5 +1,12 @@
 #include "data_storage.h"
+#include "log_config.h"
 
+#if LOG_DATA_STORAGE_ENABLE
+#include <stdio.h>
+#define dbg_printf(format,args...) printf(format, ##args)
+#else
+#define dbg_printf(format,args...) do{}while(0)
+#endif
 
 int lfs_storage_callback(const uint8_t *buf, uint32_t len, void *user_ctx)
 {
