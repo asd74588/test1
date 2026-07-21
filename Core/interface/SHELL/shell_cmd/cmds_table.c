@@ -57,10 +57,13 @@ struct cmd cmd_table[] = {
     /* 设备配置 */
     { "cfg get",     cmd_cfg_get,     "cfg get <addr>        read EEPROM var"    },
     { "cfg set",     cmd_cfg_set,     "cfg set <addr> <val>  write EEPROM var"   },
-    { "cfg dump",    cmd_cfg_dump,    "dump all known EEPROM config vars"        },
+    { "cfg dump",    cmd_cfg_dump,    "show network cfg and EEPROM status vars"  },
     /* WiFi */
     { "wifi ssid",   wifi_set_ssid,   "wifi ssid <ssid>      set & save SSID"   },
     { "wifi pass",   wifi_set_pass,   "wifi pass <pass>      set & save password"},
+    { "wifi host",   wifi_set_host,   "wifi host <host>      set MQTT host"     },
+    { "wifi port",   wifi_set_port,   "wifi port <port>      set MQTT port"     },
+    { "wifi token",  wifi_set_token,  "wifi token <token>    set access token"  },
     { "wifi connect",wifi_connect,    "wifi connect [ssid] [pass]"               },
     { "wifi status", wifi_status,     "show WiFi connection status"              },
     /* OTA */

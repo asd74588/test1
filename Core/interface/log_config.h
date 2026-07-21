@@ -34,6 +34,11 @@
 #define LOG_W25QXX_ENABLE               0
 #endif
 
+/* esp8266.c: WiFi/MQTT status, errors, ThingsBoard OTA progress and ESP-AT trace */
+#ifndef LOG_WIFI_ENABLE
+#define LOG_WIFI_ENABLE                 1
+#endif
+
 /* flash_bootloader.c: erase, ELF load, Flash write and App jump */
 #ifndef LOG_BOOTLOADER_ENABLE
 #define LOG_BOOTLOADER_ENABLE           1

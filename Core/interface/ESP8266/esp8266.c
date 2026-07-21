@@ -2,11 +2,12 @@
 #include <string.h>
 #include "usart.h"
 #include "esp8266.h"
+#include "log_config.h"
 
 #define ESP_RX_RING_SIZE          WIFI_RX_BUF_SIZE
 #define ESP_LINE_BUF_SIZE         256U
 #define ESP_MQTT_TOPIC_SIZE       128U
-#define ESP_MQTT_PAYLOAD_SIZE     1024U
+#define ESP_MQTT_PAYLOAD_SIZE     512U
 #define ESP_MQTT_EVENT_QUEUE_SIZE 2U
 
 typedef enum {
@@ -37,8 +38,9 @@ typedef enum {
 } esp_parse_state_t;
 
 static uint8_t s_wifi_rxch;
-char g_wifi_rxbuf[WIFI_RX_BUF_SIZE] = {0};
+char g_wifi_rxbuf[WIFI_REPLY_BUF_SIZE] = {0};
 volatile int g_wifi_rxbytes = 0;
+static char s_atcmd_buf[256];
 
 static uint8_t s_rx_ring[ESP_RX_RING_SIZE];
 static volatile uint16_t s_rx_head = 0U;
@@ -97,23 +99,19 @@ void ESP8266_UartErrorCallback(UART_HandleTypeDef *huart)
     ESP8266_UartStartReceive();
 }
 
-/* WiFi模块驱动调试宏,注释下面两个宏定义可以取消调试打印 */
-#define CONFIG_WIFI_DEBUG
-#define CONFIG_WIFI_PRINT
-
 #define ESP_AT_RESET_TIMEOUT_MS    5000U
 #define ESP_AT_JOIN_TIMEOUT_MS     30000U
 #define ESP_AT_QUERY_TIMEOUT_MS    1500U
 #define ESP_TB_FW_INFO_RETRY       3U
 #define ESP_TB_FW_INFO_TIMEOUT_MS  8000U
 
-#ifdef CONFIG_WIFI_DEBUG
+#if LOG_WIFI_ENABLE
 #define wifi_dbg(format,args...)  printf(format, ##args)
 #else
 #define wifi_dbg(format,args...)  do{} while(0)
 #endif
 
-#ifdef CONFIG_WIFI_PRINT
+#if LOG_WIFI_ENABLE
 #define wifi_print(format,args...) printf(format, ##args)
 #else
 #define wifi_print(format,args...) do{} while(0)
@@ -121,7 +119,7 @@ void ESP8266_UartErrorCallback(UART_HandleTypeDef *huart)
 
 static void esp_debug_append(uint8_t ch)
 {
-    if( g_wifi_rxbytes < ((int)WIFI_RX_BUF_SIZE - 1) )
+    if( g_wifi_rxbytes < ((int)WIFI_REPLY_BUF_SIZE - 1) )
     {
         g_wifi_rxbuf[g_wifi_rxbytes++] = (char)ch;
         g_wifi_rxbuf[g_wifi_rxbytes] = '\0';
@@ -536,7 +534,6 @@ static int send_atcmd_ex(char *atcmd, char *expect_reply, uint8_t need_final_ok,
 {
     int          rv = 1;
     unsigned int i;
-    char        *expect;
 
     /* check function input arguments validation */
     if( !atcmd || strlen(atcmd)<=0 )
@@ -555,8 +552,6 @@ static int send_atcmd_ex(char *atcmd, char *expect_reply, uint8_t need_final_ok,
 
     HAL_UART_Transmit(wifi_huart, (uint8_t *)atcmd, strlen(atcmd), 1000);
 
-    expect = expect_reply ? expect_reply : "OK\r\n";
-
     /* Receive AT reply string by UART interrupt handler, stop by event parser or timeout */
     for(i=0; i<timeout; i++)
     {
@@ -564,7 +559,7 @@ static int send_atcmd_ex(char *atcmd, char *expect_reply, uint8_t need_final_ok,
 
         if( s_cmd_ctx.state == AT_CMD_SUCCESS )
         {
-            wifi_dbg("AT command Got expect reply '%s'\r\n", expect);
+            wifi_dbg("AT command Got expect reply '%s'\r\n", s_cmd_ctx.expect);
             rv = 0;
             goto CleanUp;
         }
@@ -745,7 +740,7 @@ int esp8266_module_init(void)
 
 int esp8266_join_network(char *ssid, char *pwd)
 {
-    char atcmd[128] = {0x00};
+    char *atcmd = s_atcmd_buf;
     int  i;
 
     if( !ssid || !pwd )
@@ -754,7 +749,8 @@ int esp8266_join_network(char *ssid, char *pwd)
         return -1;
     }
 
-    snprintf(atcmd, sizeof(atcmd), "AT+CWJAP=\"%s\",\"%s\"\r\n", ssid, pwd);
+    memset(atcmd, 0, sizeof(s_atcmd_buf));
+    snprintf(atcmd, sizeof(s_atcmd_buf), "AT+CWJAP=\"%s\",\"%s\"\r\n", ssid, pwd);
     if( send_atcmd(atcmd, EXPECT_OK, ESP_AT_JOIN_TIMEOUT_MS) )
     {
         wifi_print("ERROR: ESP8266 connect to '%s' failure\r\n", ssid);
@@ -879,7 +875,7 @@ int esp8266_get_ipaddr(char *ipaddr, char *gateway, int ipaddr_size)
 
 int esp8266_ping_test(char *host)
 {
-    char atcmd[128] = {0x00};
+    char *atcmd = s_atcmd_buf;
 
     if( !host )
     {
@@ -887,7 +883,8 @@ int esp8266_ping_test(char *host)
         return -1;
     }
 
-    snprintf(atcmd, sizeof(atcmd), "AT+PING=\"%s\"\r\n", host);
+    memset(atcmd, 0, sizeof(s_atcmd_buf));
+    snprintf(atcmd, sizeof(s_atcmd_buf), "AT+PING=\"%s\"\r\n", host);
     if( send_atcmd(atcmd, EXPECT_OK, 3000) )
     {
         wifi_print("ERROR: ESP8266 ping test [%s] failure\r\n", host);
@@ -900,7 +897,7 @@ int esp8266_ping_test(char *host)
 
 int esp8266_sock_connect(char *servip, int port)
 {
-    char atcmd[128] = {0x00};
+    char *atcmd = s_atcmd_buf;
 
     if( !servip || port<=0 )
     {
@@ -910,7 +907,8 @@ int esp8266_sock_connect(char *servip, int port)
 
     send_atcmd("AT+CIPMUX=0\r\n", EXPECT_OK, 1500);
 
-    snprintf(atcmd, sizeof(atcmd), "AT+CIPSTART=\"TCP\",\"%s\",%d\r\n", servip, port);
+    memset(atcmd, 0, sizeof(s_atcmd_buf));
+    snprintf(atcmd, sizeof(s_atcmd_buf), "AT+CIPSTART=\"TCP\",\"%s\",%d\r\n", servip, port);
     if( send_atcmd_ex(atcmd, "CONNECT", 1U, 3000) )
     {
         wifi_print("ERROR: ESP8266 socket connect to [%s:%d] failure\r\n", servip, port);
@@ -929,7 +927,7 @@ int esp8266_sock_disconnect(void)
 
 int esp8266_sock_send(unsigned char *data, int bytes)
 {
-    char atcmd[128] = {0x00};
+    char *atcmd = s_atcmd_buf;
 
     if( !data || bytes<= 0)
     {
@@ -937,7 +935,8 @@ int esp8266_sock_send(unsigned char *data, int bytes)
         return -1;
     }
 
-    snprintf(atcmd, sizeof(atcmd), "AT+CIPSEND=%d\r\n", bytes);
+    memset(atcmd, 0, sizeof(s_atcmd_buf));
+    snprintf(atcmd, sizeof(s_atcmd_buf), "AT+CIPSEND=%d\r\n", bytes);
     if( send_atcmd(atcmd, ">", 500) )
     {
         wifi_print("ERROR: AT+CIPSEND command failure\r\n");
@@ -1005,8 +1004,8 @@ int esp8266_sock_recv(unsigned char *buf, int size)
 
 int esp8266_mqtt_connect(char *host, int port, char *access_token)
 {
-    char atcmd[256] = {0x00};
-    char client_id[64] = {0x00};
+    char *atcmd = s_atcmd_buf;
+    static char client_id[64];
 
     if( !host || port<=0 || !access_token )
     {
@@ -1016,6 +1015,8 @@ int esp8266_mqtt_connect(char *host, int port, char *access_token)
 
     send_atcmd("AT+MQTTCLEAN=0\r\n", EXPECT_OK, 1000);
 
+    memset(atcmd, 0, sizeof(s_atcmd_buf));
+    memset(client_id, 0, sizeof(client_id));
     snprintf(client_id, sizeof(client_id),
              "stm32_ota_%08lX%08lX%08lX_%lu",
              (unsigned long)HAL_GetUIDw0(),
@@ -1023,7 +1024,7 @@ int esp8266_mqtt_connect(char *host, int port, char *access_token)
              (unsigned long)HAL_GetUIDw2(),
              (unsigned long)HAL_GetTick());
 
-    snprintf(atcmd, sizeof(atcmd),
+    snprintf(atcmd, sizeof(s_atcmd_buf),
              "AT+MQTTUSERCFG=0,1,\"%s\",\"%s\",\"\",0,0,\"\"\r\n",
              client_id, access_token);
     if( send_atcmd(atcmd, EXPECT_OK, 2000) )
@@ -1034,7 +1035,7 @@ int esp8266_mqtt_connect(char *host, int port, char *access_token)
 
     wifi_print("INFO: ESP8266 MQTT client id [%s]\r\n", client_id);
 
-    snprintf(atcmd, sizeof(atcmd), "AT+MQTTCONN=0,\"%s\",%d,0\r\n", host, port);
+    snprintf(atcmd, sizeof(s_atcmd_buf), "AT+MQTTCONN=0,\"%s\",%d,0\r\n", host, port);
     if( send_atcmd_ex(atcmd, "+MQTTCONNECTED", 1U, 10000) )
     {
         wifi_print("ERROR: ESP8266 MQTT connect to [%s:%d] failure\r\n", host, port);
@@ -1054,7 +1055,7 @@ int esp8266_mqtt_disconnect(void)
 
 int esp8266_mqtt_publish_raw(char *topic, unsigned char *data, int bytes)
 {
-    char atcmd[256] = {0x00};
+    char *atcmd = s_atcmd_buf;
 
     if( !topic || !data || bytes<=0 )
     {
@@ -1062,7 +1063,8 @@ int esp8266_mqtt_publish_raw(char *topic, unsigned char *data, int bytes)
         return -1;
     }
 
-    snprintf(atcmd, sizeof(atcmd), "AT+MQTTPUBRAW=0,\"%s\",%d,1,0\r\n", topic, bytes);
+    memset(atcmd, 0, sizeof(s_atcmd_buf));
+    snprintf(atcmd, sizeof(s_atcmd_buf), "AT+MQTTPUBRAW=0,\"%s\",%d,1,0\r\n", topic, bytes);
     if( send_atcmd(atcmd, ">", 2000) )
     {
         wifi_print("ERROR: ESP8266 MQTT publish raw command failure\r\n");
@@ -1081,7 +1083,7 @@ int esp8266_mqtt_publish_raw(char *topic, unsigned char *data, int bytes)
 
 int esp8266_mqtt_subscribe(char *topic, int qos)
 {
-    char atcmd[256] = {0x00};
+    char *atcmd = s_atcmd_buf;
 
     if( !topic || qos<0 || qos>1 )
     {
@@ -1089,7 +1091,8 @@ int esp8266_mqtt_subscribe(char *topic, int qos)
         return -1;
     }
 
-    snprintf(atcmd, sizeof(atcmd), "AT+MQTTSUB=0,\"%s\",%d\r\n", topic, qos);
+    memset(atcmd, 0, sizeof(s_atcmd_buf));
+    snprintf(atcmd, sizeof(s_atcmd_buf), "AT+MQTTSUB=0,\"%s\",%d\r\n", topic, qos);
     if( send_atcmd(atcmd, EXPECT_OK, 2000) )
     {
         wifi_print("ERROR: ESP8266 MQTT subscribe [%s] failure\r\n", topic);
@@ -1166,7 +1169,7 @@ int esp8266_thingsboard_request_firmware_info(void)
 {
     unsigned char request[] =
         "{\"sharedKeys\":\"fw_title,fw_version,fw_size,fw_checksum,fw_checksum_algorithm\"}";
-    char request_topic[64];
+    static char request_topic[64];
     uint32_t request_id;
     uint8_t attempt;
     int wait_ret;
@@ -1192,6 +1195,7 @@ int esp8266_thingsboard_request_firmware_info(void)
         {
             s_tb_request_id = 1U;
         }
+        memset(request_topic, 0, sizeof(request_topic));
         snprintf(request_topic, sizeof(request_topic),
                  "v1/devices/me/attributes/request/%lu",
                  (unsigned long)request_id);
@@ -1269,9 +1273,9 @@ int esp8266_thingsboard_request_firmware_chunk(uint32_t chunk_index,
                                                uint16_t buf_size,
                                                uint16_t *out_len)
 {
-    char topic[96];
-    char expect_topic[96];
-    char payload[16];
+    static char topic[96];
+    static char expect_topic[96];
+    static char payload[16];
     uint32_t request_id;
     static mqtt_sub_event_t evt;
     int payload_len;
@@ -1297,6 +1301,9 @@ int esp8266_thingsboard_request_firmware_chunk(uint32_t chunk_index,
         s_tb_request_id = 1U;
     }
 
+    memset(topic, 0, sizeof(topic));
+    memset(expect_topic, 0, sizeof(expect_topic));
+    memset(payload, 0, sizeof(payload));
     snprintf(topic, sizeof(topic),
              "v2/fw/request/%lu/chunk/%lu",
              (unsigned long)request_id,

@@ -1,51 +1,64 @@
 /**
  * @file  cmds_wifi.c
- * @brief WiFi 命令实现（基于 bsp_wifi）
- *
- * SSID / 密码持久化到 EEPROM：
- *   每个字段最多 32 字节，按 4 字节一个 EE 变量存储。
- *   SSID：EE_VAR_WIFI_SSID_BASE  ~ +7  （8 个变量，每个存 4 字节）
- *   PASS：EE_VAR_WIFI_PASS_BASE  ~ +7
+ * @brief WiFi 命令实现（统一走 net_cfg 配置模块）
  */
 
 #include "cmds.h"
 #include "bsp_wifi.h"
+#include "net_cfg.h"
 #include <string.h>
 #include <stdlib.h>
 
-extern uint32_t          Read_Flag (uint16_t virt_addr);
-extern HAL_StatusTypeDef Write_Flag(uint16_t virt_addr, uint32_t value);
-
-/* ---- EEPROM 地址分配（接续已有变量之后，按需调整）------------ */
-#define EE_VAR_WIFI_SSID_BASE   10U   /* 10~17：SSID，8 × 4 字节 = 32 字节 */
-#define EE_VAR_WIFI_PASS_BASE   18U   /* 18~25：密码，8 × 4 字节 = 32 字节 */
-#define WIFI_STR_EE_WORDS       8U    /* 每个字段占 8 个 EE 变量 */
-
-/* ---- 工具：将字符串按 4 字节写入 / 读出 EEPROM --------------- */
-static void ee_write_str(uint16_t base, const char *s, uint32_t max_len)
+static void wifi_mask_secret(const char *src, char *out, uint32_t out_size)
 {
-    char buf[32];
-    memset(buf, 0, sizeof(buf));
-    strncpy(buf, s, sizeof(buf) - 1U);
+    uint32_t len;
 
-    uint32_t words = (max_len + 3U) / 4U;
-    for (uint32_t i = 0U; i < words && i < WIFI_STR_EE_WORDS; i++) {
-        uint32_t val;
-        memcpy(&val, &buf[i * 4U], 4U);
-        Write_Flag((uint16_t)(base + i), val);
+    if (out == NULL || out_size == 0U) {
+        return;
+    }
+
+    memset(out, 0, out_size);
+    if (src == NULL || src[0] == '\0') {
+        return;
+    }
+
+    len = (uint32_t)strlen(src);
+    if (len <= 4U) {
+        strncpy(out, "****", out_size - 1U);
+        return;
+    }
+
+    strncpy(out, src, 2U);
+    if (out_size > 4U) {
+        strncpy(out + 2U, "****", out_size - 3U);
     }
 }
 
-static void ee_read_str(uint16_t base, char *out, uint32_t out_sz)
+static int wifi_cfg_load_or_default(net_cfg_t *cfg)
 {
-    char buf[32];
-    memset(buf, 0, sizeof(buf));
-    for (uint32_t i = 0U; i < WIFI_STR_EE_WORDS; i++) {
-        uint32_t val = Read_Flag((uint16_t)(base + i));
-        memcpy(&buf[i * 4U], &val, 4U);
+    if (cfg == NULL) {
+        return -1;
     }
-    strncpy(out, buf, out_sz - 1U);
-    out[out_sz - 1U] = '\0';
+
+    if (net_cfg_load(cfg) == 0) {
+        return 0;
+    }
+
+    net_cfg_load_default(cfg);
+    return 0;
+}
+
+static int wifi_cfg_save_and_refresh(const net_cfg_t *cfg)
+{
+    if (net_cfg_save(cfg) != 0) {
+        return -1;
+    }
+
+    if (net_cfg_reload() != 0) {
+        return -1;
+    }
+
+    return 0;
 }
 
 /* ================================================================
@@ -58,11 +71,21 @@ static void ee_read_str(uint16_t base, char *out, uint32_t out_sz)
  */
 int wifi_set_ssid(uint8_t argc, char **argv)
 {
+    net_cfg_t cfg;
+
     if (argc < 2) {
         shell_printf("Usage: wifi ssid <ssid>\r\n");
         return -1;
     }
-    ee_write_str(EE_VAR_WIFI_SSID_BASE, argv[1], 32U);
+
+    wifi_cfg_load_or_default(&cfg);
+    strncpy(cfg.wifi_ssid, argv[1], sizeof(cfg.wifi_ssid) - 1U);
+    cfg.wifi_ssid[sizeof(cfg.wifi_ssid) - 1U] = '\0';
+    if (wifi_cfg_save_and_refresh(&cfg) != 0) {
+        shell_printf("Save SSID failed.\r\n");
+        return -1;
+    }
+
     shell_printf("SSID saved: %s\r\n", argv[1]);
     return 0;
 }
@@ -73,12 +96,91 @@ int wifi_set_ssid(uint8_t argc, char **argv)
  */
 int wifi_set_pass(uint8_t argc, char **argv)
 {
+    net_cfg_t cfg;
+
     if (argc < 2) {
         shell_printf("Usage: wifi pass <password>\r\n");
         return -1;
     }
-    ee_write_str(EE_VAR_WIFI_PASS_BASE, argv[1], 32U);
+
+    wifi_cfg_load_or_default(&cfg);
+    strncpy(cfg.wifi_password, argv[1], sizeof(cfg.wifi_password) - 1U);
+    cfg.wifi_password[sizeof(cfg.wifi_password) - 1U] = '\0';
+    if (wifi_cfg_save_and_refresh(&cfg) != 0) {
+        shell_printf("Save password failed.\r\n");
+        return -1;
+    }
+
     shell_printf("Password saved.\r\n");
+    return 0;
+}
+
+int wifi_set_host(uint8_t argc, char **argv)
+{
+    net_cfg_t cfg;
+
+    if (argc < 2) {
+        shell_printf("Usage: wifi host <host>\r\n");
+        return -1;
+    }
+
+    wifi_cfg_load_or_default(&cfg);
+    strncpy(cfg.mqtt_host, argv[1], sizeof(cfg.mqtt_host) - 1U);
+    cfg.mqtt_host[sizeof(cfg.mqtt_host) - 1U] = '\0';
+    if (wifi_cfg_save_and_refresh(&cfg) != 0) {
+        shell_printf("Save host failed.\r\n");
+        return -1;
+    }
+
+    shell_printf("Host saved: %s\r\n", cfg.mqtt_host);
+    return 0;
+}
+
+int wifi_set_port(uint8_t argc, char **argv)
+{
+    net_cfg_t cfg;
+    uint32_t port;
+
+    if (argc < 2) {
+        shell_printf("Usage: wifi port <port>\r\n");
+        return -1;
+    }
+
+    port = strtoul(argv[1], NULL, 0);
+    if (port == 0U || port > 65535U) {
+        shell_printf("Invalid port.\r\n");
+        return -1;
+    }
+
+    wifi_cfg_load_or_default(&cfg);
+    cfg.mqtt_port = (uint16_t)port;
+    if (wifi_cfg_save_and_refresh(&cfg) != 0) {
+        shell_printf("Save port failed.\r\n");
+        return -1;
+    }
+
+    shell_printf("Port saved: %lu\r\n", (unsigned long)port);
+    return 0;
+}
+
+int wifi_set_token(uint8_t argc, char **argv)
+{
+    net_cfg_t cfg;
+
+    if (argc < 2) {
+        shell_printf("Usage: wifi token <token>\r\n");
+        return -1;
+    }
+
+    wifi_cfg_load_or_default(&cfg);
+    strncpy(cfg.access_token, argv[1], sizeof(cfg.access_token) - 1U);
+    cfg.access_token[sizeof(cfg.access_token) - 1U] = '\0';
+    if (wifi_cfg_save_and_refresh(&cfg) != 0) {
+        shell_printf("Save token failed.\r\n");
+        return -1;
+    }
+
+    shell_printf("Token saved.\r\n");
     return 0;
 }
 
@@ -88,30 +190,30 @@ int wifi_set_pass(uint8_t argc, char **argv)
  */
 int wifi_connect(uint8_t argc, char **argv)
 {
-    char ssid[33] = {0};
-    char pass[33] = {0};
+    net_cfg_t cfg;
 
-    if (argc >= 3) {
-        strncpy(ssid, argv[1], sizeof(ssid) - 1U);
-        strncpy(pass, argv[2], sizeof(pass) - 1U);
-    } else {
-        ee_read_str(EE_VAR_WIFI_SSID_BASE, ssid, sizeof(ssid));
-        ee_read_str(EE_VAR_WIFI_PASS_BASE, pass, sizeof(pass));
+    wifi_cfg_load_or_default(&cfg);
+
+    if (argc >= 3U) {
+        strncpy(cfg.wifi_ssid, argv[1], sizeof(cfg.wifi_ssid) - 1U);
+        cfg.wifi_ssid[sizeof(cfg.wifi_ssid) - 1U] = '\0';
+        strncpy(cfg.wifi_password, argv[2], sizeof(cfg.wifi_password) - 1U);
+        cfg.wifi_password[sizeof(cfg.wifi_password) - 1U] = '\0';
     }
 
-    if (ssid[0] == '\0') {
+    if (cfg.wifi_ssid[0] == '\0') {
         shell_printf("No SSID set. Use: wifi ssid <ssid>\r\n");
         return -1;
     }
 
-    shell_printf("Connecting to \"%s\"...\r\n", ssid);
+    shell_printf("Connecting to \"%s\"...\r\n", cfg.wifi_ssid);
 
     if (wifi_init() != WIFI_OK) {
         shell_printf("ESP8266 not responding.\r\n");
         return -1;
     }
 
-    int ret = wifi_connect_ap(ssid, pass);
+    int ret = wifi_connect_ap(cfg.wifi_ssid, cfg.wifi_password);
     if (ret != WIFI_OK) {
         shell_printf("Connect failed (ret=%d).\r\n", ret);
         return -1;
@@ -129,10 +231,11 @@ int wifi_connect(uint8_t argc, char **argv)
  */
 int wifi_status(uint8_t argc, char **argv)
 {
-    (void)argc; (void)argv;
+    net_cfg_t cfg;
+    char token_mask[16];
 
-    char ssid[33] = {0};
-    ee_read_str(EE_VAR_WIFI_SSID_BASE, ssid, sizeof(ssid));
+    (void)argc; (void)argv;
+    wifi_cfg_load_or_default(&cfg);
 
     wifi_status_t st = wifi_get_status();
 
@@ -145,7 +248,11 @@ int wifi_status(uint8_t argc, char **argv)
     }
 
     shell_printf("Status   : %s\r\n", st_str);
-    shell_printf("SSID cfg : %s\r\n", ssid[0] ? ssid : "(not set)");
+    shell_printf("SSID cfg : %s\r\n", cfg.wifi_ssid[0] ? cfg.wifi_ssid : "(not set)");
+    shell_printf("MQTT host: %s\r\n", cfg.mqtt_host);
+    shell_printf("MQTT port: %u\r\n", (unsigned int)cfg.mqtt_port);
+    wifi_mask_secret(cfg.access_token, token_mask, sizeof(token_mask));
+    shell_printf("Token    : %s\r\n", token_mask[0] ? token_mask : "(not set)");
 
     if (st == WIFI_STATUS_GOT_IP) {
         char ip[24] = {0};

@@ -36,7 +36,10 @@ typedef struct {
     uint32_t     target_slot;     /**< 升级目标分区                         */
     uint8_t      active_valid;    /**< 活跃分区完整性（0=无效，1=有效）      */
     uint8_t      xmodem_retry;    /**< Xmodem重试计数                       */
+    uint8_t      skip_boot_window_once; /**< 回到BOOT时单次跳过升级等待窗     */
     uint32_t     revert_reason;   /**< 回退原因标志                          */
+    char         ota_file_path[64]; /**< 当前待装载 OTA 文件路径             */
+    char         ota_target_version[32]; /**< 当前待写入目标槽的远端版本        */
 
     /* 业务相关指针，方便handler访问，非必要可删除 */
     void    *resource_ctx ;        /**< 系统资源相关上下文指针，方便handler访问，非必要可删除 */

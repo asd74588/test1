@@ -65,6 +65,11 @@
 
 #define EE_VAR_WIFI_SSID_BASE   10U  /* 10~17：WiFi SSID（8×4 字节）  */
 #define EE_VAR_WIFI_PASS_BASE   18U  /* 18~25：WiFi 密码（8×4 字节）  */
+#define EE_VAR_SLOT_A_VER_BASE  26U  /* 26~33：Slot A 版本（8×4字节） */
+#define EE_VAR_SLOT_B_VER_BASE  34U  /* 34~41：Slot B 版本（8×4字节） */
+#define EE_VAR_MQTT_HOST_BASE   42U  /* 42~57：MQTT Host（16×4字节） */
+#define EE_VAR_MQTT_TOKEN_BASE  58U  /* 58~73：Access Token（16×4字节） */
+#define EE_VAR_MQTT_PORT        74U  /* 74：MQTT Port                */
 
 /* ================================================================
  * 回退原因标志

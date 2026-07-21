@@ -20,6 +20,8 @@ extern "C" {
  * ================================================================ */
 const char *sys_get_version(void);
 uint32_t    sys_get_sn     (void);
+int         sys_get_slot_version(uint32_t slot, char *out, uint32_t out_sz);
+int         sys_set_slot_version(uint32_t slot, const char *version);
 
 /* ================================================================
  * 系统命令（cmds_system.c）
@@ -51,6 +53,9 @@ int cmd_ota_start  (uint8_t argc, char **argv);
  * ================================================================ */
 int wifi_set_ssid(uint8_t argc, char **argv);
 int wifi_set_pass(uint8_t argc, char **argv);
+int wifi_set_host(uint8_t argc, char **argv);
+int wifi_set_port(uint8_t argc, char **argv);
+int wifi_set_token(uint8_t argc, char **argv);
 int wifi_connect (uint8_t argc, char **argv);
 int wifi_status  (uint8_t argc, char **argv);
 

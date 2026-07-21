@@ -6,9 +6,10 @@
 
 
 #define wifi_huart (&huart2)             /* WiFi模块使用的串口 */
-#define WIFI_RX_BUF_SIZE 2048U
+#define WIFI_RX_BUF_SIZE 1024U
+#define WIFI_REPLY_BUF_SIZE 512U
 
-extern char g_wifi_rxbuf[WIFI_RX_BUF_SIZE];
+extern char g_wifi_rxbuf[WIFI_REPLY_BUF_SIZE];
 extern volatile int g_wifi_rxbytes;
 
 typedef struct {

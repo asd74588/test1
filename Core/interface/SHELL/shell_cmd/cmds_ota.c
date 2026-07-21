@@ -24,6 +24,9 @@ extern uint32_t          Read_Flag (uint16_t virt_addr);
 extern HAL_StatusTypeDef Write_Flag(uint16_t virt_addr, uint32_t value);
 extern lfs_ctx_t lfs_ctx;
 
+#define FW_VERSION_EE_WORDS 8U
+#define FW_VERSION_STR_LEN  32U
+
 /* ---- Flash 分区表（根据实际芯片/scatter 调整）---------------- */
 #define SLOT_B_FLASH_ADDR   APP_B_START_ADDR
 #define SLOT_B_FLASH_SIZE   APP_B_SIZE
@@ -61,11 +64,92 @@ static int parse_slot_arg(const char *arg, uint32_t *slot)
 /**
  * 固件版本字符串（由编译期 -DFW_VERSION_STR="x.y.z" 注入）
  */
+static uint16_t version_slot_base(uint32_t slot)
+{
+    if (slot == SLOT_A) {
+        return EE_VAR_SLOT_A_VER_BASE;
+    }
+
+    if (slot == SLOT_B) {
+        return EE_VAR_SLOT_B_VER_BASE;
+    }
+
+    return EE_ADDR_INVALID;
+}
+
+static void ee_write_fixed_str(uint16_t base, const char *s, uint32_t max_len)
+{
+    char buf[FW_VERSION_STR_LEN];
+    uint32_t words = (max_len + 3U) / 4U;
+
+    memset(buf, 0, sizeof(buf));
+    if (s != NULL) {
+        strncpy(buf, s, sizeof(buf) - 1U);
+    }
+
+    for (uint32_t i = 0U; i < words && i < FW_VERSION_EE_WORDS; i++) {
+        uint32_t val = 0U;
+        memcpy(&val, &buf[i * 4U], 4U);
+        Write_Flag((uint16_t)(base + i), val);
+    }
+}
+
+static void ee_read_fixed_str(uint16_t base, char *out, uint32_t out_sz)
+{
+    char buf[FW_VERSION_STR_LEN];
+
+    memset(buf, 0, sizeof(buf));
+    for (uint32_t i = 0U; i < FW_VERSION_EE_WORDS; i++) {
+        uint32_t val = Read_Flag((uint16_t)(base + i));
+        memcpy(&buf[i * 4U], &val, 4U);
+    }
+
+    if (out == NULL || out_sz == 0U) {
+        return;
+    }
+
+    strncpy(out, buf, out_sz - 1U);
+    out[out_sz - 1U] = '\0';
+}
+
+int sys_get_slot_version(uint32_t slot, char *out, uint32_t out_sz)
+{
+    uint16_t base = version_slot_base(slot);
+
+    if (base == EE_ADDR_INVALID || out == NULL || out_sz == 0U) {
+        return -1;
+    }
+
+    ee_read_fixed_str(base, out, out_sz);
+    return (out[0] != '\0') ? 0 : -2;
+}
+
+int sys_set_slot_version(uint32_t slot, const char *version)
+{
+    uint16_t base = version_slot_base(slot);
+
+    if (base == EE_ADDR_INVALID || version == NULL || version[0] == '\0') {
+        return -1;
+    }
+
+    ee_write_fixed_str(base, version, FW_VERSION_STR_LEN);
+    return 0;
+}
+
 const char *sys_get_version(void)
 {
+    static char slot_version[FW_VERSION_STR_LEN];
+    uint32_t active_slot = Read_Flag(EE_VAR_ACTIVE_SLOT);
+
 #ifndef FW_VERSION_STR
 #define FW_VERSION_STR "1.0.0"
 #endif
+
+    memset(slot_version, 0, sizeof(slot_version));
+    if (sys_get_slot_version(active_slot, slot_version, sizeof(slot_version)) == 0) {
+        return slot_version;
+    }
+
     return FW_VERSION_STR;
 }
 

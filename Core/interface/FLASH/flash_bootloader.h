@@ -42,7 +42,7 @@ typedef enum {
 } bootloader_load_status_t;
 
 //解析并写入目标分区；成功返回前保证目标分区具备合法向量表
-bootloader_load_status_t bootloader_load_target(uint8_t target_slot);
+bootloader_load_status_t bootloader_load_target(uint8_t target_slot, const char *path);
 
 
 #endif

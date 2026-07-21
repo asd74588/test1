@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <string.h>
 extern lfs_ctx_t lfs_ctx;
+extern const struct lfs_file_config lfs_file_cfg;
 
 #define BL_PREFIX  "[boot] "
 #if LOG_APP_VERIFY_ENABLE
@@ -87,14 +88,15 @@ firmware_verify_status_t verify_lfs_file_sha256(lfs_ctx_t *fs,
                                                 char *calc_hex,
                                                 uint16_t calc_hex_size)
 {
-    lfs_file_t file;
+    static lfs_file_t file;
+    static uint8_t expected_hash[32];
+    static uint8_t calc_hash[32];
+    static uint8_t buf[512];
     lfs_soff_t file_size;
-    uint8_t expected_hash[32];
-    uint8_t calc_hash[32];
-    uint8_t buf[512];
     size_t hash_len = 0U;
-    cmox_sha256_handle_t ctx;
+    static cmox_sha256_handle_t ctx;
     uint32_t total = 0U;
+    uint32_t remaining;
     int err;
 
     if (fs == NULL || path == NULL || expected_hex == NULL || fs->mounted == 0U) {
@@ -105,7 +107,8 @@ firmware_verify_status_t verify_lfs_file_sha256(lfs_ctx_t *fs,
         return FIRMWARE_VERIFY_ERR_SHA256;
     }
 
-    err = lfs_file_open(&fs->lfs, &file, path, LFS_O_RDONLY);
+    memset(&file, 0, sizeof(file));
+    err = lfs_file_opencfg(&fs->lfs, &file, path, LFS_O_RDONLY, &lfs_file_cfg);
     if (err < 0) {
         return FIRMWARE_VERIFY_ERR_OPEN;
     }
@@ -116,17 +119,22 @@ firmware_verify_status_t verify_lfs_file_sha256(lfs_ctx_t *fs,
         return FIRMWARE_VERIFY_ERR_READ;
     }
 
-    if (expected_size != 0U && file_size != (lfs_soff_t)expected_size) {
+    if (expected_size == 0U || file_size != (lfs_soff_t)expected_size) {
         lfs_file_close(&fs->lfs, &file);
         return FIRMWARE_VERIFY_ERR_SIZE;
     }
 
+    memset(&ctx, 0, sizeof(ctx));
     cmox_sha256_construct(&ctx);
     cmox_hash_init((cmox_hash_handle_t *)&ctx);
     cmox_hash_setTagLen((cmox_hash_handle_t *)&ctx, 32);
 
-    while (1) {
-        int rd = lfs_file_read(&fs->lfs, &file, buf, sizeof(buf));
+    remaining = expected_size;
+    while (remaining > 0U) {
+        lfs_size_t request = (remaining < (uint32_t)sizeof(buf))
+                             ? (lfs_size_t)remaining
+                             : (lfs_size_t)sizeof(buf);
+        int rd = lfs_file_read(&fs->lfs, &file, buf, request);
         if (rd < 0) {
             cmox_hash_cleanup((cmox_hash_handle_t *)&ctx);
             lfs_file_close(&fs->lfs, &file);
@@ -134,11 +142,14 @@ firmware_verify_status_t verify_lfs_file_sha256(lfs_ctx_t *fs,
         }
 
         if (rd == 0) {
-            break;
+            cmox_hash_cleanup((cmox_hash_handle_t *)&ctx);
+            lfs_file_close(&fs->lfs, &file);
+            return FIRMWARE_VERIFY_ERR_READ;
         }
 
         cmox_hash_append((cmox_hash_handle_t *)&ctx, buf, (size_t)rd);
         total += (uint32_t)rd;
+        remaining -= (uint32_t)rd;
     }
 
     cmox_hash_generateTag((cmox_hash_handle_t *)&ctx, calc_hash, &hash_len);
@@ -149,7 +160,7 @@ firmware_verify_status_t verify_lfs_file_sha256(lfs_ctx_t *fs,
         sha256_bytes_to_hex(calc_hash, calc_hex, calc_hex_size);
     }
 
-    if (total != (uint32_t)file_size || hash_len != 32U) {
+    if (total != expected_size || hash_len != 32U) {
         return FIRMWARE_VERIFY_ERR_READ;
     }
 
@@ -161,72 +172,50 @@ firmware_verify_status_t verify_lfs_file_sha256(lfs_ctx_t *fs,
 }
 
 
-int test_ota_sha256()
-{
-    uint8_t test_hash[32];
-    size_t hash_len;
-    cmox_sha256_handle_t ctx;
-    memset(&ctx, 0, sizeof(ctx));
-    cmox_sha256_construct(&ctx);
-    cmox_hash_init((cmox_hash_handle_t *)&ctx);
-    cmox_hash_setTagLen((cmox_hash_handle_t *)&ctx, 32);
-    // 不 append 任何数据
-    cmox_hash_generateTag((cmox_hash_handle_t *)&ctx, test_hash, &hash_len);
-    cmox_hash_cleanup((cmox_hash_handle_t *)&ctx);
-
-    dbg_printf("Empty SHA256:\r\n");
-    for(int i = 0; i < 32; i++) dbg_printf("%02X", test_hash[i]);
-    dbg_printf("\r\n");
-
-    return 0;
-}
-
-
 static int verify_ecdsa(const Firmware_Header_t *hdr)
 {
-    BL_INFO("SHA256 OK");
-    uint8_t pubkey[64];
+    static uint8_t pubkey[64];
+    static cmox_ecc_handle_t ecc_ctx;
+    static uint32_t ecc_buf_words[4096U / sizeof(uint32_t)];
+    uint8_t *ecc_buf = (uint8_t *)ecc_buf_words;
     memcpy(&pubkey[0],  FW_PUBKEY_X, 32);
     memcpy(&pubkey[32], FW_PUBKEY_Y, 32);
 
-    cmox_ecc_handle_t ecc_ctx;
-    static uint8_t ecc_buf[4096];  // 放入 SRAM2
     uint32_t fault_check = 0;
+    cmox_ecc_retval_t ret;
 
-    BL_INFO("SHA256 OK");
+    memset(&ecc_ctx, 0, sizeof(ecc_ctx));
+    cmox_ecc_construct(&ecc_ctx,
+                       CMOX_MATH_FUNCS_SMALL,
+                       ecc_buf,
+                       sizeof(ecc_buf_words));
 
-
-    cmox_ecc_construct(&ecc_ctx, CMOX_MATH_FUNCS_FAST, ecc_buf, sizeof(ecc_buf));
-
-
-    BL_INFO("SHA256 OK");
-    cmox_ecc_retval_t ret = cmox_ecdsa_verify(
+    ret = cmox_ecdsa_verify(
         &ecc_ctx,
-        CMOX_ECC_SECP256R1_HIGHMEM,
+        CMOX_ECC_SECP256R1_LOWMEM,
         pubkey,    64,
         hdr->sha256, 32,
         hdr->signature, 64,
         &fault_check
     );
 
-
-    BL_INFO("SHA256 OK");
-    cmox_ecc_cleanup(&ecc_ctx);
-
-    dbg_printf("ret=0x%X fault=0x%X\r\n", ret, fault_check);
-
     if (ret != CMOX_ECC_AUTH_SUCCESS || fault_check != CMOX_ECC_AUTH_SUCCESS) {
         BL_ERR("ECDSA verify failed: ret=0x%X fault=0x%X", ret, fault_check);
+        memset(ecc_buf_words, 0, sizeof(ecc_buf_words));
         return -1;
     }
 
+    memset(ecc_buf_words, 0, sizeof(ecc_buf_words));
     BL_INFO("ECDSA OK");
     return 0;
 }
 
 firmware_verify_status_t verify_firmware(const char *path)
 {
-    Firmware_Header_t hdr;
+    static Firmware_Header_t hdr;
+    static uint8_t buf[512];
+    static uint8_t calc_hash[32];
+    static cmox_sha256_handle_t ctx;
     lfs_soff_t file_size;
     uint32_t package_size;
     int err;
@@ -236,7 +225,11 @@ firmware_verify_status_t verify_firmware(const char *path)
     }
 
     /* 1. 打开文件读Header */
-    err = lfs_file_open(&lfs_ctx.lfs, &lfs_ctx.file, path, LFS_O_RDONLY);
+    err = lfs_file_opencfg(&lfs_ctx.lfs,
+                           &lfs_ctx.file,
+                           path,
+                           LFS_O_RDONLY,
+                           &lfs_file_cfg);
     if (err < 0) {
         BL_ERR("open failed: %d", err);
         return FIRMWARE_VERIFY_ERR_OPEN;
@@ -282,13 +275,10 @@ firmware_verify_status_t verify_firmware(const char *path)
 
     /* 3. 校验SHA256 */
     {
-        uint8_t buf[512];
         int rd;
         uint32_t total = 0U;
         uint32_t remaining = hdr.size;
-        uint8_t calc_hash[32];
-        size_t hash_len;
-        cmox_sha256_handle_t ctx;
+        size_t hash_len = 0U;
 
         if (lfs_file_seek(&lfs_ctx.lfs, &lfs_ctx.file,
                           sizeof(Firmware_Header_t), LFS_SEEK_SET) < 0) {
@@ -297,6 +287,7 @@ firmware_verify_status_t verify_firmware(const char *path)
             goto fail;
         }
 
+        memset(&ctx, 0, sizeof(ctx));
         cmox_sha256_construct(&ctx);
         cmox_hash_init((cmox_hash_handle_t *)&ctx);
         cmox_hash_setTagLen((cmox_hash_handle_t *)&ctx, 32);

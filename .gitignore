@@ -43,3 +43,43 @@ uv4.log.*
 Thumbs.db
 *.bak
 *~
+
+# Codex / local scratch
+.resume_work/
+
+# Local IDE files
+MDK-ARM/test.uvoptx
+MDK-ARM/.vscode/
+MDK-ARM/test.uvguix.*
+MDK-ARM/test.code-workspace
+
+# Local debug / serial logs
+MDK-ARM/codex_build*.log
+MDK-ARM/codex_serial*.log
+
+# Local Keil/CMSIS cache content
+MDK-ARM/.cmsis/
+MDK-ARM/.pack/
+MDK-ARM/.eide/
+MDK-ARM/.venv/
+MDK-ARM/build/
+MDK-ARM/codex_obj/
+
+# Local helper tools / analysis artifacts
+MDK-ARM/EventRecorderStub.scvd
+MDK-ARM/ram_analyzer.py
+MDK-ARM/srec_cat.exe
+
+# Firmware packager generated output
+firmware_packager_gui/dist/
+firmware_packager_gui/
+
+# Non-engineering documents / notes
+skill_references/
+*.docx
+项目复现技术文档.md
+ESP8266_AT调试问题记录.md
+Flash双页网络配置存储方案.md
+EEPROM双槽配置提交方案A.md
+OTA状态机优化建议.md
+.mxproject

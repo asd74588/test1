@@ -46,9 +46,6 @@
 /* One bitmap bit per 32-bit ELF word for fallback relocation scanning. */
 #define ELF_RELOC_SCRATCH_SIZE  ((ELF_BUF_SIZE + 31U) / 32U)
 
-/* LittleFS 中 App ELF 的路径 */
-#define APP_ELF_PATH   "a.elf"
-
 /* ===================================================================
  * ELF buffer（全局 .bss，启动时已清零，4字节对齐）
  * =================================================================== */
@@ -66,6 +63,7 @@ static uint8_t s_tail_len      = 0U;
  * LittleFS 句柄（外部初始化）
  * =================================================================== */
 extern lfs_ctx_t lfs_ctx;
+extern const struct lfs_file_config lfs_file_cfg;
 
 /* ===================================================================
  * 第一部分：Flash 擦写接口
@@ -413,10 +411,11 @@ static int read_elf_from_lfs(const char *path,
     BL_INFO("opening \"%s\" from LittleFS...", path);
 
     if (lfs_ctx.file_open == 0U) {
-        err = lfs_file_open(&lfs_ctx.lfs, &lfs_ctx.file, path, LFS_O_RDONLY);
+        err = lfs_file_opencfg(&lfs_ctx.lfs, &lfs_ctx.file, path,
+                               LFS_O_RDONLY, &lfs_file_cfg);
         lfs_ctx.file_open = (err == LFS_ERR_OK) ? 1U : 0U;
         if (err < 0) {
-            BL_ERR("lfs_file_open failed: %d", err);
+            BL_ERR("lfs_file_opencfg failed: %d", err);
             return err;
         }
     }
@@ -650,7 +649,7 @@ static int write_sections_to_flash(elf_ctx_t *ctx, uint8_t slot)
  * 本函数只执行仍可能失败的步骤，不修改 OTA active/state，也不跳转。
  * 状态机必须在本函数返回成功后再提交 active，然后调用跳转接口。
  */
-bootloader_load_status_t bootloader_load_target(uint8_t target_slot)
+bootloader_load_status_t bootloader_load_target(uint8_t target_slot, const char *path)
 {
     BL_INFO("elf_buf actual address: 0x%08x", (uint32_t)(uintptr_t)elf_buf);
     /* ---- 打印上次复位原因，便于定位 APP 是否触发了复位 ---- */
@@ -671,6 +670,11 @@ bootloader_load_status_t bootloader_load_target(uint8_t target_slot)
     uint32_t link_base = UINT32_MAX;
     int32_t reloc_offset = 0;
     uint32_t app_max = 0U;
+
+    if (path == NULL || path[0] == '\0') {
+        BL_ERR("invalid OTA file path");
+        return BOOTLOADER_LOAD_ERR_READ;
+    }
 
     if (target_slot != SLOT_A && target_slot != SLOT_B) {
         BL_ERR("invalid target slot: %u", target_slot);
@@ -695,9 +699,9 @@ bootloader_load_status_t bootloader_load_target(uint8_t target_slot)
     BL_INFO("=========================================");
 
     /* ---- Step 1: 从 LittleFS 读 ELF ---- */
-    BL_INFO("[1/5] reading ELF \"%s\" from LittleFS...", APP_ELF_PATH);
+    BL_INFO("[1/5] reading ELF \"%s\" from LittleFS...", path);
 
-    ret = read_elf_from_lfs(APP_ELF_PATH, elf_buf, ELF_BUF_SIZE, &elf_size);
+    ret = read_elf_from_lfs(path, elf_buf, ELF_BUF_SIZE, &elf_size);
     if (ret != 0) {
         BL_ERR("failed to read ELF from LittleFS: %d", ret);
         return BOOTLOADER_LOAD_ERR_READ;
@@ -745,7 +749,7 @@ bootloader_load_status_t bootloader_load_target(uint8_t target_slot)
     }
 
     /* 写入成功后可删除 LittleFS 中的 ELF（节省空间，可选）*/
-    /* lfs_remove(&lfs_ctx.lfs, APP_ELF_PATH); */
+    /* lfs_remove(&lfs_ctx.lfs, path); */
 
     /* ---- Step 5: 写入后的目标 App 合法性检查 ---- */
     BL_INFO("[5/5] validating target App at 0x%08x...", app_start);
