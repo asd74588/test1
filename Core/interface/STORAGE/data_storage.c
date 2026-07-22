@@ -3,9 +3,9 @@
 
 #if LOG_DATA_STORAGE_ENABLE
 #include <stdio.h>
-#define dbg_printf(format,args...) printf(format, ##args)
+#define dbg_printf(...) printf(__VA_ARGS__)
 #else
-#define dbg_printf(format,args...) do{}while(0)
+#define dbg_printf(...) ((void)0)
 #endif
 
 int lfs_storage_callback(const uint8_t *buf, uint32_t len, void *user_ctx)
@@ -16,19 +16,20 @@ int lfs_storage_callback(const uint8_t *buf, uint32_t len, void *user_ctx)
 
     int ret = lfs_file_write(&ctx->lfs, &ctx->file, buf, len);
 
-    if (ret < 0) {
+    if (ret < 0)
+    {
         dbg_printf("[LFS][FAIL] lfs_file_write len=%lu ret=%d\r\n", len, ret);
         return -1;
     }
 
-    if ((uint32_t)ret != len) {
+    if ((uint32_t)ret != len)
+    {
         dbg_printf("[LFS][FAIL] partial write len=%lu ret=%d\r\n", len, ret);
         return -1;
     }
 
     dbg_printf("[LFS][PASS] lfs_file_write len=%lu\r\n", len);
     return 0;
-
 }
 
 // int flash_storage_callback(const uint8_t *buf, uint32_t len, void *user_ctx)
@@ -37,5 +38,3 @@ int lfs_storage_callback(const uint8_t *buf, uint32_t len, void *user_ctx)
 //     // 直接调用你的Flash写函数，传入buf和len
 //     return Write_Buffer_To_NorFlash(ctx->flash_handle, buf, len);
 // }
-
-

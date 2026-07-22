@@ -16,14 +16,15 @@
 #include <stddef.h>
 
 #ifdef __cplusplus
-extern "C" {
+extern "C"
+{
 #endif
 
 /* ------------------------------------------------------------------ */
 /*  可配置项（不想改结构体的参数在这里调）                              */
 /* ------------------------------------------------------------------ */
-#define SHELL_LINE_MAX      128     /* 单行最大字节数   */
-#define SHELL_ARG_MAX       8       /* 最多参数个数     */
+#define SHELL_LINE_MAX 128 /* 单行最大字节数   */
+#define SHELL_ARG_MAX  8   /* 最多参数个数     */
 
 /* ------------------------------------------------------------------ */
 /*  命令描述                                                            */
@@ -36,29 +37,30 @@ extern "C" {
  */
 typedef int (*shell_cmd_func_t)(int argc, char *argv[]);
 
-typedef struct {
-    const char        *name;    /* 命令名，如 "ls"            */
-    const char        *help;    /* 帮助说明，如 "list files"  */
-    shell_cmd_func_t   func;    /* 命令回调                   */
+typedef struct
+{
+    const char      *name; /* 命令名，如 "ls"            */
+    const char      *help; /* 帮助说明，如 "list files"  */
+    shell_cmd_func_t func; /* 命令回调                   */
 } shell_cmd_t;
 
 /* ------------------------------------------------------------------ */
 /*  Shell 配置结构体（用户填充后传给 shell_init）                       */
 /* ------------------------------------------------------------------ */
-typedef struct {
-
+typedef struct
+{
     /* --- IO 回调（必填）---------------------------------------------- */
-    void (*putc)(char c);       /* 输出一个字符，如写 UART TX      */
-    char (*getc)(void);         /* 阻塞读一个字符，如从缓冲区取    */
+    void (*putc)(char c); /* 输出一个字符，如写 UART TX      */
+    char (*getc)(void);   /* 阻塞读一个字符，如从缓冲区取    */
 
     /* --- 命令表（必填）----------------------------------------------- */
-    const shell_cmd_t *commands;    /* 命令数组首地址               */
-    uint8_t            cmd_count;   /* 命令个数                     */
+    const shell_cmd_t *commands;  /* 命令数组首地址               */
+    uint8_t            cmd_count; /* 命令个数                     */
 
     /* --- 可选项（填 0 / NULL 使用默认值）------------------------------ */
-    const char *prompt;             /* 提示符，默认 "> "            */
+    const char *prompt; /* 提示符，默认 "> "            */
 
-    uint8_t     history_size;       /* 历史记录条数，最大 16，默认 8 */
+    uint8_t history_size; /* 历史记录条数，最大 16，默认 8 */
 
 } shell_config_t;
 
@@ -83,5 +85,3 @@ void shell_run(void);
 #endif
 
 #endif /* __SHELL_H__ */
-
-

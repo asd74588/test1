@@ -1,8 +1,7 @@
 #include "uart_bootloader.h"
 #include "shell.h"
-void Init_Uart()
+void Init_Uart(void)
 {
-   
     //阻塞式接收
     //HAL_UARTEx_ReceiveToIdle(&huart1,buffer, 512, rxlen, 0xFFFFFFFF);
 
@@ -13,9 +12,8 @@ void Init_Uart()
     //而且需要关闭半满中断，避免不必要的中断触发。
     // HAL_UARTEx_ReceiveToIdle_DMA(&huart1, buffer, 512);
     // __HAL_DMA_DISABLE_IT(&hdma_usart1_rx, DMA_IT_HT);
-    
 
-    return ;
+    return;
 }
 
 // 清空硬件与软件缓冲区（中止传输/接收、清空寄存器、清零软件缓冲）
@@ -35,11 +33,7 @@ void UART_FlushBuffers(UART_HandleTypeDef *huart)
 
     // 清掉外设数据寄存器残留（读出 RDR）
     __HAL_UART_FLUSH_DRREGISTER(huart);
-
 }
-
-
-
 
 // void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 // {
@@ -56,7 +50,3 @@ void UART_FlushBuffers(UART_HandleTypeDef *huart)
 //         __HAL_DMA_DISABLE_IT(&hdma_usart1_rx, DMA_IT_HT);
 //     }
 // }
-
-
-
-

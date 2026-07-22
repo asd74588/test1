@@ -9,44 +9,44 @@
 #include "nr_micro_shell.h"
 #include <stdint.h>
 
-
 #include "ota_state_machine.h"
 #ifdef __cplusplus
-extern "C" {
+extern "C"
+{
 #endif
 
 /* ================================================================
  * 设备信息（cmds_ota.c）
  * ================================================================ */
 const char *sys_get_version(void);
-uint32_t    sys_get_sn     (void);
+uint32_t    sys_get_sn(void);
 int         sys_get_slot_version(uint32_t slot, char *out, uint32_t out_sz);
 int         sys_set_slot_version(uint32_t slot, const char *version);
 
 /* ================================================================
  * 系统命令（cmds_system.c）
  * ================================================================ */
-int cmd_help   (uint8_t argc, char **argv);
-int cmd_clear  (uint8_t argc, char **argv);
-int cmd_reboot (uint8_t argc, char **argv);
+int cmd_help(uint8_t argc, char **argv);
+int cmd_clear(uint8_t argc, char **argv);
+int cmd_reboot(uint8_t argc, char **argv);
 int cmd_version(uint8_t argc, char **argv);
 
 /* ================================================================
  * 配置命令（cmds_cfg.c）
  * ================================================================ */
-int cmd_cfg_get (uint8_t argc, char **argv);
-int cmd_cfg_set (uint8_t argc, char **argv);
+int cmd_cfg_get(uint8_t argc, char **argv);
+int cmd_cfg_set(uint8_t argc, char **argv);
 int cmd_cfg_dump(uint8_t argc, char **argv);
 
 /* ================================================================
  * OTA 命令（cmds_ota.c）
  * ================================================================ */
-int cmd_ota_status (uint8_t argc, char **argv);
-int cmd_ota_slot   (uint8_t argc, char **argv);
-int cmd_ota_boot   (uint8_t argc, char **argv);
-int cmd_ota_revert (uint8_t argc, char **argv);
+int cmd_ota_status(uint8_t argc, char **argv);
+int cmd_ota_slot(uint8_t argc, char **argv);
+int cmd_ota_boot(uint8_t argc, char **argv);
+int cmd_ota_revert(uint8_t argc, char **argv);
 int cmd_ota_trigger(uint8_t argc, char **argv);
-int cmd_ota_start  (uint8_t argc, char **argv);
+int cmd_ota_start(uint8_t argc, char **argv);
 
 /* ================================================================
  * WiFi 命令（cmds_wifi.c）
@@ -56,17 +56,16 @@ int wifi_set_pass(uint8_t argc, char **argv);
 int wifi_set_host(uint8_t argc, char **argv);
 int wifi_set_port(uint8_t argc, char **argv);
 int wifi_set_token(uint8_t argc, char **argv);
-int wifi_connect (uint8_t argc, char **argv);
-int wifi_status  (uint8_t argc, char **argv);
+int wifi_connect(uint8_t argc, char **argv);
+int wifi_status(uint8_t argc, char **argv);
 
 /* ================================================================
  * Ymodem 命令（cmds_ymodem.c）
  * ================================================================ */
 int ymodem_receive(uint8_t argc, char **argv);
-int ymodem_send   (uint8_t argc, char **argv);
+int ymodem_send(uint8_t argc, char **argv);
 
 #ifdef __cplusplus
 }
 #endif
 #endif /* CMDS_H */
-

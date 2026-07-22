@@ -28,14 +28,11 @@
  */
 void fs_cmd_init(lfs_ctx_t *ctx);
 
-int fs_cmd_ls   (int argc, char *argv[]);
-int fs_cmd_cat  (int argc, char *argv[]);
+int fs_cmd_ls(int argc, char *argv[]);
+int fs_cmd_cat(int argc, char *argv[]);
 int fs_cmd_write(int argc, char *argv[]);
-int fs_cmd_rm   (int argc, char *argv[]);
+int fs_cmd_rm(int argc, char *argv[]);
 int fs_cmd_mkdir(int argc, char *argv[]);
-int fs_cmd_free (int argc, char *argv[]);
+int fs_cmd_free(int argc, char *argv[]);
 
 #endif /* __FS_CMD_H__ */
-
-
-

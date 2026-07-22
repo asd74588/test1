@@ -17,24 +17,26 @@
 #include <string.h>
 #include <stdio.h>
 
-extern lfs_ctx_t lfs_ctx;   /* LittleFS 实例，由 main.c 挂载 */
+extern lfs_ctx_t lfs_ctx; /* LittleFS 实例，由 main.c 挂载 */
 
 /* ================================================================
  * Ymodem 接收（rz）
  * ================================================================ */
 
 /* write_cb：Proto_Start_Receive 每收到一块数据调用一次 */
-typedef struct {
-    lfs_file_t  file;
-    int         opened;
-    char        path[64];
+typedef struct
+{
+    lfs_file_t file;
+    int        opened;
+    char       path[64];
 } ymodem_rx_ctx_t;
 
 static int ymodem_write_cb(const uint8_t *data, uint32_t len, void *user)
 {
-    ymodem_rx_ctx_t *ctx = (ymodem_rx_ctx_t *)user;
-    lfs_ssize_t written = lfs_file_write(&lfs_ctx.lfs, &ctx->file, data, (lfs_size_t)len);
-    if (written < 0 || (uint32_t)written != len) {
+    ymodem_rx_ctx_t *ctx     = (ymodem_rx_ctx_t *)user;
+    lfs_ssize_t      written = lfs_file_write(&lfs_ctx.lfs, &ctx->file, data, (lfs_size_t)len);
+    if (written < 0 || (uint32_t)written != len)
+    {
         shell_printf("LFS write error: %d\r\n", (int)written);
         return -1;
     }
@@ -64,7 +66,8 @@ int ymodem_receive(uint8_t argc, char **argv)
 
     /* 确定存储路径：命令行参数优先，否则等协议头填充后再定 */
     int path_from_arg = (argc >= 2);
-    if (path_from_arg) {
+    if (path_from_arg)
+    {
         strncpy(rx_ctx.path, argv[1], sizeof(rx_ctx.path) - 1);
     }
 
@@ -73,13 +76,12 @@ int ymodem_receive(uint8_t argc, char **argv)
     /* 握手完成、文件名包解析完毕后才知道文件名，
      * 所以先用临时路径打开，传输完后 rename。
      * 若调用方已给 path 则直接用该路径。           */
-    const char *open_path = path_from_arg
-                            ? rx_ctx.path
-                            : "/tmp_ymodem_rx";
+    const char *open_path = path_from_arg ? rx_ctx.path : "/tmp_ymodem_rx";
 
-    int lfs_err = lfs_file_open(&lfs_ctx.lfs, &rx_ctx.file, open_path,
-                                LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC);
-    if (lfs_err < 0) {
+    int lfs_err = lfs_file_open(
+        &lfs_ctx.lfs, &rx_ctx.file, open_path, LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC);
+    if (lfs_err < 0)
+    {
         shell_printf("LFS open error: %d  path=%s\r\n", lfs_err, open_path);
         return -1;
     }
@@ -90,21 +92,25 @@ int ymodem_receive(uint8_t argc, char **argv)
     lfs_file_close(&lfs_ctx.lfs, &rx_ctx.file);
     rx_ctx.opened = 0;
 
-    if (result < 0) {
+    if (result < 0)
+    {
         lfs_remove(&lfs_ctx.lfs, open_path);
         shell_printf("Ymodem receive failed.\r\n");
         return -1;
     }
 
     /* 若路径来自协议头，rename 临时文件 */
-    if (!path_from_arg && file_info.filename[0] != '\0') {
+    if (!path_from_arg && file_info.filename[0] != '\0')
+    {
         /* 构造目标路径 */
         char dst[72];
         snprintf(dst, sizeof(dst), "/%s", file_info.filename);
 
         lfs_rename(&lfs_ctx.lfs, open_path, dst);
         shell_printf("Received: %s  (%d bytes)\r\n", dst, result);
-    } else {
+    }
+    else
+    {
         shell_printf("Received: %s  (%d bytes)\r\n", open_path, result);
     }
 
@@ -114,13 +120,12 @@ int ymodem_receive(uint8_t argc, char **argv)
 /* ================================================================
  * Ymodem 发送（sz）
  * ================================================================ */
-static int ymodem_read_cb(uint8_t *buf, uint32_t max_len,
-                          uint32_t *out_len, void *user)
+static int ymodem_read_cb(uint8_t *buf, uint32_t max_len, uint32_t *out_len, void *user)
 {
-    lfs_file_t *file = (lfs_file_t *)user;
-    lfs_ssize_t nread = lfs_file_read(&lfs_ctx.lfs, file, buf,
-                                      (lfs_size_t)max_len);
-    if (nread < 0) {
+    lfs_file_t *file  = (lfs_file_t *)user;
+    lfs_ssize_t nread = lfs_file_read(&lfs_ctx.lfs, file, buf, (lfs_size_t)max_len);
+    if (nread < 0)
+    {
         shell_printf("LFS read error: %d\r\n", (int)nread);
         return -1;
     }
@@ -138,7 +143,8 @@ static int ymodem_read_cb(uint8_t *buf, uint32_t max_len,
  */
 int ymodem_send(uint8_t argc, char **argv)
 {
-    if (argc < 2) {
+    if (argc < 2)
+    {
         shell_printf("Usage: sz <path>\r\n");
         return -1;
     }
@@ -147,15 +153,17 @@ int ymodem_send(uint8_t argc, char **argv)
 
     /* ── 打开文件 ─────────────────────────────────────────── */
     lfs_file_t file;
-    int err = lfs_file_open(&lfs_ctx.lfs, &file, path, LFS_O_RDONLY);
-    if (err < 0) {
+    int        err = lfs_file_open(&lfs_ctx.lfs, &file, path, LFS_O_RDONLY);
+    if (err < 0)
+    {
         shell_printf("LFS open error: %d  path=%s\r\n", err, path);
         return -1;
     }
 
     /* 获取文件大小 */
     lfs_soff_t fsize = lfs_file_size(&lfs_ctx.lfs, &file);
-    if (fsize < 0) {
+    if (fsize < 0)
+    {
         lfs_file_close(&lfs_ctx.lfs, &file);
         shell_printf("LFS size error: %d\r\n", (int)fsize);
         return -1;
@@ -164,9 +172,11 @@ int ymodem_send(uint8_t argc, char **argv)
     /* 提取文件名（去掉目录前缀）*/
     const char *fname = path;
     for (const char *p = path; *p; p++)
-        if (*p == '/') fname = p + 1;
+        if (*p == '/')
+            fname = p + 1;
 
-    if (fsize > 0xFFFFFFFFLL) {
+    if (fsize > 0xFFFFFFFFLL)
+    {
         lfs_file_close(&lfs_ctx.lfs, &file);
         shell_printf("File too large for Ymodem: %ld\r\n", (long)fsize);
         return -1;
@@ -185,7 +195,8 @@ int ymodem_send(uint8_t argc, char **argv)
     int sent = Proto_Start_Send(&send_cfg);
     lfs_file_close(&lfs_ctx.lfs, &file);
 
-    if (sent < 0) {
+    if (sent < 0)
+    {
         shell_printf("Ymodem send failed.\r\n");
         return -1;
     }
@@ -193,5 +204,3 @@ int ymodem_send(uint8_t argc, char **argv)
     shell_printf("Send complete: %d bytes\r\n", sent);
     return 0;
 }
-
-

@@ -40,45 +40,42 @@ static int shell_fs_free(uint8_t argc, char **argv)
 
 struct cmd cmd_table[] = {
     /* 系统 */
-    { "help",        cmd_help,        "show this help"                           },
-    { "clear",       cmd_clear,       "clear screen"                             },
-    { "version",     cmd_version,     "print firmware version and build time"    },
-    { "reboot",      cmd_reboot,      "software reset"                           },
+    {"help", cmd_help, "show this help"},
+    {"clear", cmd_clear, "clear screen"},
+    {"version", cmd_version, "print firmware version and build time"},
+    {"reboot", cmd_reboot, "software reset"},
     /* 文件传输 */
-    { "rz",          ymodem_receive,  "rz [path]         receive file via Ymodem"  },
-    { "sz",          ymodem_send,     "sz <path>         send file via Ymodem"     },
+    {"rz", ymodem_receive, "rz [path]         receive file via Ymodem"},
+    {"sz", ymodem_send, "sz <path>         send file via Ymodem"},
     /* 文件系统 */
-    { "ls",          shell_fs_ls,      "ls [path]         list LittleFS files"      },
-    { "cat",         shell_fs_cat,     "cat <path>        print LittleFS file"      },
-    { "write",       shell_fs_write,   "write <file> <data> write LittleFS file"   },
-    { "rm",          shell_fs_rm,      "rm <path>         remove LittleFS file"     },
-    { "mkdir",       shell_fs_mkdir,   "mkdir <path>      create LittleFS dir"      },
-    { "free",        shell_fs_free,    "show LittleFS usage"                       },
+    {"ls", shell_fs_ls, "ls [path]         list LittleFS files"},
+    {"cat", shell_fs_cat, "cat <path>        print LittleFS file"},
+    {"write", shell_fs_write, "write <file> <data> write LittleFS file"},
+    {"rm", shell_fs_rm, "rm <path>         remove LittleFS file"},
+    {"mkdir", shell_fs_mkdir, "mkdir <path>      create LittleFS dir"},
+    {"free", shell_fs_free, "show LittleFS usage"},
     /* 设备配置 */
-    { "cfg get",     cmd_cfg_get,     "cfg get <addr>        read EEPROM var"    },
-    { "cfg set",     cmd_cfg_set,     "cfg set <addr> <val>  write EEPROM var"   },
-    { "cfg dump",    cmd_cfg_dump,    "show network cfg and EEPROM status vars"  },
+    {"cfg get", cmd_cfg_get, "cfg get <addr>        read EEPROM var"},
+    {"cfg set", cmd_cfg_set, "cfg set <addr> <val>  write EEPROM var"},
+    {"cfg dump", cmd_cfg_dump, "show network cfg and EEPROM status vars"},
     /* WiFi */
-    { "wifi ssid",   wifi_set_ssid,   "wifi ssid <ssid>      set & save SSID"   },
-    { "wifi pass",   wifi_set_pass,   "wifi pass <pass>      set & save password"},
-    { "wifi host",   wifi_set_host,   "wifi host <host>      set MQTT host"     },
-    { "wifi port",   wifi_set_port,   "wifi port <port>      set MQTT port"     },
-    { "wifi token",  wifi_set_token,  "wifi token <token>    set access token"  },
-    { "wifi connect",wifi_connect,    "wifi connect [ssid] [pass]"               },
-    { "wifi status", wifi_status,     "show WiFi connection status"              },
+    {"wifi ssid", wifi_set_ssid, "wifi ssid <ssid>      set & save SSID"},
+    {"wifi pass", wifi_set_pass, "wifi pass <pass>      set & save password"},
+    {"wifi host", wifi_set_host, "wifi host <host>      set MQTT host"},
+    {"wifi port", wifi_set_port, "wifi port <port>      set MQTT port"},
+    {"wifi token", wifi_set_token, "wifi token <token>    set access token"},
+    {"wifi connect", wifi_connect, "wifi connect [ssid] [pass]"},
+    {"wifi status", wifi_status, "show WiFi connection status"},
     /* OTA */
-    { "ota status",  cmd_ota_status,  "show OTA and device info"                 },
-    { "ota slot",    cmd_ota_slot,    "ota slot <0|1>        set target slot"    },
-    { "ota boot",    cmd_ota_boot,    "experimental: set OTA state to BOOT"      },
-    { "ota revert",  cmd_ota_revert,  "revert to previous slot and reboot"       },
-    { "ota trigger", cmd_ota_trigger, "set UPGRADING and reboot to bootloader"   },
-    { "ota start",   cmd_ota_start,   "ota start <path> [slot]  flash & reboot"  },
+    {"ota status", cmd_ota_status, "show OTA and device info"},
+    {"ota slot", cmd_ota_slot, "ota slot <0|1>        set target slot"},
+    {"ota boot", cmd_ota_boot, "experimental: set OTA state to BOOT"},
+    {"ota revert", cmd_ota_revert, "revert to previous slot and reboot"},
+    {"ota trigger", cmd_ota_trigger, "set UPGRADING and reboot to bootloader"},
+    {"ota start", cmd_ota_start, "ota start <path> [slot]  flash & reboot"},
 };
 
-const uint16_t cmd_table_size =
-    sizeof(cmd_table) / sizeof(cmd_table[0]);
+const uint16_t cmd_table_size = sizeof(cmd_table) / sizeof(cmd_table[0]);
 
-char *auto_complete_words[]         = { NULL };
+char          *auto_complete_words[]    = {NULL};
 const uint16_t auto_complete_words_size = 0U;
-
-

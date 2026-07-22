@@ -4,28 +4,32 @@
 /* ======================== 内部类型 ======================== */
 
 /* 数据条目：8 字节，与 Flash 双字编程对齐 */
-typedef struct {
-    uint16_t virt_addr;   /* 虚拟地址 / 变量 ID     */
-    uint16_t reserved;    /* 保留，擦除态 0xFFFF     */
-    uint32_t data;        /* 变量数据                */
+typedef struct
+{
+    uint16_t virt_addr; /* 虚拟地址 / 变量 ID     */
+    uint16_t reserved;  /* 保留，擦除态 0xFFFF     */
+    uint32_t data;      /* 变量数据                */
 } ee_entry_t;
 
 /* 页状态枚举 */
-typedef enum {
-    EE_PAGE_ERASED  = 0,  /* status1=ERASED, status2=ERASED */
-    EE_PAGE_RECEIVE = 1,  /* status1=RECEIVE, status2=ERASED */
-    EE_PAGE_ACTIVE  = 2,  /* status1=RECEIVE, status2=ACTIVE */
-    EE_PAGE_ERROR   = 3   /* 非法组合                       */
+typedef enum
+{
+    EE_PAGE_ERASED  = 0, /* status1=ERASED, status2=ERASED */
+    EE_PAGE_RECEIVE = 1, /* status1=RECEIVE, status2=ERASED */
+    EE_PAGE_ACTIVE  = 2, /* status1=RECEIVE, status2=ACTIVE */
+    EE_PAGE_ERROR   = 3  /* 非法组合                       */
 } ee_page_state_t;
 
 /* ======================== 内部函数声明 ======================== */
 
-static ee_page_state_t EE_GetPageState(uint32_t page_addr);
-static int8_t          EE_FindActivePage(void);
-static int16_t         EE_FindFreeEntry(uint32_t page_addr);
-static ee_entry_t      EE_ReadEntry(uint32_t page_addr, uint16_t index);
-static HAL_StatusTypeDef EE_WriteEntry(uint32_t page_addr, uint16_t index,
-                                       uint16_t virt_addr, uint32_t data);
+static ee_page_state_t   EE_GetPageState(uint32_t page_addr);
+static int8_t            EE_FindActivePage(void);
+static int16_t           EE_FindFreeEntry(uint32_t page_addr);
+static ee_entry_t        EE_ReadEntry(uint32_t page_addr, uint16_t index);
+static HAL_StatusTypeDef EE_WriteEntry(uint32_t page_addr,
+                                       uint16_t index,
+                                       uint16_t virt_addr,
+                                       uint32_t data);
 static HAL_StatusTypeDef EE_WritePageStatus(uint32_t addr, uint64_t value);
 static HAL_StatusTypeDef EE_ErasePage(uint32_t page_addr);
 static HAL_StatusTypeDef EE_PageTransfer(uint32_t active_page,
@@ -43,8 +47,8 @@ static HAL_StatusTypeDef EE_Format(void);
  */
 static ee_page_state_t EE_GetPageState(uint32_t page_addr)
 {
-    uint64_t s1 = *(__IO uint64_t*)(page_addr);
-    uint64_t s2 = *(__IO uint64_t*)(page_addr + 8U);
+    uint64_t s1 = *(__IO uint64_t *)(page_addr);
+    uint64_t s2 = *(__IO uint64_t *)(page_addr + 8U);
 
     if (s1 == EE_STATUS_ERASED && s2 == EE_STATUS_ERASED)
         return EE_PAGE_ERASED;
@@ -66,12 +70,16 @@ static int8_t EE_FindActivePage(void)
     ee_page_state_t s1 = EE_GetPageState(EE_PAGE1_BASE);
 
     /* 正常：一页 ACTIVE + 一页 ERASED */
-    if (s0 == EE_PAGE_ACTIVE && s1 == EE_PAGE_ERASED) return 0;
-    if (s0 == EE_PAGE_ERASED && s1 == EE_PAGE_ACTIVE) return 1;
+    if (s0 == EE_PAGE_ACTIVE && s1 == EE_PAGE_ERASED)
+        return 0;
+    if (s0 == EE_PAGE_ERASED && s1 == EE_PAGE_ACTIVE)
+        return 1;
 
     /* 页转移中断：一页 ACTIVE + 一页 RECEIVE */
-    if (s0 == EE_PAGE_ACTIVE && s1 == EE_PAGE_RECEIVE) return 0;
-    if (s0 == EE_PAGE_RECEIVE && s1 == EE_PAGE_ACTIVE) return 1;
+    if (s0 == EE_PAGE_ACTIVE && s1 == EE_PAGE_RECEIVE)
+        return 0;
+    if (s0 == EE_PAGE_RECEIVE && s1 == EE_PAGE_ACTIVE)
+        return 1;
 
     return -1;
 }
@@ -82,12 +90,12 @@ static int8_t EE_FindActivePage(void)
 static HAL_StatusTypeDef EE_ErasePage(uint32_t page_addr)
 {
     FLASH_EraseInitTypeDef erase_init;
-    uint32_t page_error = 0U;
+    uint32_t               page_error = 0U;
 
-    erase_init.TypeErase   = FLASH_TYPEERASE_PAGES;
-    erase_init.Banks       = EE_FLASH_BANK;
-    erase_init.Page        = (page_addr - EE_FLASH_BASE) / EE_FLASH_PAGE_SIZE;
-    erase_init.NbPages     = 1U;
+    erase_init.TypeErase = FLASH_TYPEERASE_PAGES;
+    erase_init.Banks     = EE_FLASH_BANK;
+    erase_init.Page      = (page_addr - EE_FLASH_BASE) / EE_FLASH_PAGE_SIZE;
+    erase_init.NbPages   = 1U;
 
     return HAL_FLASHEx_Erase(&erase_init, &page_error);
 }
@@ -106,9 +114,8 @@ static HAL_StatusTypeDef EE_WritePageStatus(uint32_t addr, uint64_t value)
 static ee_entry_t EE_ReadEntry(uint32_t page_addr, uint16_t index)
 {
     ee_entry_t entry;
-    uint32_t addr = page_addr + EE_HEADER_SIZE
-                    + ((uint32_t)index * EE_ENTRY_SIZE);
-    uint64_t raw = *(__IO uint64_t*)addr;
+    uint32_t   addr = page_addr + EE_HEADER_SIZE + ((uint32_t)index * EE_ENTRY_SIZE);
+    uint64_t   raw  = *(__IO uint64_t *)addr;
     memcpy(&entry, &raw, sizeof(ee_entry_t));
     return entry;
 }
@@ -116,13 +123,14 @@ static ee_entry_t EE_ReadEntry(uint32_t page_addr, uint16_t index)
 /**
  * @brief  在指定页的指定索引处写入条目（调用前须 Unlock）
  */
-static HAL_StatusTypeDef EE_WriteEntry(uint32_t page_addr, uint16_t index,
-                                       uint16_t virt_addr, uint32_t data)
+static HAL_StatusTypeDef EE_WriteEntry(uint32_t page_addr,
+                                       uint16_t index,
+                                       uint16_t virt_addr,
+                                       uint32_t data)
 {
-    uint32_t addr = page_addr + EE_HEADER_SIZE
-                    + ((uint32_t)index * EE_ENTRY_SIZE);
+    uint32_t   addr = page_addr + EE_HEADER_SIZE + ((uint32_t)index * EE_ENTRY_SIZE);
     ee_entry_t entry;
-    uint64_t raw;
+    uint64_t   raw;
 
     entry.virt_addr = virt_addr;
     entry.reserved  = 0xFFFFU;
@@ -170,15 +178,17 @@ static HAL_StatusTypeDef EE_PageTransfer(uint32_t active_page,
                                          uint32_t new_data)
 {
     HAL_StatusTypeDef status;
-    uint16_t write_idx = 0U;
+    uint16_t          write_idx = 0U;
 
     /* ---- 1. 擦除接收页 ---- */
     status = EE_ErasePage(receive_page);
-    if (status != HAL_OK) return status;
+    if (status != HAL_OK)
+        return status;
 
     /* ---- 2. 标记接收页为 RECEIVE ---- */
     status = EE_WritePageStatus(receive_page, EE_STATUS_RECEIVE);
-    if (status != HAL_OK) return status;
+    if (status != HAL_OK)
+        return status;
 
     /* ---- 3. 从活跃页末尾向前扫描，搬移最新值 ---- */
     for (int16_t i = (int16_t)EE_MAX_ENTRIES - 1; i >= 0; i--)
@@ -201,24 +211,25 @@ static HAL_StatusTypeDef EE_PageTransfer(uint32_t active_page,
         if (already_moved)
             continue;
 
-        status = EE_WriteEntry(receive_page, write_idx,
-                               entry.virt_addr, entry.data);
-        if (status != HAL_OK) return status;
+        status = EE_WriteEntry(receive_page, write_idx, entry.virt_addr, entry.data);
+        if (status != HAL_OK)
+            return status;
         write_idx++;
     }
 
     /* ---- 4. 写入触发转移的新变量 ---- */
     if (new_virt_addr != EE_ADDR_INVALID)
     {
-        status = EE_WriteEntry(receive_page, write_idx,
-                               new_virt_addr, new_data);
-        if (status != HAL_OK) return status;
+        status = EE_WriteEntry(receive_page, write_idx, new_virt_addr, new_data);
+        if (status != HAL_OK)
+            return status;
         write_idx++;
     }
 
     /* ---- 5. 先擦除旧活跃页（掉电后可恢复） ---- */
     status = EE_ErasePage(active_page);
-    if (status != HAL_OK) return status;
+    if (status != HAL_OK)
+        return status;
 
     /* ---- 6. 标记接收页为 ACTIVE ---- */
     status = EE_WritePageStatus(receive_page + 8U, EE_STATUS_ACTIVE);
@@ -232,14 +243,26 @@ static HAL_StatusTypeDef EE_Format(void)
     HAL_FLASH_Unlock();
 
     status = EE_ErasePage(EE_PAGE0_BASE);
-    if (status != HAL_OK) { HAL_FLASH_Lock(); return status; }
+    if (status != HAL_OK)
+    {
+        HAL_FLASH_Lock();
+        return status;
+    }
 
     status = EE_ErasePage(EE_PAGE1_BASE);
-    if (status != HAL_OK) { HAL_FLASH_Lock(); return status; }
+    if (status != HAL_OK)
+    {
+        HAL_FLASH_Lock();
+        return status;
+    }
 
     /* 将 Page0 标记为 ACTIVE */
     status = EE_WritePageStatus(EE_PAGE0_BASE, EE_STATUS_RECEIVE);
-    if (status != HAL_OK) { HAL_FLASH_Lock(); return status; }
+    if (status != HAL_OK)
+    {
+        HAL_FLASH_Lock();
+        return status;
+    }
 
     status = EE_WritePageStatus(EE_PAGE0_BASE + 8U, EE_STATUS_ACTIVE);
     HAL_FLASH_Lock();
@@ -290,21 +313,17 @@ static HAL_StatusTypeDef EE_Write(uint16_t virt_addr, uint32_t data)
     {
         /* 活跃页有空位，直接追加写入 */
         HAL_FLASH_Unlock();
-        HAL_StatusTypeDef status = EE_WriteEntry(active_addr, (uint16_t)free_idx,
-                                                  virt_addr, data);
+        HAL_StatusTypeDef status = EE_WriteEntry(active_addr, (uint16_t)free_idx, virt_addr, data);
         HAL_FLASH_Lock();
         return status;
     }
 
     /* 活跃页已满，执行页转移 */
     HAL_FLASH_Unlock();
-    HAL_StatusTypeDef status = EE_PageTransfer(active_addr, receive_addr,
-                                                virt_addr, data);
+    HAL_StatusTypeDef status = EE_PageTransfer(active_addr, receive_addr, virt_addr, data);
     HAL_FLASH_Lock();
     return status;
 }
-
-
 
 /* ======================== 外部接口 ======================== */
 HAL_StatusTypeDef Write_Flag(uint16_t virt_addr, uint32_t flag_value)
@@ -321,8 +340,8 @@ uint32_t Read_Flag(uint16_t virt_addr)
 
 HAL_StatusTypeDef EE_Init(void)
 {
-    ee_page_state_t s0 = EE_GetPageState(EE_PAGE0_BASE);
-    ee_page_state_t s1 = EE_GetPageState(EE_PAGE1_BASE);
+    ee_page_state_t   s0 = EE_GetPageState(EE_PAGE0_BASE);
+    ee_page_state_t   s1 = EE_GetPageState(EE_PAGE1_BASE);
     HAL_StatusTypeDef status;
 
     /* ---- 情况 1：两页均擦除 → 首次使用 ---- */
@@ -330,7 +349,11 @@ HAL_StatusTypeDef EE_Init(void)
     {
         HAL_FLASH_Unlock();
         status = EE_WritePageStatus(EE_PAGE0_BASE, EE_STATUS_RECEIVE);
-        if (status != HAL_OK) { HAL_FLASH_Lock(); return status; }
+        if (status != HAL_OK)
+        {
+            HAL_FLASH_Lock();
+            return status;
+        }
         status = EE_WritePageStatus(EE_PAGE0_BASE + 8U, EE_STATUS_ACTIVE);
         HAL_FLASH_Lock();
         return status;
@@ -347,16 +370,14 @@ HAL_StatusTypeDef EE_Init(void)
     if (s0 == EE_PAGE_ACTIVE && s1 == EE_PAGE_RECEIVE)
     {
         HAL_FLASH_Unlock();
-        status = EE_PageTransfer(EE_PAGE0_BASE, EE_PAGE1_BASE,
-                                 EE_ADDR_INVALID, 0U);
+        status = EE_PageTransfer(EE_PAGE0_BASE, EE_PAGE1_BASE, EE_ADDR_INVALID, 0U);
         HAL_FLASH_Lock();
         return status;
     }
     if (s0 == EE_PAGE_RECEIVE && s1 == EE_PAGE_ACTIVE)
     {
         HAL_FLASH_Unlock();
-        status = EE_PageTransfer(EE_PAGE1_BASE, EE_PAGE0_BASE,
-                                 EE_ADDR_INVALID, 0U);
+        status = EE_PageTransfer(EE_PAGE1_BASE, EE_PAGE0_BASE, EE_ADDR_INVALID, 0U);
         HAL_FLASH_Lock();
         return status;
     }
@@ -380,5 +401,3 @@ HAL_StatusTypeDef EE_Init(void)
     /* ---- 情况 5：异常状态 → 格式化 ---- */
     return EE_Format();
 }
-
-

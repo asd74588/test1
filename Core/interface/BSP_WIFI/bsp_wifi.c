@@ -24,7 +24,8 @@ wifi_status_t wifi_get_status(void)
 
 int wifi_get_ip(char *buf, size_t buf_size)
 {
-    if (buf == NULL || buf_size == 0U) {
+    if (buf == NULL || buf_size == 0U)
+    {
         return WIFI_ERROR;
     }
 

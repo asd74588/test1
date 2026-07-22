@@ -22,21 +22,24 @@ void fs_cmd_init(lfs_ctx_t *ctx)
 /* ------------------------------------------------------------------ */
 /*  内部宏                                                              */
 /* ------------------------------------------------------------------ */
-#define FS_PRINT(fmt, ...)  printf(fmt, ##__VA_ARGS__)
+#define FS_PRINT(fmt, ...) printf(fmt, ##__VA_ARGS__)
 
-#define FS_CHECK_READY()                                \
-    do {                                                \
-        if (s_ctx == NULL) {                            \
-            FS_PRINT("fs: not initialized\r\n");        \
-            return -1;                                  \
-        }                                               \
-        if (!s_ctx->mounted) {                          \
-            FS_PRINT("fs: not mounted\r\n");            \
-            return -1;                                  \
-        }                                               \
+#define FS_CHECK_READY()                                                                           \
+    do                                                                                             \
+    {                                                                                              \
+        if (s_ctx == NULL)                                                                         \
+        {                                                                                          \
+            FS_PRINT("fs: not initialized\r\n");                                                   \
+            return -1;                                                                             \
+        }                                                                                          \
+        if (!s_ctx->mounted)                                                                       \
+        {                                                                                          \
+            FS_PRINT("fs: not mounted\r\n");                                                       \
+            return -1;                                                                             \
+        }                                                                                          \
     } while (0)
 
-#define LFS  (&s_ctx->lfs)
+#define LFS (&s_ctx->lfs)
 
 /* ------------------------------------------------------------------ */
 /*  fs_cmd_ls  —  列目录                                               */
@@ -52,34 +55,39 @@ int fs_cmd_ls(int argc, char *argv[])
     struct lfs_info info;
 
     int err = lfs_dir_open(LFS, &dir, path);
-    if (err < 0) {
+    if (err < 0)
+    {
         FS_PRINT("ls: cannot open '%s' (err=%d)\r\n", path, err);
         return -1;
     }
 
     FS_PRINT("--- %s ---\r\n", path);
 
-    while (1) {
+    while (1)
+    {
         int res = lfs_dir_read(LFS, &dir, &info);
-        if (res < 0) {
+        if (res < 0)
+        {
             FS_PRINT("ls: read error (err=%d)\r\n", res);
             lfs_dir_close(LFS, &dir);
             return -1;
         }
-        if (res == 0) break;
+        if (res == 0)
+            break;
 
         if (strcmp(info.name, ".") == 0 || strcmp(info.name, "..") == 0)
             continue;
 
-        if (info.type == LFS_TYPE_DIR) {
+        if (info.type == LFS_TYPE_DIR)
+        {
             FS_PRINT("[DIR]  %s\r\n", info.name);
-        } else {
+        }
+        else
+        {
             if (info.size < 1024)
-                FS_PRINT("[FILE] %-24s %lu B\r\n",
-                         info.name, (unsigned long)info.size);
+                FS_PRINT("[FILE] %-24s %lu B\r\n", info.name, (unsigned long)info.size);
             else
-                FS_PRINT("[FILE] %-24s %lu KB\r\n",
-                         info.name, (unsigned long)(info.size / 1024));
+                FS_PRINT("[FILE] %-24s %lu KB\r\n", info.name, (unsigned long)(info.size / 1024));
         }
     }
 
@@ -95,18 +103,21 @@ int fs_cmd_cat(int argc, char *argv[])
 {
     FS_CHECK_READY();
 
-    if (argc < 2) {
+    if (argc < 2)
+    {
         FS_PRINT("usage: cat <file>\r\n");
         return -1;
     }
 
-    if (s_ctx->file_open) {
+    if (s_ctx->file_open)
+    {
         FS_PRINT("cat: a file is already open\r\n");
         return -1;
     }
 
     int err = lfs_file_open(LFS, &s_ctx->file, argv[1], LFS_O_RDONLY);
-    if (err < 0) {
+    if (err < 0)
+    {
         FS_PRINT("cat: cannot open '%s' (err=%d)\r\n", argv[1], err);
         return -1;
     }
@@ -116,13 +127,15 @@ int fs_cmd_cat(int argc, char *argv[])
     lfs_ssize_t n;
     int         ret = 0;
 
-    while ((n = lfs_file_read(LFS, &s_ctx->file, buf, sizeof(buf) - 1)) > 0) {
+    while ((n = lfs_file_read(LFS, &s_ctx->file, buf, sizeof(buf) - 1)) > 0)
+    {
         buf[n] = '\0';
         FS_PRINT("%s", buf);
     }
     FS_PRINT("\r\n");
 
-    if (n < 0) {
+    if (n < 0)
+    {
         FS_PRINT("cat: read error (err=%d)\r\n", (int)n);
         ret = -1;
     }
@@ -140,19 +153,21 @@ int fs_cmd_write(int argc, char *argv[])
 {
     FS_CHECK_READY();
 
-    if (argc < 3) {
+    if (argc < 3)
+    {
         FS_PRINT("usage: write <file> <data>\r\n");
         return -1;
     }
 
-    if (s_ctx->file_open) {
+    if (s_ctx->file_open)
+    {
         FS_PRINT("write: a file is already open\r\n");
         return -1;
     }
 
-    int err = lfs_file_open(LFS, &s_ctx->file, argv[1],
-                            LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC);
-    if (err < 0) {
+    int err = lfs_file_open(LFS, &s_ctx->file, argv[1], LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC);
+    if (err < 0)
+    {
         FS_PRINT("write: cannot open '%s' (err=%d)\r\n", argv[1], err);
         return -1;
     }
@@ -164,7 +179,8 @@ int fs_cmd_write(int argc, char *argv[])
     lfs_file_close(LFS, &s_ctx->file);
     s_ctx->file_open = 0;
 
-    if (written < 0 || (lfs_size_t)written != len) {
+    if (written < 0 || (lfs_size_t)written != len)
+    {
         FS_PRINT("write: write error (err=%d)\r\n", (int)written);
         return -1;
     }
@@ -179,13 +195,15 @@ int fs_cmd_rm(int argc, char *argv[])
 {
     FS_CHECK_READY();
 
-    if (argc < 2) {
+    if (argc < 2)
+    {
         FS_PRINT("usage: rm <file>\r\n");
         return -1;
     }
 
     int err = lfs_remove(LFS, argv[1]);
-    if (err < 0) {
+    if (err < 0)
+    {
         FS_PRINT("rm: cannot remove '%s' (err=%d)\r\n", argv[1], err);
         return -1;
     }
@@ -200,13 +218,15 @@ int fs_cmd_mkdir(int argc, char *argv[])
 {
     FS_CHECK_READY();
 
-    if (argc < 2) {
+    if (argc < 2)
+    {
         FS_PRINT("usage: mkdir <dir>\r\n");
         return -1;
     }
 
     int err = lfs_mkdir(LFS, argv[1]);
-    if (err < 0) {
+    if (err < 0)
+    {
         FS_PRINT("mkdir: cannot create '%s' (err=%d)\r\n", argv[1], err);
         return -1;
     }
@@ -219,25 +239,27 @@ int fs_cmd_mkdir(int argc, char *argv[])
 /* ------------------------------------------------------------------ */
 int fs_cmd_free(int argc, char *argv[])
 {
-    (void)argc; (void)argv;
+    (void)argc;
+    (void)argv;
     FS_CHECK_READY();
 
     lfs_ssize_t used_blocks = lfs_fs_size(LFS);
-    if (used_blocks < 0) {
+    if (used_blocks < 0)
+    {
         FS_PRINT("free: cannot get fs size (err=%d)\r\n", (int)used_blocks);
         return -1;
     }
 
     lfs_size_t block_size  = LFS->cfg->block_size;
     lfs_size_t block_count = LFS->cfg->block_count;
-    lfs_size_t total_kb    = (block_size * block_count)                  / 1024;
-    lfs_size_t used_kb     = (block_size * (lfs_size_t)used_blocks)      / 1024;
+    lfs_size_t total_kb    = (block_size * block_count) / 1024;
+    lfs_size_t used_kb     = (block_size * (lfs_size_t)used_blocks) / 1024;
     lfs_size_t free_kb     = total_kb - used_kb;
 
-    FS_PRINT("Total : %4lu KB  (%lu blocks)\r\n",
-             (unsigned long)total_kb,  (unsigned long)block_count);
-    FS_PRINT("Used  : %4lu KB  (%lu blocks)\r\n",
-             (unsigned long)used_kb,   (unsigned long)used_blocks);
+    FS_PRINT(
+        "Total : %4lu KB  (%lu blocks)\r\n", (unsigned long)total_kb, (unsigned long)block_count);
+    FS_PRINT(
+        "Used  : %4lu KB  (%lu blocks)\r\n", (unsigned long)used_kb, (unsigned long)used_blocks);
     FS_PRINT("Free  : %4lu KB  (%lu blocks)\r\n",
              (unsigned long)free_kb,
              (unsigned long)(block_count - (lfs_size_t)used_blocks));

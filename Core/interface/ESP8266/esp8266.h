@@ -4,26 +4,30 @@
 #include "usart.h"
 #include <string.h>
 
-
-#define wifi_huart (&huart2)             /* WiFi模块使用的串口 */
-#define WIFI_RX_BUF_SIZE 1024U
+#define wifi_huart          (&huart2) /* WiFi模块使用的串口 */
+#define WIFI_RX_BUF_SIZE    1024U
 #define WIFI_REPLY_BUF_SIZE 512U
 
-extern char g_wifi_rxbuf[WIFI_REPLY_BUF_SIZE];
+extern char         g_wifi_rxbuf[WIFI_REPLY_BUF_SIZE];
 extern volatile int g_wifi_rxbytes;
 
-typedef struct {
-    uint8_t valid;
+typedef struct
+{
+    uint8_t  valid;
     uint32_t size;
-    char title[32];
-    char version[32];
-    char checksum_algorithm[16];
-    char checksum[80];
+    char     title[32];
+    char     version[32];
+    char     checksum_algorithm[16];
+    char     checksum[80];
 } esp8266_tb_firmware_info_t;
 
 /* 清除WiFi模块接收buffer里的数据内容宏，用宏不用函数是因为函数调用需要额外时间开销 */
-#define clear_atcmd_buf()   do { memset(g_wifi_rxbuf, 0, sizeof(g_wifi_rxbuf)); \
-                                g_wifi_rxbytes=0; } while(0)
+#define clear_atcmd_buf()                                                                          \
+    do                                                                                             \
+    {                                                                                              \
+        memset(g_wifi_rxbuf, 0, sizeof(g_wifi_rxbuf));                                             \
+        g_wifi_rxbytes = 0;                                                                        \
+    } while (0)
 
 void ESP8266_UartStartReceive(void);
 void ESP8266_UartRxCpltCallback(UART_HandleTypeDef *huart);
@@ -87,10 +91,7 @@ extern int esp8266_thingsboard_get_firmware_info(esp8266_tb_firmware_info_t *inf
 extern int esp8266_thingsboard_subscribe_firmware_chunks(void);
 
 /* ThingsBoard OTA：请求单个固件chunk到调用方buffer */
-extern int esp8266_thingsboard_request_firmware_chunk(uint32_t chunk_index,
-                                                      uint32_t chunk_size,
-                                                      uint8_t *buf,
-                                                      uint16_t buf_size,
-                                                      uint16_t *out_len);
+extern int esp8266_thingsboard_request_firmware_chunk(
+    uint32_t chunk_index, uint32_t chunk_size, uint8_t *buf, uint16_t buf_size, uint16_t *out_len);
 
 #endif /* INC_ESP8266_H_ */

@@ -14,4 +14,3 @@ void Init_Uart(void);
 void UART_FlushBuffers(UART_HandleTypeDef *huart);
 
 #endif
-

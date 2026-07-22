@@ -14,8 +14,8 @@
 /* ------------------------------------------------------------------ */
 /*  内部常量                                                            */
 /* ------------------------------------------------------------------ */
-#define HISTORY_MAX     16      /* history_size 上限 */
-#define PROMPT_DEFAULT  "> "
+#define HISTORY_MAX    16 /* history_size 上限 */
+#define PROMPT_DEFAULT "> "
 
 /* ------------------------------------------------------------------ */
 /*  运行时状态（全部私有）                                              */
@@ -23,10 +23,10 @@
 static const shell_config_t *s_cfg = NULL;
 
 /* 历史记录 */
-static char  s_history[HISTORY_MAX][SHELL_LINE_MAX];
-static int   s_history_size  = 0;   /* 实际使用的历史槽位数 */
-static int   s_history_count = 0;   /* 已压入的条目总数     */
-static int   s_history_index = 0;   /* 上下键浏览游标       */
+static char s_history[HISTORY_MAX][SHELL_LINE_MAX];
+static int  s_history_size  = 0; /* 实际使用的历史槽位数 */
+static int  s_history_count = 0; /* 已压入的条目总数     */
+static int  s_history_index = 0; /* 上下键浏览游标       */
 
 /* ------------------------------------------------------------------ */
 /*  内部 IO 封装                                                        */
@@ -43,12 +43,13 @@ static inline char io_getc(void)
 
 static void io_puts(const char *s)
 {
-    while (*s) io_putc(*s++);
+    while (*s)
+        io_putc(*s++);
 }
 
 static void io_printf(const char *fmt, ...)
 {
-    char buf[256];
+    char    buf[256];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
@@ -61,12 +62,15 @@ static void io_printf(const char *fmt, ...)
 /* ------------------------------------------------------------------ */
 static void history_push(const char *line)
 {
-    if (line[0] == '\0') return;
+    if (line[0] == '\0')
+        return;
 
     /* 与最新一条相同则不重复压入 */
-    if (s_history_count > 0) {
+    if (s_history_count > 0)
+    {
         int last = (s_history_count - 1) % s_history_size;
-        if (strcmp(s_history[last], line) == 0) return;
+        if (strcmp(s_history[last], line) == 0)
+            return;
     }
 
     int idx = s_history_count % s_history_size;
@@ -79,8 +83,8 @@ static void history_push(const char *line)
 /* offset=1 最新，offset=2 次新，超出范围返回 NULL */
 static const char *history_get(int offset)
 {
-    if (offset < 1 || offset > s_history_count ||
-        offset > s_history_size) return NULL;
+    if (offset < 1 || offset > s_history_count || offset > s_history_size)
+        return NULL;
     int idx = (s_history_count - offset) % s_history_size;
     return s_history[idx];
 }
@@ -88,8 +92,8 @@ static const char *history_get(int offset)
 /* ------------------------------------------------------------------ */
 /*  行编辑                                                              */
 /* ------------------------------------------------------------------ */
-static char   s_line[SHELL_LINE_MAX];
-static int    s_line_len = 0;
+static char s_line[SHELL_LINE_MAX];
+static int  s_line_len = 0;
 
 /* 清除终端当前行，重新打印提示符 + 当前行内容 */
 static void refresh_line(void)
@@ -109,17 +113,24 @@ static void readline(void)
     /* 用于吞掉 \r\n 里多余的 \n */
     static uint8_t last_was_cr = 0;
 
-    while (1) {
+    while (1)
+    {
         char c = io_getc();
 
         /* --- \r\n 处理 --- */
-        if (c == '\n') {
-            if (last_was_cr) { last_was_cr = 0; continue; }
+        if (c == '\n')
+        {
+            if (last_was_cr)
+            {
+                last_was_cr = 0;
+                continue;
+            }
             io_puts("\r\n");
             s_line[s_line_len] = '\0';
             return;
         }
-        if (c == '\r') {
+        if (c == '\r')
+        {
             last_was_cr = 1;
             io_puts("\r\n");
             s_line[s_line_len] = '\0';
@@ -128,8 +139,10 @@ static void readline(void)
         last_was_cr = 0;
 
         /* --- 退格 --- */
-        if (c == '\b' || c == 0x7F) {
-            if (s_line_len > 0) {
+        if (c == '\b' || c == 0x7F)
+        {
+            if (s_line_len > 0)
+            {
                 s_line_len--;
                 s_line[s_line_len] = '\0';
                 io_puts("\b \b");
@@ -138,7 +151,8 @@ static void readline(void)
         }
 
         /* --- Ctrl+C：清行 --- */
-        if (c == 0x03) {
+        if (c == 0x03)
+        {
             s_line_len = 0;
             s_line[0]  = '\0';
             io_puts("^C\r\n");
@@ -147,15 +161,22 @@ static void readline(void)
         }
 
         /* --- ESC 序列：方向键 ESC [ A/B --- */
-        if (c == '\033') {
+        if (c == '\033')
+        {
             char c2 = io_getc();
             char c3 = io_getc();
-            if (c2 == '[') {
-                if (c3 == 'A') {            /* 上键：往旧历史 */
+            if (c2 == '[')
+            {
+                if (c3 == 'A')
+                { /* 上键：往旧历史 */
                     s_history_index++;
-                } else if (c3 == 'B') {     /* 下键：往新历史 */
+                }
+                else if (c3 == 'B')
+                { /* 下键：往新历史 */
                     s_history_index--;
-                } else {
+                }
+                else
+                {
                     continue;
                 }
 
@@ -171,10 +192,13 @@ static void readline(void)
                     h = history_get(s_history_index);
 
                 memset(s_line, 0, sizeof(s_line));
-                if (h) {
+                if (h)
+                {
                     strncpy(s_line, h, SHELL_LINE_MAX - 1);
                     s_line_len = strlen(s_line);
-                } else {
+                }
+                else
+                {
                     s_line_len = 0;
                 }
                 refresh_line();
@@ -183,10 +207,11 @@ static void readline(void)
         }
 
         /* --- 普通可打印字符 --- */
-        if (c >= 0x20 && c < 0x7F && s_line_len < SHELL_LINE_MAX - 1) {
+        if (c >= 0x20 && c < 0x7F && s_line_len < SHELL_LINE_MAX - 1)
+        {
             s_line[s_line_len++] = c;
             s_line[s_line_len]   = '\0';
-            io_putc(c);     /* 回显 */
+            io_putc(c); /* 回显 */
         }
     }
 }
@@ -199,12 +224,17 @@ static int parse_args(char *line, char *argv[], int max_argc)
     int   argc = 0;
     char *p    = line;
 
-    while (*p && argc < max_argc) {
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p == '\0') break;
+    while (*p && argc < max_argc)
+    {
+        while (*p == ' ' || *p == '\t')
+            p++;
+        if (*p == '\0')
+            break;
         argv[argc++] = p;
-        while (*p && *p != ' ' && *p != '\t') p++;
-        if (*p) *p++ = '\0';
+        while (*p && *p != ' ' && *p != '\t')
+            p++;
+        if (*p)
+            *p++ = '\0';
     }
     return argc;
 }
@@ -214,9 +244,11 @@ static int parse_args(char *line, char *argv[], int max_argc)
 /* ------------------------------------------------------------------ */
 static void builtin_help(int argc, char *argv[])
 {
-    (void)argc; (void)argv;
+    (void)argc;
+    (void)argv;
     io_puts("\r\nCommands:\r\n");
-    for (int i = 0; i < s_cfg->cmd_count; i++) {
+    for (int i = 0; i < s_cfg->cmd_count; i++)
+    {
         io_printf("  %-16s  %s\r\n",
                   s_cfg->commands[i].name,
                   s_cfg->commands[i].help ? s_cfg->commands[i].help : "");
@@ -230,16 +262,20 @@ static void builtin_help(int argc, char *argv[])
 /* ------------------------------------------------------------------ */
 static void dispatch(int argc, char *argv[])
 {
-    if (argc == 0) return;
+    if (argc == 0)
+        return;
 
     /* 内建 help 优先 */
-    if (strcmp(argv[0], "help") == 0) {
+    if (strcmp(argv[0], "help") == 0)
+    {
         builtin_help(argc, argv);
         return;
     }
 
-    for (int i = 0; i < s_cfg->cmd_count; i++) {
-        if (strcmp(argv[0], s_cfg->commands[i].name) == 0) {
+    for (int i = 0; i < s_cfg->cmd_count; i++)
+    {
+        if (strcmp(argv[0], s_cfg->commands[i].name) == 0)
+        {
             s_cfg->commands[i].func(argc, argv);
             return;
         }
@@ -256,8 +292,8 @@ void shell_init(const shell_config_t *cfg)
     s_cfg = cfg;
 
     /* 历史记录槽位数：限制在 [1, HISTORY_MAX] */
-    s_history_size = (cfg->history_size > 0 && cfg->history_size <= HISTORY_MAX)
-                     ? cfg->history_size : 8;
+    s_history_size =
+        (cfg->history_size > 0 && cfg->history_size <= HISTORY_MAX) ? cfg->history_size : 8;
 
     const char *prompt = cfg->prompt ? cfg->prompt : PROMPT_DEFAULT;
 
@@ -269,13 +305,15 @@ void shell_init(const shell_config_t *cfg)
 
 void shell_run(void)
 {
-    char *argv[SHELL_ARG_MAX];
+    char       *argv[SHELL_ARG_MAX];
     const char *prompt = s_cfg->prompt ? s_cfg->prompt : PROMPT_DEFAULT;
 
-    while (1) {
+    while (1)
+    {
         readline();
 
-        if (s_line_len == 0) {
+        if (s_line_len == 0)
+        {
             io_puts(prompt);
             continue;
         }
@@ -290,4 +328,3 @@ void shell_run(void)
         io_puts(prompt);
     }
 }
-

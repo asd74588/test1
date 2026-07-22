@@ -27,11 +27,11 @@
   */
 cmox_init_retval_t cmox_ll_init(void *pArg)
 {
-  (void)pArg;
-  /* Ensure CRC is enabled for cryptographic processing */
-  __HAL_RCC_CRC_RELEASE_RESET();
-  __HAL_RCC_CRC_CLK_ENABLE();
-  return CMOX_INIT_SUCCESS;
+    (void)pArg;
+    /* Ensure CRC is enabled for cryptographic processing */
+    __HAL_RCC_CRC_RELEASE_RESET();
+    __HAL_RCC_CRC_CLK_ENABLE();
+    return CMOX_INIT_SUCCESS;
 }
 
 /**
@@ -41,7 +41,7 @@ cmox_init_retval_t cmox_ll_init(void *pArg)
   */
 cmox_init_retval_t cmox_ll_deInit(void *pArg)
 {
-  (void)pArg;
-  /* Do not turn off CRC to avoid side effect on other SW parts using it */
-  return CMOX_INIT_SUCCESS;
+    (void)pArg;
+    /* Do not turn off CRC to avoid side effect on other SW parts using it */
+    return CMOX_INIT_SUCCESS;
 }

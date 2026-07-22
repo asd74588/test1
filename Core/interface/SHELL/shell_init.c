@@ -16,12 +16,12 @@
 extern UART_HandleTypeDef huart1;
 
 /* ---- ring buffer ---- */
-#define SHELL_RX_BUF_SIZE  32
+#define SHELL_RX_BUF_SIZE 32
 
 static volatile uint8_t  s_rx_buf[SHELL_RX_BUF_SIZE];
-static volatile uint16_t s_rx_head = 0;   /* ISR 写入位置 */
-static volatile uint16_t s_rx_tail = 0;   /* 主循环读取位置 */
-static uint8_t s_rx_byte;                 /* HAL 单字节接收缓存 */
+static volatile uint16_t s_rx_head = 0; /* ISR 写入位置 */
+static volatile uint16_t s_rx_tail = 0; /* 主循环读取位置 */
+static uint8_t           s_rx_byte;     /* HAL 单字节接收缓存 */
 
 void Shell_Init(void)
 {
@@ -36,7 +36,8 @@ void Shell_Init(void)
  */
 void Shell_Process(void)
 {
-    while (s_rx_tail != s_rx_head) {
+    while (s_rx_tail != s_rx_head)
+    {
         uint8_t c = s_rx_buf[s_rx_tail];
         s_rx_tail = (s_rx_tail + 1U) % SHELL_RX_BUF_SIZE;
         shell((char)c);
@@ -45,11 +46,13 @@ void Shell_Process(void)
 
 void Shell_UartRxCpltCallback(UART_HandleTypeDef *huart)
 {
-    if (huart->Instance == huart1.Instance) {
+    if (huart->Instance == huart1.Instance)
+    {
         uint16_t next = (s_rx_head + 1U) % SHELL_RX_BUF_SIZE;
-        if (next != s_rx_tail) {
+        if (next != s_rx_tail)
+        {
             s_rx_buf[s_rx_head] = s_rx_byte;
-            s_rx_head = next;
+            s_rx_head           = next;
         }
         HAL_UART_Receive_IT(&huart1, &s_rx_byte, 1U);
     }
@@ -63,7 +66,8 @@ void Shell_UartRxCpltCallback(UART_HandleTypeDef *huart)
  */
 void Shell_UartErrorCallback(UART_HandleTypeDef *huart)
 {
-    if (huart->Instance == huart1.Instance) {
+    if (huart->Instance == huart1.Instance)
+    {
         __HAL_UART_CLEAR_OREFLAG(huart);
         huart->RxState = HAL_UART_STATE_READY;
         HAL_UART_Receive_IT(&huart1, &s_rx_byte, 1U);

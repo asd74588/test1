@@ -3,7 +3,8 @@
 #include <stdint.h>
 #include "main.h"
 #ifdef __cplusplus
-extern "C" {
+extern "C"
+{
 #endif
 void Shell_Init(void);
 void Shell_Process(void);
