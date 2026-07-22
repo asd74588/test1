@@ -8,9 +8,15 @@
 #include "log_config.h"
 
 #if LOG_W25QXX_ENABLE
-#define spinor_print(...) printf(__VA_ARGS__)
+#define spinor_log(...) printf(__VA_ARGS__)
 #else
-#define spinor_print(...) ((void)0)
+#define spinor_log(...) ((void)0)
+#endif
+
+#if LOG_W25QXX_TRACE_ENABLE
+#define spinor_trace(...) printf(__VA_ARGS__)
+#else
+#define spinor_trace(...) ((void)0)
 #endif
 
 __attribute__((unused)) static void dump_buf(const char *prompt, uint8_t *buf, uint32_t size)
@@ -21,12 +27,12 @@ __attribute__((unused)) static void dump_buf(const char *prompt, uint8_t *buf, u
         return;
 
     if (prompt)
-        spinor_print("%s\r\n", prompt);
+        spinor_trace("%s\r\n", prompt);
 
     for (i = 0; i < size; i++)
-        spinor_print("%02x ", buf[i]);
+        spinor_trace("%02x ", buf[i]);
 
-    spinor_print("\r\n");
+    spinor_trace("\r\n");
 }
 
 #ifdef USE_FREERTOS
@@ -177,12 +183,12 @@ int spinor_init(struct spinor_info *spinor)
     if (!spinor_detect_by_jedec(spinor))
         return -1;
 
-    spinor_print("Norflash %s detected, capacity %lu KB, %lu blocks, %lu sectors, %lu pages.\r\n",
-                 spinor->flash->name,
-                 spinor->flash->capacity >> 10,
-                 spinor->flash->n_blocks,
-                 spinor->flash->n_sectors,
-                 spinor->flash->n_pages);
+    spinor_log("Norflash %s detected, capacity %lu KB, %lu blocks, %lu sectors, %lu pages.\r\n",
+               spinor->flash->name,
+               spinor->flash->capacity >> 10,
+               spinor->flash->n_blocks,
+               spinor->flash->n_sectors,
+               spinor->flash->n_pages);
 
     return 0;
 }
@@ -201,7 +207,7 @@ int spinor_erase_chip(struct spinor_info *spinor)
 
 #if LOG_W25QXX_ENABLE
     uint32_t StartTime = HAL_GetTick();
-    spinor_print("Norflash EraseChip Begin...\r\n");
+    spinor_trace("Norflash EraseChip Begin...\r\n");
 #endif
 
     spinor_write_enable(spi);
@@ -212,7 +218,7 @@ int spinor_erase_chip(struct spinor_info *spinor)
     spinor_WaitForWriteEnd(spi);
 
 #if LOG_W25QXX_ENABLE
-    spinor_print("Norflash EraseChip done after %ld ms!\r\n", HAL_GetTick() - StartTime);
+    spinor_trace("Norflash EraseChip done after %ld ms!\r\n", HAL_GetTick() - StartTime);
 #endif
 
     mdelay(10);
@@ -243,7 +249,7 @@ int spinor_erase_block(struct spinor_info *spinor, uint32_t address, uint32_t si
     last  = (address + size - 1) / flash->block_size;
 
 #if LOG_W25QXX_ENABLE
-    spinor_print("Norflash Erase %ld Bytes Block@0x%lx Begin...\r\n", size, address);
+    spinor_trace("Norflash Erase %ld Bytes Block@0x%lx Begin...\r\n", size, address);
     uint32_t StartTime = HAL_GetTick();
 #endif
 
@@ -252,7 +258,7 @@ int spinor_erase_block(struct spinor_info *spinor, uint32_t address, uint32_t si
     {
         addr = block * flash->sector_size;
 #if LOG_W25QXX_ENABLE
-        spinor_print("Norflash Erase Block@%lx ...\r\n", addr);
+        spinor_trace("Norflash Erase Block@%lx ...\r\n", addr);
 #endif
         spinor_WaitForWriteEnd(spi);
         spinor_write_enable(spi);
@@ -277,7 +283,7 @@ int spinor_erase_block(struct spinor_info *spinor, uint32_t address, uint32_t si
     }
 
 #if LOG_W25QXX_ENABLE
-    spinor_print(
+    spinor_trace(
         "Norflash EraseBlock@0x%lx done after %ld ms\r\n", address, HAL_GetTick() - StartTime);
     mdelay(100);
 #endif
@@ -311,7 +317,7 @@ int spinor_erase_sector(struct spinor_info *spinor, uint32_t address, uint32_t s
 
 #if LOG_W25QXX_ENABLE
     uint32_t StartTime = HAL_GetTick();
-    spinor_print("Norflash Erase %ld Bytes Sector@0x%lx Begin...\r\n", size, address);
+    spinor_trace("Norflash Erase %ld Bytes Sector@0x%lx Begin...\r\n", size, address);
 #endif
 
     /* start erase all the sectors */
@@ -319,7 +325,7 @@ int spinor_erase_sector(struct spinor_info *spinor, uint32_t address, uint32_t s
     {
         addr = sector * flash->sector_size;
 #if LOG_W25QXX_ENABLE
-        spinor_print("Norflash Erase Sector@%lx ...\r\n", addr);
+        spinor_trace("Norflash Erase Sector@%lx ...\r\n", addr);
 #endif
 
         spinor_WaitForWriteEnd(spi);
@@ -344,7 +350,7 @@ int spinor_erase_sector(struct spinor_info *spinor, uint32_t address, uint32_t s
     }
 
 #if LOG_W25QXX_ENABLE
-    spinor_print(
+    spinor_trace(
         "Norflash EraseSector@0x%lx done after %ld ms\r\n", address, HAL_GetTick() - StartTime);
 #endif
 
@@ -373,7 +379,7 @@ int spinor_write(struct spinor_info *spinor, uint32_t address, uint8_t *data, ui
 
 #if LOG_W25QXX_ENABLE
     uint32_t StartTime = HAL_GetTick();
-    spinor_print("Norflash Write %ld Bytes to addr@0x%lx Begin...\r\n", bytes, address);
+    spinor_trace("Norflash Write %ld Bytes to addr@0x%lx Begin...\r\n", bytes, address);
 #endif
 
     /* address in page and offset in buffer */
@@ -386,7 +392,7 @@ int spinor_write(struct spinor_info *spinor, uint32_t address, uint8_t *data, ui
         len = flash->page_size - (addr % flash->page_size);
         len = len > bytes ? bytes : len;
 #if LOG_W25QXX_ENABLE
-        spinor_print("Norflash write addr@0x%lx, %lu bytes\r\n", addr, len);
+        spinor_trace("Norflash write addr@0x%lx, %lu bytes\r\n", addr, len);
 #endif
 
         spinor_WaitForWriteEnd(spi);
@@ -418,7 +424,7 @@ int spinor_write(struct spinor_info *spinor, uint32_t address, uint8_t *data, ui
     }
 
 #if LOG_W25QXX_ENABLE
-    spinor_print(
+    spinor_trace(
         "Norflash WriteByte@0x%lx done after %ld ms\r\n", address, HAL_GetTick() - StartTime);
 #endif
 
@@ -444,7 +450,7 @@ int spinor_read(struct spinor_info *spinor, uint32_t address, uint8_t *buf, uint
 
 #if LOG_W25QXX_ENABLE
     uint32_t StartTime = HAL_GetTick();
-    spinor_print("Norflash Read %ld Bytes from addr@0x%lx Begin...\r\n", bytes, address);
+    spinor_trace("Norflash Read %ld Bytes from addr@0x%lx Begin...\r\n", bytes, address);
 #endif
 
     spi->select(spi);
@@ -470,7 +476,7 @@ int spinor_read(struct spinor_info *spinor, uint32_t address, uint8_t *buf, uint
     spi->deselect(spi);
 
 #if LOG_W25QXX_ENABLE
-    spinor_print(
+    spinor_trace(
         "Norflash ReadBytes@0x%lx done after %ld ms\r\n", address, HAL_GetTick() - StartTime);
 #endif
     spinor->lock = 0;
@@ -500,9 +506,9 @@ int spinor_detect_by_jedec(struct spinor_info *spinor)
         }
     }
 
-    spinor_print("Detect JEDEC ID[0x%lx], Norflash %s found\r\n",
-                 jedec_id,
-                 found ? spinor->flash->name : "not");
+    spinor_log("Detect JEDEC ID[0x%lx], Norflash %s found\r\n",
+               jedec_id,
+               found ? spinor->flash->name : "not");
     return found;
 }
 

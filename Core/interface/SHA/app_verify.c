@@ -18,12 +18,16 @@ extern const struct lfs_file_config lfs_file_cfg;
 #define BL_INFO(fmt, ...) printf(BL_PREFIX fmt "\r\n", ##__VA_ARGS__)
 #define BL_ERR(fmt, ...)  printf(BL_PREFIX "ERROR: " fmt "\r\n", ##__VA_ARGS__)
 #define BL_WARN(fmt, ...) printf(BL_PREFIX "WARN: " fmt "\r\n", ##__VA_ARGS__)
-#define dbg_printf(...)   printf(__VA_ARGS__)
 #else
-#define BL_INFO(...)    ((void)0)
-#define BL_ERR(...)     ((void)0)
-#define BL_WARN(...)    ((void)0)
-#define dbg_printf(...) ((void)0)
+#define BL_INFO(...) ((void)0)
+#define BL_ERR(...)  ((void)0)
+#define BL_WARN(...) ((void)0)
+#endif
+
+#if LOG_APP_VERIFY_TRACE_ENABLE
+#define VERIFY_TRACE(...) printf(__VA_ARGS__)
+#else
+#define VERIFY_TRACE(...) ((void)0)
 #endif
 
 static int hex_char_to_value(char ch)
@@ -289,8 +293,8 @@ firmware_verify_status_t verify_firmware(const char *path)
         goto fail;
     }
 
-    BL_INFO("Version: %lu", hdr.version);
-    BL_INFO("Size   : %lu", hdr.size);
+    VERIFY_TRACE(BL_PREFIX "Version: %lu\r\n", hdr.version);
+    VERIFY_TRACE(BL_PREFIX "Size   : %lu\r\n", hdr.size);
 
     /* 3. 校验SHA256 */
     {
@@ -334,7 +338,7 @@ firmware_verify_status_t verify_firmware(const char *path)
         cmox_hash_generateTag((cmox_hash_handle_t *)&ctx, calc_hash, &hash_len);
         cmox_hash_cleanup((cmox_hash_handle_t *)&ctx);
 
-        BL_INFO("Hashed %lu bytes", (unsigned long)total);
+        VERIFY_TRACE(BL_PREFIX "Hashed %lu bytes\r\n", (unsigned long)total);
 
         if (memcmp(calc_hash, hdr.sha256, 32) != 0)
         {

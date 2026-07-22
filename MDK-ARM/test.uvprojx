@@ -341,7 +341,7 @@
               <MiscControls></MiscControls>
               <Define>USE_HAL_DRIVER,STM32L431xx,NDEBUG</Define>
               <Undefine></Undefine>
-              <IncludePath>../Core/Inc;../Drivers/STM32L4xx_HAL_Driver/Inc;../Drivers/STM32L4xx_HAL_Driver/Inc/Legacy;../Drivers/CMSIS/Device/ST/STM32L4xx/Include;../Drivers/CMSIS/Include;../Core/interface;../Core/interface/FLASH;../Core/interface/SPI;../Core/interface/UART;../Core/interface/Xmodem;../Core/interface/Littlefs;../Core/interface/ELF;../Core/interface/STATE_MACHINE;../Core/interface/STORAGE;../Core/interface/SHELL;../Core/interface/FS_CMD;../Core/interface/SHA/include;../Core/interface/SHA/include/ecc;../Core/interface/SHA/include/hash;../Core/interface/SHA/include/rsa;../Core/interface/SHA/include/utils;../Core/interface/SHA;../Core/interface/SHELL/shell_cmd;../Core/interface/BSP_WIFI;../Core/interface/ESP8266</IncludePath>
+              <IncludePath>../Core/Inc;../Drivers/STM32L4xx_HAL_Driver/Inc;../Drivers/STM32L4xx_HAL_Driver/Inc/Legacy;../Drivers/CMSIS/Device/ST/STM32L4xx/Include;../Drivers/CMSIS/Include;../Core/interface;../Core/interface/FLASH;../Core/interface/SPI;../Core/interface/UART;../Core/interface/Xmodem;../Core/interface/Littlefs;../Core/interface/ELF;../Core/interface/STATE_MACHINE;../Core/interface/STORAGE;../Core/interface/SHELL;../Core/interface/FS_CMD;../Core/interface/SHA/include;../Core/interface/SHA/include/ecc;../Core/interface/SHA/include/hash;../Core/interface/SHA/include/rsa;../Core/interface/SHA/include/utils;../Core/interface/SHA;../Core/interface/SHELL/shell_cmd;../Core/interface/BSP_WIFI;../Core/interface/ESP8266;..\Core\interface\MQTT</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -1151,6 +1151,96 @@
               <FileName>net_cfg.h</FileName>
               <FileType>5</FileType>
               <FilePath>..\Core\interface\ESP8266\net_cfg.h</FilePath>
+            </File>
+            <File>
+              <FileName>MQTTConnect.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Core\interface\MQTT\MQTTConnect.h</FilePath>
+            </File>
+            <File>
+              <FileName>MQTTConnectClient.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\interface\MQTT\MQTTConnectClient.c</FilePath>
+            </File>
+            <File>
+              <FileName>MQTTDeserializePublish.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\interface\MQTT\MQTTDeserializePublish.c</FilePath>
+            </File>
+            <File>
+              <FileName>MQTTFormat.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\interface\MQTT\MQTTFormat.c</FilePath>
+            </File>
+            <File>
+              <FileName>MQTTFormat.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Core\interface\MQTT\MQTTFormat.h</FilePath>
+            </File>
+            <File>
+              <FileName>MQTTPacket.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\interface\MQTT\MQTTPacket.c</FilePath>
+            </File>
+            <File>
+              <FileName>MQTTPacket.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Core\interface\MQTT\MQTTPacket.h</FilePath>
+            </File>
+            <File>
+              <FileName>MQTTPublish.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Core\interface\MQTT\MQTTPublish.h</FilePath>
+            </File>
+            <File>
+              <FileName>MQTTSerializePublish.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\interface\MQTT\MQTTSerializePublish.c</FilePath>
+            </File>
+            <File>
+              <FileName>MQTTSubscribe.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Core\interface\MQTT\MQTTSubscribe.h</FilePath>
+            </File>
+            <File>
+              <FileName>MQTTSubscribeClient.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\interface\MQTT\MQTTSubscribeClient.c</FilePath>
+            </File>
+            <File>
+              <FileName>MQTTUnsubscribe.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Core\interface\MQTT\MQTTUnsubscribe.h</FilePath>
+            </File>
+            <File>
+              <FileName>MQTTUnsubscribeClient.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\interface\MQTT\MQTTUnsubscribeClient.c</FilePath>
+            </File>
+            <File>
+              <FileName>StackTrace.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Core\interface\MQTT\StackTrace.h</FilePath>
+            </File>
+            <File>
+              <FileName>transport.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\interface\MQTT\transport.c</FilePath>
+            </File>
+            <File>
+              <FileName>transport.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Core\interface\MQTT\transport.h</FilePath>
+            </File>
+            <File>
+              <FileName>core_mqtt.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\interface\MQTT\core_mqtt.c</FilePath>
+            </File>
+            <File>
+              <FileName>core_mqtt.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Core\interface\MQTT\core_mqtt.h</FilePath>
             </File>
           </Files>
         </Group>

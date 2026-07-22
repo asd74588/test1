@@ -11,13 +11,17 @@
 
 #define ELF_PREFIX "[elf] "
 #if LOG_ELF_LOADER_ENABLE
-#define ELF_INFO(fmt, ...) printf(ELF_PREFIX fmt "\r\n", ##__VA_ARGS__)
 #define ELF_WARN(fmt, ...) printf(ELF_PREFIX "WARN: " fmt "\r\n", ##__VA_ARGS__)
 #define ELF_ERR(fmt, ...)  printf(ELF_PREFIX "ERROR: " fmt "\r\n", ##__VA_ARGS__)
 #else
-#define ELF_INFO(...) ((void)0)
 #define ELF_WARN(...) ((void)0)
 #define ELF_ERR(...)  ((void)0)
+#endif
+
+#if LOG_ELF_LOADER_TRACE_ENABLE
+#define ELF_INFO(fmt, ...) printf(ELF_PREFIX fmt "\r\n", ##__VA_ARGS__)
+#else
+#define ELF_INFO(...) ((void)0)
 #endif
 
 #define MIN_U32(a, b) ((a) < (b) ? (a) : (b))
@@ -652,13 +656,13 @@ static int relocate_from_tables(elf_ctx_t *ctx,
                     else if (pending[rd].valid != 0U && pending[rd].symbol == symbol)
                     {
                         result            = relocate_mov_pair(ctx,
-                                                              &pending[rd],
-                                                              file_offset,
-                                                              upper,
-                                                              lower,
-                                                              runtime_base,
-                                                              image_size,
-                                                              offset);
+                                                   &pending[rd],
+                                                   file_offset,
+                                                   upper,
+                                                   lower,
+                                                   runtime_base,
+                                                   image_size,
+                                                   offset);
                         pending[rd].valid = 0U;
                         if (result < 0)
                         {
@@ -866,13 +870,13 @@ static int relocate_mov_pairs_by_scan(elf_ctx_t        *ctx,
                      half_index - pending[rd].half_index <= 256U)
             {
                 int result        = relocate_mov_pair(ctx,
-                                                      &pending[rd],
-                                                      section->sh_offset + half_index * 2U,
-                                                      upper,
-                                                      lower,
-                                                      runtime_base,
-                                                      image_size,
-                                                      offset);
+                                               &pending[rd],
+                                               section->sh_offset + half_index * 2U,
+                                               upper,
+                                               lower,
+                                               runtime_base,
+                                               image_size,
+                                               offset);
                 pending[rd].valid = 0U;
                 if (result < 0)
                 {
@@ -950,8 +954,8 @@ static int relocate_by_scan(elf_ctx_t *ctx,
                 uint32_t value        = read_u32(ctx->buf + file_offset);
                 uint32_t word_address = section->sh_addr + word_index * 4U;
                 int      in_vectors   = section->sh_addr == ctx->link_base && word_index != 0U &&
-                                        word_address <= entry_address;
-                int      in_literal_pool =
+                                 word_address <= entry_address;
+                int in_literal_pool =
                     (scratch[word_index / 8U] & (uint8_t)(1U << (word_index % 8U))) != 0U;
                 int result;
 

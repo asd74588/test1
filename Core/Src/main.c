@@ -35,6 +35,9 @@
 #include "cmox_crypto.h"
 #include "log_config.h"
 #include "thingsboard_ota.h"
+#include "esp8266.h"
+#include "net_cfg.h"
+#include "core_mqtt.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -51,9 +54,15 @@
 /* USER CODE BEGIN PM */
 
 #if LOG_MAIN_ENABLE
-#define dbg_printf(...) printf(__VA_ARGS__)
+#define main_log(...) printf(__VA_ARGS__)
 #else
-#define dbg_printf(...) ((void)0)
+#define main_log(...) ((void)0)
+#endif
+
+#if LOG_MAIN_TRACE_ENABLE
+#define main_trace(...) printf(__VA_ARGS__)
+#else
+#define main_trace(...) ((void)0)
 #endif
 
 /* USER CODE END PM */
@@ -67,19 +76,24 @@
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-static uint8_t storage_mount(lfs_ctx_t *fs);
+#if ESP8266_MQTT_BACKEND_AT_ENABLE
+static uint8_t spinor_lfs_mount(lfs_ctx_t *fs);
+#else
+static void    wifi_mqtt_smoke_test(void);
+#endif
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
+lfs_ctx_t lfs_ctx;
+
+#if ESP8266_MQTT_BACKEND_AT_ENABLE
 extern const struct lfs_config my_lfs_config;
 extern spinor_info_t           spinor;
 
-lfs_ctx_t lfs_ctx;
-
-static uint8_t storage_mount(lfs_ctx_t *fs)
+static uint8_t spinor_lfs_mount(lfs_ctx_t *fs)
 {
     if (fs == NULL)
     {
@@ -92,13 +106,13 @@ static uint8_t storage_mount(lfs_ctx_t *fs)
     }
 
     int mount_err = lfs_mount(&fs->lfs, &my_lfs_config);
-    dbg_printf("lfs_mount: %d\r\n", mount_err);
+    main_trace("lfs_mount: %d\r\n", mount_err);
 
     if (mount_err)
     {
         lfs_format(&fs->lfs, &my_lfs_config);
         mount_err = lfs_mount(&fs->lfs, &my_lfs_config);
-        dbg_printf("LittleFS formatted and mounted,err: %d\r\n", mount_err);
+        main_log("LittleFS formatted and mounted, err: %d\r\n", mount_err);
     }
 
     if (mount_err != 0)
@@ -111,6 +125,117 @@ static uint8_t storage_mount(lfs_ctx_t *fs)
 
     return 0;
 }
+#else
+static void wifi_mqtt_smoke_test(void)
+{
+    const net_cfg_t *cfg;
+    static char      ip[32];
+    static char      gateway[32];
+    static char      client_id[64];
+    static char      telemetry[96];
+    int              rv;
+
+    cfg = net_cfg_get();
+    if (net_cfg_is_valid(cfg) == 0)
+    {
+        main_log("WiFi MQTT test: network config invalid\r\n");
+        return;
+    }
+
+    if (esp8266_module_init() != 0)
+    {
+        main_log("WiFi MQTT test: ESP8266 init failed\r\n");
+        return;
+    }
+
+    if (esp8266_scan_ap((char *)cfg->wifi_ssid) != 0)
+    {
+        main_log("WiFi MQTT test: AP [%s] not found\r\n", cfg->wifi_ssid);
+        return;
+    }
+
+    if (esp8266_join_network((char *)cfg->wifi_ssid, (char *)cfg->wifi_password) != 0)
+    {
+        main_log("WiFi MQTT test: join AP failed\r\n");
+        return;
+    }
+
+    if (esp8266_get_ipaddr(ip, gateway, (int)sizeof(ip)) != 0)
+    {
+        main_log("WiFi MQTT test: get IP failed\r\n");
+        goto ExitWiFi;
+    }
+
+    main_log("WiFi MQTT test: ip=%s gateway=%s\r\n", ip, gateway);
+
+    if (esp8266_ping_test((char *)cfg->mqtt_host) != 0)
+    {
+        main_log("WiFi MQTT test: ping host [%s] failed\r\n", cfg->mqtt_host);
+        goto ExitWiFi;
+    }
+
+    memset(client_id, 0, sizeof(client_id));
+    snprintf(client_id,
+             sizeof(client_id),
+             "stm32_ota_%08lX%08lX%08lX_%lu",
+             (unsigned long)HAL_GetUIDw0(),
+             (unsigned long)HAL_GetUIDw1(),
+             (unsigned long)HAL_GetUIDw2(),
+             (unsigned long)HAL_GetTick());
+
+    rv = mqtt_connect(
+        (char *)cfg->mqtt_host, (int)cfg->mqtt_port, client_id, (char *)cfg->access_token, "");
+    if (rv != 0)
+    {
+        main_log("WiFi MQTT test: mqtt_connect [%s:%u] failed, rv=%d\r\n",
+                 cfg->mqtt_host,
+                 (unsigned int)cfg->mqtt_port,
+                 rv);
+        goto ExitWiFi;
+    }
+
+    main_log("WiFi MQTT test: mqtt_connect [%s:%u] ok\r\n",
+             cfg->mqtt_host,
+             (unsigned int)cfg->mqtt_port);
+
+    rv = mqtt_subscribe_topic("v1/devices/me/attributes", Qos0, 1);
+    if (rv != 0)
+    {
+        main_log("WiFi MQTT test: subscribe attributes failed, rv=%d\r\n", rv);
+        goto ExitMqtt;
+    }
+
+    main_log("WiFi MQTT test: subscribe attributes ok\r\n");
+
+    memset(telemetry, 0, sizeof(telemetry));
+    snprintf(
+        telemetry, sizeof(telemetry), "{\"fw_test\":1,\"tick\":%lu}", (unsigned long)HAL_GetTick());
+
+    rv = mqtt_publish("v1/devices/me/telemetry", Qos0, telemetry);
+    if (rv != 0)
+    {
+        main_log("WiFi MQTT test: publish telemetry failed, rv=%d\r\n", rv);
+        goto ExitMqtt;
+    }
+
+    main_log("WiFi MQTT test: publish telemetry ok\r\n");
+
+    rv = mqtt_pingreq();
+    if (rv != 0)
+    {
+        main_log("WiFi MQTT test: pingreq failed, rv=%d\r\n", rv);
+        goto ExitMqtt;
+    }
+
+    main_log("WiFi MQTT test: pingreq sent\r\n");
+
+ExitMqtt:
+    mqtt_disconnect();
+
+ExitWiFi:
+    esp8266_wifi_disconnect();
+}
+#endif
 /* USER CODE END 0 */
 
 /**
@@ -150,22 +275,28 @@ int main(void)
 
     EE_Init();
     cmox_initialize(NULL);
+
+#if ESP8266_MQTT_BACKEND_AT_ENABLE
     {
         ota_ctx_t      ctx;
         transfer_cfg_t transfer_cfg;
 
         memset(&lfs_ctx, 0, sizeof(lfs_ctx_t));
-        thingsboard_ota_context_init(&ctx, &transfer_cfg, &lfs_ctx);
+        thingsboard_ota_bind_transport(&ctx, &transfer_cfg, &lfs_ctx);
 
-        if (storage_mount(&lfs_ctx) != 0U)
+        if (spinor_lfs_mount(&lfs_ctx) != 0U)
         {
-            dbg_printf("LittleFS mount failed\r\n");
+            main_log("LittleFS mount failed\r\n");
             Error_Handler();
         }
 
-        dbg_printf("Starting ThingsBoard OTA state machine...\r\n");
+        main_log("Starting ThingsBoard OTA state machine...\r\n");
         ota_run(&ctx);
     }
+#else
+    main_log("Starting WiFi MQTT smoke test...\r\n");
+    wifi_mqtt_smoke_test();
+#endif
     /* USER CODE END 2 */
 
     /* Infinite loop */

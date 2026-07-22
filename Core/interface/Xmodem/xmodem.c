@@ -18,10 +18,18 @@
 #include <stdio.h>
 
 #if LOG_XMODEM_ENABLE
-#define dbg_printf(...) printf(__VA_ARGS__)
+#define xmodem_log(...) printf(__VA_ARGS__)
 #else
-#define dbg_printf(...) ((void)0)
+#define xmodem_log(...) ((void)0)
 #endif
+
+#if LOG_XMODEM_TRACE_ENABLE
+#define xmodem_trace(...) printf(__VA_ARGS__)
+#else
+#define xmodem_trace(...) ((void)0)
+#endif
+
+#define dbg_printf(...) xmodem_log(__VA_ARGS__)
 
 /* ============================================================
  *  常量
@@ -406,11 +414,11 @@ static int ymodem_process_header_pkt(TransferCtx *ctx)
  */
 static int write_to_storage(transfer_cfg_t *transfer_cfg, const uint8_t *data, size_t len)
 {
-    dbg_printf("write_to_storage\r\n");
+    xmodem_trace("write_to_storage\r\n");
     if (!transfer_cfg->write_cb)
         return 0;
 
-    dbg_printf("write_to_storage\r\n");
+    xmodem_trace("write_to_storage\r\n");
     if (transfer_cfg->write_cb((const void *)data, len, transfer_cfg->write_user_ctx) != 0)
     {
         send_cancel();
@@ -427,11 +435,11 @@ static int write_to_storage(transfer_cfg_t *transfer_cfg, const uint8_t *data, s
  */
 static int flush_prev_buf(TransferCtx *ctx)
 {
-    dbg_printf("flush_prev_buf\r\n");
+    xmodem_trace("flush_prev_buf\r\n");
     if (!ctx->has_prev)
         return 0;
 
-    dbg_printf("flush_prev_buf\r\n");
+    xmodem_trace("flush_prev_buf\r\n");
     if (write_to_storage(ctx->transfer_cfg, ctx->prev_buf, (size_t)ctx->prev_len) < 0)
         return -1;
     ctx->total_recv += ctx->prev_len;

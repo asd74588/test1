@@ -8,9 +8,22 @@
 #define WIFI_RX_BUF_SIZE    1024U
 #define WIFI_REPLY_BUF_SIZE 512U
 
+/*
+ * MQTT backend switch:
+ *   1 = use ESP-AT built-in MQTT commands
+ *   0 = disable ESP-AT MQTT path, keep only WiFi + TCP socket capability
+ *
+ * When set to 0, upper-layer MQTT should be implemented on MCU side
+ * with a dedicated MQTT library over esp8266_sock_connect/send/recv.
+ */
+#ifndef ESP8266_MQTT_BACKEND_AT_ENABLE
+#define ESP8266_MQTT_BACKEND_AT_ENABLE 0
+#endif
+
 extern char         g_wifi_rxbuf[WIFI_REPLY_BUF_SIZE];
 extern volatile int g_wifi_rxbytes;
 
+#if ESP8266_MQTT_BACKEND_AT_ENABLE
 typedef struct
 {
     uint8_t  valid;
@@ -20,6 +33,7 @@ typedef struct
     char     checksum_algorithm[16];
     char     checksum[80];
 } esp8266_tb_firmware_info_t;
+#endif
 
 /* 清除WiFi模块接收buffer里的数据内容宏，用宏不用函数是因为函数调用需要额外时间开销 */
 #define clear_atcmd_buf()                                                                          \
@@ -70,6 +84,7 @@ extern int esp8266_sock_send(unsigned char *data, int bytes);
 /* ESP8266 WiFi通过TCP Socket接收数据函数。返回值为0无数据，>0 表示接收到数据字节数 */
 extern int esp8266_sock_recv(unsigned char *buf, int size);
 
+#if ESP8266_MQTT_BACKEND_AT_ENABLE
 /* ESP-AT MQTT连接函数。access_token 用作 ThingsBoard MQTT username */
 extern int esp8266_mqtt_connect(char *host, int port, char *access_token);
 
@@ -93,5 +108,6 @@ extern int esp8266_thingsboard_subscribe_firmware_chunks(void);
 /* ThingsBoard OTA：请求单个固件chunk到调用方buffer */
 extern int esp8266_thingsboard_request_firmware_chunk(
     uint32_t chunk_index, uint32_t chunk_size, uint8_t *buf, uint16_t buf_size, uint16_t *out_len);
+#endif
 
 #endif /* INC_ESP8266_H_ */

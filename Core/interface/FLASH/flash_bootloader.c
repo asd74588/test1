@@ -34,6 +34,12 @@
 #define BL_WARN(...) ((void)0)
 #endif
 
+#if LOG_BOOTLOADER_TRACE_ENABLE
+#define BL_TRACE(fmt, ...) printf(BL_PREFIX fmt "\r\n", ##__VA_ARGS__)
+#else
+#define BL_TRACE(...) ((void)0)
+#endif
+
 /* ===================================================================
  * Internal RAM buffers
  *
@@ -354,13 +360,13 @@ int Jump_To_App_Flash(void *resource_ctx, uint32_t appaddr)
         {
             lfs_file_close(&lfs_ctx_ptr->lfs, &lfs_ctx_ptr->file);
             lfs_ctx_ptr->file_open = 0U;
-            BL_INFO("  LittleFS file closed");
+            BL_TRACE("  LittleFS file closed");
         }
         if (lfs_ctx_ptr->mounted)
         {
             lfs_unmount(&lfs_ctx_ptr->lfs);
             lfs_ctx_ptr->mounted = 0U;
-            BL_INFO("  LittleFS unmounted");
+            BL_TRACE("  LittleFS unmounted");
         }
     }
 
@@ -433,7 +439,7 @@ static int read_elf_from_lfs(const char *path, uint8_t *buf, uint32_t buf_size, 
     }
     *out_size = 0U;
 
-    BL_INFO("opening \"%s\" from LittleFS...", path);
+    BL_TRACE("opening \"%s\" from LittleFS...", path);
 
     if (lfs_ctx.file_open == 0U)
     {
@@ -448,7 +454,7 @@ static int read_elf_from_lfs(const char *path, uint8_t *buf, uint32_t buf_size, 
 
     /* 文件总大小 */
     lfs_soff_t fsize = lfs_file_size(&lfs_ctx.lfs, &lfs_ctx.file);
-    BL_INFO("file size = %d bytes", (int)fsize);
+    BL_TRACE("file size = %d bytes", (int)fsize);
 
     if (fsize < (lfs_soff_t)sizeof(Firmware_Header_t))
     {
@@ -488,7 +494,7 @@ static int read_elf_from_lfs(const char *path, uint8_t *buf, uint32_t buf_size, 
     }
 
     uint32_t payload_size = hdr.size;
-    BL_INFO("payload size from header = %lu bytes", (unsigned long)payload_size);
+    BL_TRACE("payload size from header = %lu bytes", (unsigned long)payload_size);
 
     if (payload_size > buf_size)
     {
@@ -498,7 +504,7 @@ static int read_elf_from_lfs(const char *path, uint8_t *buf, uint32_t buf_size, 
         return -1;
     }
 
-    BL_INFO("reading complete ELF to internal RAM 0x%08X...", (uint32_t)(uintptr_t)buf);
+    BL_TRACE("reading complete ELF to internal RAM 0x%08X...", (uint32_t)(uintptr_t)buf);
 
     while (total_read < payload_size)
     {
@@ -523,7 +529,7 @@ static int read_elf_from_lfs(const char *path, uint8_t *buf, uint32_t buf_size, 
     }
 
     *out_size = total_read;
-    BL_INFO("read OK: %u bytes", *out_size);
+    BL_TRACE("read OK: %u bytes", *out_size);
     return 0;
 }
 
@@ -639,12 +645,12 @@ static int write_sections_to_flash(elf_ctx_t *ctx, uint8_t slot)
             return -1;
         }
 
-        BL_INFO("  \"%s\" [%s]: file+0x%05x  %u bytes  -> flash 0x%08x",
-                name,
-                is_ram ? "RAM→LMA" : "Flash",
-                shdr->sh_offset,
-                shdr->sh_size,
-                dst);
+        BL_TRACE("  \"%s\" [%s]: file+0x%05x  %u bytes  -> flash 0x%08x",
+                 name,
+                 is_ram ? "RAM→LMA" : "Flash",
+                 shdr->sh_offset,
+                 shdr->sh_size,
+                 dst);
 
         /* 写入 Flash */
         uint8_t *src        = elf_buf + shdr->sh_offset;
@@ -698,24 +704,24 @@ static int write_sections_to_flash(elf_ctx_t *ctx, uint8_t slot)
  */
 bootloader_load_status_t bootloader_load_target(uint8_t target_slot, const char *path)
 {
-    BL_INFO("elf_buf actual address: 0x%08x", (uint32_t)(uintptr_t)elf_buf);
+    BL_TRACE("elf_buf actual address: 0x%08x", (uint32_t)(uintptr_t)elf_buf);
     /* ---- 打印上次复位原因，便于定位 APP 是否触发了复位 ---- */
     if (__HAL_RCC_GET_FLAG(RCC_FLAG_IWDGRST))
-        BL_INFO("Reset cause: IWDG");
+        BL_TRACE("Reset cause: IWDG");
     if (__HAL_RCC_GET_FLAG(RCC_FLAG_WWDGRST))
-        BL_INFO("Reset cause: WWDG");
+        BL_TRACE("Reset cause: WWDG");
     if (__HAL_RCC_GET_FLAG(RCC_FLAG_LPWRRST))
-        BL_INFO("Reset cause: LowPower");
+        BL_TRACE("Reset cause: LowPower");
     if (__HAL_RCC_GET_FLAG(RCC_FLAG_BORRST))
-        BL_INFO("Reset cause: BOR");
+        BL_TRACE("Reset cause: BOR");
     if (__HAL_RCC_GET_FLAG(RCC_FLAG_PINRST))
-        BL_INFO("Reset cause: PIN/PWR");
+        BL_TRACE("Reset cause: PIN/PWR");
 #ifdef RCC_FLAG_PORRST
     if (__HAL_RCC_GET_FLAG(RCC_FLAG_PORRST))
-        BL_INFO("Reset cause: POR");
+        BL_TRACE("Reset cause: POR");
 #endif
     if (__HAL_RCC_GET_FLAG(RCC_FLAG_SFTRST))
-        BL_INFO("Reset cause: Software");
+        BL_TRACE("Reset cause: Software");
     __HAL_RCC_CLEAR_RESET_FLAGS();
     int       ret;
     uint32_t  elf_size = 0U;
@@ -740,19 +746,19 @@ bootloader_load_status_t bootloader_load_target(uint8_t target_slot, const char 
     uint32_t app_start = (target_slot == SLOT_B) ? APP_B_START_ADDR : APP_A_START_ADDR;
     uint32_t app_size  = (target_slot == SLOT_B) ? APP_B_SIZE : APP_A_SIZE;
 
-    BL_INFO("=========================================");
-    BL_INFO("  STM32L431 Bootloader");
-    BL_INFO("  target slot  : %s", target_slot == SLOT_B ? "B" : "A");
-    BL_INFO("  App Flash    : 0x%08x ~ 0x%08x (%uKB)",
-            app_start,
-            app_start + ((target_slot == SLOT_B) ? APP_B_SIZE : APP_A_SIZE) - 1U,
-            ((target_slot == SLOT_B) ? APP_B_SIZE : APP_A_SIZE) / 1024U);
-    BL_INFO("  RAM buffers (linker managed):");
-    BL_INFO("    ELF buffer : 0x%08x  %uKB", (uint32_t)(uintptr_t)elf_buf, ELF_BUF_SIZE / 1024U);
-    BL_INFO("    ELF scratch: 0x%08x  %u bytes",
-            (uint32_t)(uintptr_t)elf_reloc_scratch,
-            ELF_RELOC_SCRATCH_SIZE);
-    BL_INFO("=========================================");
+    BL_TRACE("=========================================");
+    BL_TRACE("  STM32L431 Bootloader");
+    BL_TRACE("  target slot  : %s", target_slot == SLOT_B ? "B" : "A");
+    BL_TRACE("  App Flash    : 0x%08x ~ 0x%08x (%uKB)",
+             app_start,
+             app_start + ((target_slot == SLOT_B) ? APP_B_SIZE : APP_A_SIZE) - 1U,
+             ((target_slot == SLOT_B) ? APP_B_SIZE : APP_A_SIZE) / 1024U);
+    BL_TRACE("  RAM buffers (linker managed):");
+    BL_TRACE("    ELF buffer : 0x%08x  %uKB", (uint32_t)(uintptr_t)elf_buf, ELF_BUF_SIZE / 1024U);
+    BL_TRACE("    ELF scratch: 0x%08x  %u bytes",
+             (uint32_t)(uintptr_t)elf_reloc_scratch,
+             ELF_RELOC_SCRATCH_SIZE);
+    BL_TRACE("=========================================");
 
     /* ---- Step 1: 从 LittleFS 读 ELF ---- */
     BL_INFO("[1/5] reading ELF \"%s\" from LittleFS...", path);

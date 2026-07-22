@@ -12,12 +12,19 @@
 #include "log_config.h"
 #include "net_cfg.h"
 
+#if ESP8266_MQTT_BACKEND_AT_ENABLE
 extern const struct lfs_file_config lfs_file_cfg;
 
 #if LOG_WIFI_ENABLE
 #define tb_ota_log(...) printf(__VA_ARGS__)
 #else
 #define tb_ota_log(...) ((void)0)
+#endif
+
+#if LOG_WIFI_TRACE_ENABLE
+#define tb_ota_trace(...) printf(__VA_ARGS__)
+#else
+#define tb_ota_trace(...) ((void)0)
 #endif
 
 static void thingsboard_build_download_path(const esp8266_tb_firmware_info_t *fw_info,
@@ -215,9 +222,9 @@ static int thingsboard_firmware_download_to_lfs(lfs_ctx_t                       
     }
     fs->file_open = 1U;
 
-    tb_ota_log("ThingsBoard firmware download start: %lu bytes -> %s\r\n",
-               (unsigned long)fw_info->size,
-               path);
+    tb_ota_trace("ThingsBoard firmware download start: %lu bytes -> %s\r\n",
+                 (unsigned long)fw_info->size,
+                 path);
 
     if (esp8266_thingsboard_subscribe_firmware_chunks() != 0)
     {
@@ -270,9 +277,9 @@ static int thingsboard_firmware_download_to_lfs(lfs_ctx_t                       
         }
 
         total_written += chunk_len;
-        tb_ota_log("ThingsBoard firmware download progress: %lu/%lu bytes\r\n",
-                   (unsigned long)total_written,
-                   (unsigned long)fw_info->size);
+        tb_ota_trace("ThingsBoard firmware download progress: %lu/%lu bytes\r\n",
+                     (unsigned long)total_written,
+                     (unsigned long)fw_info->size);
         chunk_index++;
     }
 
@@ -361,17 +368,17 @@ static int thingsboard_firmware_verify_download(lfs_ctx_t                       
         return -2;
     }
 
-    tb_ota_log("ThingsBoard firmware checksum verify begin\r\n");
+    tb_ota_trace("ThingsBoard firmware checksum verify begin\r\n");
     memset(calc_checksum, 0, sizeof(calc_checksum));
     verify_ret = verify_lfs_file_sha256(
         fs, path, fw_info->checksum, fw_info->size, calc_checksum, sizeof(calc_checksum));
     if (verify_ret != FIRMWARE_VERIFY_OK)
     {
         tb_ota_log("ThingsBoard firmware checksum verify failed: %d\r\n", verify_ret);
-        tb_ota_log("expected=%s\r\n", fw_info->checksum);
+        tb_ota_trace("expected=%s\r\n", fw_info->checksum);
         if (calc_checksum[0] != '\0')
         {
-            tb_ota_log("actual  =%s\r\n", calc_checksum);
+            tb_ota_trace("actual  =%s\r\n", calc_checksum);
         }
         return -3;
     }
@@ -415,7 +422,7 @@ static int thingsboard_wifi_prepare(const net_cfg_t *cfg, char *ip, char *gatewa
         goto fail_after_join;
     }
 
-    tb_ota_log("ip=%s gateway=%s\r\n", ip, gateway);
+    tb_ota_trace("ip=%s gateway=%s\r\n", ip, gateway);
 
     if (esp8266_ping_test(gateway) != 0)
     {
@@ -462,7 +469,7 @@ static int thingsboard_mqtt_prepare(const net_cfg_t *cfg, esp8266_tb_firmware_in
     }
 
     sent = esp8266_thingsboard_publish_telemetry(telemetry, (int)(sizeof(telemetry) - 1U));
-    tb_ota_log("ThingsBoard telemetry sent %d bytes\r\n", sent);
+    tb_ota_trace("ThingsBoard telemetry sent %d bytes\r\n", sent);
     if (sent <= 0)
     {
         esp8266_mqtt_disconnect();
@@ -605,11 +612,11 @@ cleanup:
         esp8266_wifi_disconnect();
     }
 
-    tb_ota_log("ThingsBoard OTA receive exit ret=%d\r\n", ret);
+    tb_ota_trace("ThingsBoard OTA receive exit ret=%d\r\n", ret);
     return ret;
 }
 
-void thingsboard_ota_context_init(ota_ctx_t *ctx, transfer_cfg_t *transfer_cfg, lfs_ctx_t *fs)
+void thingsboard_ota_bind_transport(ota_ctx_t *ctx, transfer_cfg_t *transfer_cfg, lfs_ctx_t *fs)
 {
     memset(transfer_cfg, 0, sizeof(*transfer_cfg));
     memset(ctx, 0, sizeof(*ctx));
@@ -622,3 +629,4 @@ void thingsboard_ota_context_init(ota_ctx_t *ctx, transfer_cfg_t *transfer_cfg, 
     ctx->transfer_cfg = transfer_cfg;
     ctx->resource_ctx = fs;
 }
+#endif

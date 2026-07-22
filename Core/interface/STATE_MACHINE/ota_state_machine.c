@@ -22,11 +22,18 @@
 #include "log_config.h"
 #include "cmds.h"
 
-#if LOG_OTA_STATE_MACHINE_ENABLE
 #include <stdio.h>
-#define dbg_printf(...) printf(__VA_ARGS__)
+
+#if LOG_OTA_STATE_MACHINE_ENABLE
+#define ota_log(...) printf(__VA_ARGS__)
 #else
-#define dbg_printf(...) ((void)0)
+#define ota_log(...) ((void)0)
+#endif
+
+#if LOG_OTA_STATE_MACHINE_TRACE_ENABLE
+#define ota_trace(...) printf(__VA_ARGS__)
+#else
+#define ota_trace(...) ((void)0)
 #endif
 
 #define OTA_MAX_PROTOCOL_PADDING 1023U
@@ -104,7 +111,7 @@ static void ota_dispatch(ota_ctx_t *ctx)
         if (!s_ota_table[i].guard_fn(ctx))
         {
             /* guard未通过：重置为BOOT兜底，避免永久困死 */
-            dbg_printf("[FSM] guard failed for state %u, fallback to BOOT\r\n", ctx->state);
+            ota_log("[FSM] guard failed for state %u, fallback to BOOT\r\n", ctx->state);
             fsm_transition(ctx, OTA_STATE_BOOT);
             return;
         }
@@ -117,7 +124,7 @@ static void ota_dispatch(ota_ctx_t *ctx)
     }
 
     /* 未命中任何表项（异常枚举值）：重置 */
-    dbg_printf("[FSM] unknown state %u, reset to BOOT\r\n", ctx->state);
+    ota_log("[FSM] unknown state %u, reset to BOOT\r\n", ctx->state);
     fsm_transition(ctx, OTA_STATE_BOOT);
 }
 
@@ -131,7 +138,7 @@ static void ota_dispatch(ota_ctx_t *ctx)
  */
 static void fsm_transition(ota_ctx_t *ctx, ota_state_t next)
 {
-    dbg_printf("[FSM] %u -> %u\r\n", ctx->state, next);
+    ota_log("[FSM] %u -> %u\r\n", ctx->state, next);
     ctx->state = next;
     Write_Flag(EE_VAR_OTA_STATE, (uint32_t)next);
 }
@@ -144,13 +151,13 @@ static int commit_verified_target(ota_ctx_t *ctx)
 {
     if (Write_Flag(EE_VAR_OTA_STATE, OTA_STATE_BOOT) != HAL_OK)
     {
-        dbg_printf("[VERIFYING] failed to persist BOOT state\r\n");
+        ota_log("[VERIFYING] failed to persist BOOT state\r\n");
         return -1;
     }
 
     if (Write_Flag(EE_VAR_ACTIVE_SLOT, ctx->target_slot) != HAL_OK)
     {
-        dbg_printf("[VERIFYING] failed to persist active slot\r\n");
+        ota_log("[VERIFYING] failed to persist active slot\r\n");
         return -1;
     }
 
@@ -300,7 +307,7 @@ static void fsm_ctx_init(ota_ctx_t *ctx)
     Write_Flag(EE_VAR_ACTIVE_SLOT, SLOT_A);
     Write_Flag(EE_VAR_TARGET_SLOT, SLOT_B);
     Write_Flag(EE_VAR_OTA_STATE, OTA_STATE_UPGRADING);
-    dbg_printf("[TEST] forced into UPGRADING mode\r\n");
+    ota_log("[TEST] forced into UPGRADING mode\r\n");
     return;
 #else
     ctx->state       = (ota_state_t)Read_Flag(EE_VAR_OTA_STATE);
@@ -389,8 +396,7 @@ static ota_state_t handle_boot(ota_ctx_t *ctx)
     if (Verify_APP_Integrity_Flash(app_addr) == 0)
     {
         /* 活跃分区无效：预检另一分区，写原因，转REVERT */
-        dbg_printf("[BOOT] active slot %s invalid, entering revert\r\n",
-                   SLOT_NAME(ctx->active_slot));
+        ota_log("[BOOT] active slot %s invalid, entering revert\r\n", SLOT_NAME(ctx->active_slot));
         other_slot = OPPOSITE_SLOT(ctx->active_slot);
         other_addr = (other_slot == SLOT_B) ? APP_B_START_ADDR : APP_A_START_ADDR;
         reason     = (Verify_APP_Integrity_Flash(other_addr) != 0) ? REVERT_OTHER_VALID
@@ -403,15 +409,15 @@ static ota_state_t handle_boot(ota_ctx_t *ctx)
     if (ctx->skip_boot_window_once != 0U)
     {
         ctx->skip_boot_window_once = 0U;
-        dbg_printf("[BOOT] skip upgrade window once, jumping to slot %s @ 0x%08lX\r\n",
-                   SLOT_NAME(ctx->active_slot),
-                   app_addr);
+        ota_log("[BOOT] skip upgrade window once, jumping to slot %s @ 0x%08lX\r\n",
+                SLOT_NAME(ctx->active_slot),
+                app_addr);
         Jump_To_App_Flash(ctx->resource_ctx, app_addr);
         return OTA_STATE_SAME;
     }
 
     /* 3秒升级等待窗口 */
-    dbg_printf("[BOOT] press 'U' within 3s to upgrade...\r\n");
+    ota_log("[BOOT] press 'U' within 3s to upgrade...\r\n");
     rx_byte    = 0U;
     start_tick = HAL_GetTick();
 
@@ -421,7 +427,7 @@ static ota_state_t handle_boot(ota_ctx_t *ctx)
         {
             if (rx_byte == 'U' || rx_byte == 'u')
             {
-                dbg_printf("[BOOT] upgrade triggered\r\n");
+                ota_log("[BOOT] upgrade triggered\r\n");
                 ctx->target_slot = OPPOSITE_SLOT(ctx->active_slot);
                 Write_Flag(EE_VAR_TARGET_SLOT, ctx->target_slot);
                 return OTA_STATE_UPGRADING;
@@ -430,7 +436,7 @@ static ota_state_t handle_boot(ota_ctx_t *ctx)
     }
 
     /* 超时：直接跳转APP，不再返回 */
-    dbg_printf(
+    ota_log(
         "[BOOT] timeout, jumping to slot %s @ 0x%08lX\r\n", SLOT_NAME(ctx->active_slot), app_addr);
     Jump_To_App_Flash(ctx->resource_ctx, app_addr);
     /* NOTREACHED */
@@ -457,11 +463,11 @@ static ota_state_t handle_upgrading(ota_ctx_t *ctx)
     /* active_valid 仅初次进入时评估，存入ctx避免重复校验 */
     ctx->active_valid = (Verify_APP_Integrity_Flash(active_addr) != 0) ? 1U : 0U;
 
-    dbg_printf("[UPGRADING] target=%s @ 0x%08lX (active=%s %s)\r\n",
-               SLOT_NAME(ctx->target_slot),
-               write_addr,
-               SLOT_NAME(ctx->active_slot),
-               ctx->active_valid ? "valid" : "invalid");
+    ota_log("[UPGRADING] target=%s @ 0x%08lX (active=%s %s)\r\n",
+            SLOT_NAME(ctx->target_slot),
+            write_addr,
+            SLOT_NAME(ctx->active_slot),
+            ctx->active_valid ? "valid" : "invalid");
 
     ctx->xmodem_retry = 0U;
 
@@ -469,7 +475,7 @@ static ota_state_t handle_upgrading(ota_ctx_t *ctx)
     {
         if (fs == NULL || fs->mounted == 0U)
         {
-            dbg_printf("[UPGRADING] LittleFS not ready\r\n");
+            ota_log("[UPGRADING] LittleFS not ready\r\n");
             return ctx->active_valid ? OTA_STATE_BOOT : OTA_STATE_UPGRADING;
         }
 
@@ -488,7 +494,7 @@ static ota_state_t handle_upgrading(ota_ctx_t *ctx)
                                             &lfs_file_cfg);
             if (open_err != 0)
             {
-                dbg_printf("[UPGRADING] open %s failed: %d\r\n", ota_path, open_err);
+                ota_log("[UPGRADING] open %s failed: %d\r\n", ota_path, open_err);
                 return ctx->active_valid ? OTA_STATE_BOOT : OTA_STATE_UPGRADING;
             }
             fs->file_open = 1U;
@@ -506,11 +512,11 @@ static ota_state_t handle_upgrading(ota_ctx_t *ctx)
 
         if (received > 0)
         {
-            dbg_printf("[UPGRADING] received=%d bytes\r\n", received);
+            ota_log("[UPGRADING] received=%d bytes\r\n", received);
         }
         else if (received == 0)
         {
-            dbg_printf("[UPGRADING] no new firmware received\r\n");
+            ota_log("[UPGRADING] no new firmware received\r\n");
             ctx->skip_boot_window_once = 1U;
             if (fs->file_open)
             {
@@ -522,7 +528,7 @@ static ota_state_t handle_upgrading(ota_ctx_t *ctx)
         }
         else
         {
-            dbg_printf("[UPGRADING] transfer failed, ret=%d\r\n", received);
+            ota_log("[UPGRADING] transfer failed, ret=%d\r\n", received);
             if (fs->file_open)
             {
                 lfs_file_close(&fs->lfs, &fs->file);
@@ -536,7 +542,7 @@ static ota_state_t handle_upgrading(ota_ctx_t *ctx)
         {
             if (normalize_received_package(fs, ota_path, received, &file_info) != 0)
             {
-                dbg_printf("[UPGRADING] received package length validation failed\r\n");
+                ota_log("[UPGRADING] received package length validation failed\r\n");
                 Write_Flag(EE_VAR_REVERT_REASON,
                            ctx->active_valid ? REVERT_ACTIVE_VALID : REVERT_BOTH_INVALID);
                 return ctx->active_valid ? OTA_STATE_REVERT : OTA_STATE_UPGRADING;
@@ -544,15 +550,15 @@ static ota_state_t handle_upgrading(ota_ctx_t *ctx)
         }
         else
         {
-            dbg_printf("[UPGRADING] exact-size transport, skip protocol padding normalize\r\n");
+            ota_trace("[UPGRADING] exact-size transport, skip protocol padding normalize\r\n");
         }
 
-        dbg_printf("[UPGRADING] verify firmware begin\r\n");
+        ota_trace("[UPGRADING] verify firmware begin\r\n");
         verify_status = verify_firmware(ota_path);
-        dbg_printf("[UPGRADING] verify firmware end: %d\r\n", (int)verify_status);
+        ota_trace("[UPGRADING] verify firmware end: %d\r\n", (int)verify_status);
         if (verify_status != FIRMWARE_VERIFY_OK)
         {
-            dbg_printf("Failed to verify firmware: %d\r\n", (int)verify_status);
+            ota_log("Failed to verify firmware: %d\r\n", (int)verify_status);
             Write_Flag(EE_VAR_REVERT_REASON,
                        ctx->active_valid ? REVERT_ACTIVE_VALID : REVERT_BOTH_INVALID);
             return ctx->active_valid ? OTA_STATE_REVERT : OTA_STATE_UPGRADING;
@@ -577,14 +583,14 @@ static ota_state_t handle_verifying(ota_ctx_t *ctx)
     verify_status = verify_firmware(ota_path);
     if (verify_status != FIRMWARE_VERIFY_OK)
     {
-        dbg_printf("[VERIFYING] firmware verification failed: %d\r\n", (int)verify_status);
+        ota_log("[VERIFYING] firmware verification failed: %d\r\n", (int)verify_status);
         goto load_failed;
     }
 
     load_status = bootloader_load_target((uint8_t)ctx->target_slot, ota_path);
     if (load_status != BOOTLOADER_LOAD_OK)
     {
-        dbg_printf("[VERIFYING] target load failed: %d\r\n", (int)load_status);
+        ota_log("[VERIFYING] target load failed: %d\r\n", (int)load_status);
         goto load_failed;
     }
 
@@ -592,23 +598,23 @@ static ota_state_t handle_verifying(ota_ctx_t *ctx)
     {
         if (sys_set_slot_version(ctx->target_slot, ctx->ota_target_version) != 0)
         {
-            dbg_printf("[VERIFYING] persist slot %s version [%s] failed\r\n",
-                       SLOT_NAME(ctx->target_slot),
-                       ctx->ota_target_version);
+            ota_log("[VERIFYING] persist slot %s version [%s] failed\r\n",
+                    SLOT_NAME(ctx->target_slot),
+                    ctx->ota_target_version);
             goto load_failed;
         }
-        dbg_printf("[VERIFYING] slot %s version updated to [%s]\r\n",
-                   SLOT_NAME(ctx->target_slot),
-                   ctx->ota_target_version);
+        ota_log("[VERIFYING] slot %s version updated to [%s]\r\n",
+                SLOT_NAME(ctx->target_slot),
+                ctx->ota_target_version);
     }
 
     if (commit_verified_target(ctx) != 0)
     {
-        dbg_printf("[VERIFYING] target commit failed\r\n");
+        ota_log("[VERIFYING] target commit failed\r\n");
         goto load_failed;
     }
 
-    dbg_printf("[VERIFYING] slot %s committed, jumping to App\r\n", SLOT_NAME(ctx->active_slot));
+    ota_log("[VERIFYING] slot %s committed, jumping to App\r\n", SLOT_NAME(ctx->active_slot));
     if (Jump_To_App_Flash(ctx->resource_ctx, target_addr) == 0)
     {
         /* 目标已提交后若跳转前复检异常，REVERT_OTHER_VALID 会切回旧分区。 */
@@ -642,16 +648,16 @@ static ota_state_t handle_revert(ota_ctx_t *ctx)
     switch (ctx->revert_reason)
     {
         case REVERT_ACTIVE_VALID:
-            dbg_printf("[REVERT] upgrade revert: active=%s valid -> BOOT\r\n",
-                       SLOT_NAME(ctx->active_slot));
+            ota_log("[REVERT] upgrade revert: active=%s valid -> BOOT\r\n",
+                    SLOT_NAME(ctx->active_slot));
             return OTA_STATE_BOOT;
 
         case REVERT_OTHER_VALID:
         {
             other = OPPOSITE_SLOT(ctx->active_slot);
-            dbg_printf("[REVERT] boot fallback: %s -> %s\r\n",
-                       SLOT_NAME(ctx->active_slot),
-                       SLOT_NAME(other));
+            ota_log("[REVERT] boot fallback: %s -> %s\r\n",
+                    SLOT_NAME(ctx->active_slot),
+                    SLOT_NAME(other));
             ctx->active_slot = other;
             ctx->target_slot = OPPOSITE_SLOT(other);
             Write_Flag(EE_VAR_ACTIVE_SLOT, other);
@@ -661,7 +667,7 @@ static ota_state_t handle_revert(ota_ctx_t *ctx)
 
         default:
             /* REVERT_BOTH_INVALID 或异常值 */
-            dbg_printf("[REVERT] both invalid, -> UPGRADING\r\n");
+            ota_log("[REVERT] both invalid, -> UPGRADING\r\n");
             ctx->target_slot = OPPOSITE_SLOT(ctx->active_slot);
             Write_Flag(EE_VAR_TARGET_SLOT, ctx->target_slot);
             return OTA_STATE_UPGRADING;

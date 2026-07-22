@@ -5,10 +5,13 @@
 #include "log_config.h"
 
 #define ESP_RX_RING_SIZE          WIFI_RX_BUF_SIZE
+#define ESP_TCP_RX_RING_SIZE      1024U
 #define ESP_LINE_BUF_SIZE         256U
+#if ESP8266_MQTT_BACKEND_AT_ENABLE
 #define ESP_MQTT_TOPIC_SIZE       128U
 #define ESP_MQTT_PAYLOAD_SIZE     512U
 #define ESP_MQTT_EVENT_QUEUE_SIZE 2U
+#endif
 
 typedef enum
 {
@@ -28,18 +31,30 @@ typedef struct
     at_cmd_state_t state;
 } at_cmd_ctx_t;
 
+typedef enum
+{
+    ESP_PARSE_LINE = 0,
+    ESP_PARSE_TCP_PAYLOAD,
+#if ESP8266_MQTT_BACKEND_AT_ENABLE
+    ESP_PARSE_MQTT_PAYLOAD,
+    #endif
+} esp_parse_state_t;
+
+#if ESP8266_MQTT_BACKEND_AT_ENABLE
 typedef struct
 {
     char     topic[ESP_MQTT_TOPIC_SIZE];
     uint16_t payload_len;
     uint8_t  payload[ESP_MQTT_PAYLOAD_SIZE + 1U];
 } mqtt_sub_event_t;
+#endif
 
-typedef enum
+typedef struct
 {
-    ESP_PARSE_LINE = 0,
-    ESP_PARSE_MQTT_PAYLOAD,
-} esp_parse_state_t;
+    uint16_t payload_len;
+    uint16_t payload_pos;
+    uint8_t  overflow;
+} tcp_ipd_state_t;
 
 static uint8_t s_wifi_rxch;
 char           g_wifi_rxbuf[WIFI_REPLY_BUF_SIZE] = {0};
@@ -50,28 +65,39 @@ static uint8_t           s_rx_ring[ESP_RX_RING_SIZE];
 static volatile uint16_t s_rx_head = 0U;
 static volatile uint16_t s_rx_tail = 0U;
 
+static uint8_t           s_tcp_rx_ring[ESP_TCP_RX_RING_SIZE];
+static volatile uint16_t s_tcp_rx_head = 0U;
+static volatile uint16_t s_tcp_rx_tail = 0U;
+
 static char     s_line_buf[ESP_LINE_BUF_SIZE];
 static uint16_t s_line_len = 0U;
 
+#if ESP8266_MQTT_BACKEND_AT_ENABLE
 static mqtt_sub_event_t s_mqtt_events[ESP_MQTT_EVENT_QUEUE_SIZE];
 static uint8_t          s_mqtt_evt_head  = 0U;
 static uint8_t          s_mqtt_evt_tail  = 0U;
 static uint8_t          s_mqtt_evt_count = 0U;
 static mqtt_sub_event_t s_last_mqtt_event;
 static uint8_t          s_last_mqtt_valid = 0U;
+#endif
 
-static at_cmd_ctx_t               s_cmd_ctx     = {0};
-static esp_parse_state_t          s_parse_state = ESP_PARSE_LINE;
+static at_cmd_ctx_t      s_cmd_ctx    = {0};
+static esp_parse_state_t s_parse_state = ESP_PARSE_LINE;
+static tcp_ipd_state_t   s_tcp_ipd     = {0};
+
+#if ESP8266_MQTT_BACKEND_AT_ENABLE
 static mqtt_sub_event_t           s_parse_mqtt_event;
 static uint16_t                   s_parse_payload_pos = 0U;
 static uint32_t                   s_tb_request_id     = 1U;
 static esp8266_tb_firmware_info_t s_tb_fw_info;
+#endif
 
 static void esp_at_process(void);
 static int  send_atcmd_ex(char        *atcmd,
                           char        *expect_reply,
                           uint8_t      need_final_ok,
                           unsigned int timeout);
+static int  try_parse_tcp_ipd_header(void);
 
 void ESP8266_UartStartReceive(void)
 {
@@ -112,19 +138,21 @@ void ESP8266_UartErrorCallback(UART_HandleTypeDef *huart)
 #define ESP_AT_RESET_TIMEOUT_MS   5000U
 #define ESP_AT_JOIN_TIMEOUT_MS    30000U
 #define ESP_AT_QUERY_TIMEOUT_MS   1500U
+#if ESP8266_MQTT_BACKEND_AT_ENABLE
 #define ESP_TB_FW_INFO_RETRY      3U
 #define ESP_TB_FW_INFO_TIMEOUT_MS 8000U
-
-#if LOG_WIFI_ENABLE
-#define wifi_dbg(...) printf(__VA_ARGS__)
-#else
-#define wifi_dbg(...) ((void)0)
 #endif
 
 #if LOG_WIFI_ENABLE
-#define wifi_print(...) printf(__VA_ARGS__)
+#define wifi_log(...) printf(__VA_ARGS__)
 #else
-#define wifi_print(...) ((void)0)
+#define wifi_log(...) ((void)0)
+#endif
+
+#if LOG_WIFI_TRACE_ENABLE
+#define wifi_trace(...) printf(__VA_ARGS__)
+#else
+#define wifi_trace(...) ((void)0)
 #endif
 
 static void esp_debug_append(uint8_t ch)
@@ -148,6 +176,43 @@ static int esp_ring_pop(uint8_t *ch)
     return 1;
 }
 
+static int esp_tcp_ring_push(uint8_t ch)
+{
+    uint16_t next = (uint16_t)((s_tcp_rx_head + 1U) % ESP_TCP_RX_RING_SIZE);
+
+    if (next == s_tcp_rx_tail)
+    {
+        return 0;
+    }
+
+    s_tcp_rx_ring[s_tcp_rx_head] = ch;
+    s_tcp_rx_head                = next;
+    return 1;
+}
+
+static int esp_tcp_ring_pop(uint8_t *ch)
+{
+    if (s_tcp_rx_tail == s_tcp_rx_head)
+    {
+        return 0;
+    }
+
+    *ch           = s_tcp_rx_ring[s_tcp_rx_tail];
+    s_tcp_rx_tail = (uint16_t)((s_tcp_rx_tail + 1U) % ESP_TCP_RX_RING_SIZE);
+    return 1;
+}
+
+static uint16_t esp_tcp_ring_count(void)
+{
+    if (s_tcp_rx_head >= s_tcp_rx_tail)
+    {
+        return (uint16_t)(s_tcp_rx_head - s_tcp_rx_tail);
+    }
+
+    return (uint16_t)(ESP_TCP_RX_RING_SIZE - s_tcp_rx_tail + s_tcp_rx_head);
+}
+
+#if ESP8266_MQTT_BACKEND_AT_ENABLE
 static void mqtt_event_push(const mqtt_sub_event_t *evt)
 {
     if (!evt || evt->payload_len == 0U)
@@ -164,10 +229,10 @@ static void mqtt_event_push(const mqtt_sub_event_t *evt)
     s_mqtt_events[s_mqtt_evt_head] = *evt;
     s_mqtt_evt_head                = (uint8_t)((s_mqtt_evt_head + 1U) % ESP_MQTT_EVENT_QUEUE_SIZE);
     s_mqtt_evt_count++;
-    wifi_dbg("MQTT event queued topic [%s], %u bytes, count %u\r\n",
-             evt->topic,
-             evt->payload_len,
-             s_mqtt_evt_count);
+    wifi_trace("MQTT event queued topic [%s], %u bytes, count %u\r\n",
+               evt->topic,
+               evt->payload_len,
+               s_mqtt_evt_count);
 }
 
 static int mqtt_event_pop(mqtt_sub_event_t *evt)
@@ -180,10 +245,10 @@ static int mqtt_event_pop(mqtt_sub_event_t *evt)
     *evt            = s_mqtt_events[s_mqtt_evt_tail];
     s_mqtt_evt_tail = (uint8_t)((s_mqtt_evt_tail + 1U) % ESP_MQTT_EVENT_QUEUE_SIZE);
     s_mqtt_evt_count--;
-    wifi_dbg("MQTT event popped topic [%s], %u bytes, count %u\r\n",
-             evt->topic,
-             evt->payload_len,
-             s_mqtt_evt_count);
+    wifi_trace("MQTT event popped topic [%s], %u bytes, count %u\r\n",
+               evt->topic,
+               evt->payload_len,
+               s_mqtt_evt_count);
     return 1;
 }
 
@@ -196,20 +261,29 @@ static void mqtt_event_clear(void)
     s_mqtt_evt_count  = 0U;
     s_last_mqtt_valid = 0U;
 }
+#endif
 
 static void esp8266_driver_reset_state(void)
 {
     clear_atcmd_buf();
     s_rx_head           = 0U;
     s_rx_tail           = 0U;
+    s_tcp_rx_head       = 0U;
+    s_tcp_rx_tail       = 0U;
     s_line_len          = 0U;
     s_parse_state       = ESP_PARSE_LINE;
+    memset(&s_tcp_ipd, 0, sizeof(s_tcp_ipd));
+#if ESP8266_MQTT_BACKEND_AT_ENABLE
     s_parse_payload_pos = 0U;
     memset(&s_parse_mqtt_event, 0, sizeof(s_parse_mqtt_event));
     memset(&s_cmd_ctx, 0, sizeof(s_cmd_ctx));
     mqtt_event_clear();
+#else
+    memset(&s_cmd_ctx, 0, sizeof(s_cmd_ctx));
+#endif
 }
 
+#if ESP8266_MQTT_BACKEND_AT_ENABLE
 static int payload_contains(const uint8_t *payload, uint16_t payload_len, const char *text)
 {
     uint16_t i;
@@ -331,6 +405,7 @@ static int thingsboard_parse_firmware_info(void)
     s_tb_fw_info.valid = 1U;
     return 0;
 }
+#endif
 
 static void at_cmd_handle_text(const char *text)
 {
@@ -354,7 +429,7 @@ static void at_cmd_handle_text(const char *text)
     if (s_cmd_ctx.expect[0] != '\0' && strstr(text, s_cmd_ctx.expect))
     {
         s_cmd_ctx.got_expect = 1U;
-        wifi_dbg("AT command matched expect '%s'\r\n", s_cmd_ctx.expect);
+        wifi_trace("AT command matched expect '%s'\r\n", s_cmd_ctx.expect);
         if (!s_cmd_ctx.need_final_ok)
         {
             s_cmd_ctx.state = AT_CMD_SUCCESS;
@@ -371,6 +446,64 @@ static void at_cmd_handle_text(const char *text)
     }
 }
 
+static int tcp_payload_append_byte(uint8_t ch)
+{
+    if (s_tcp_ipd.overflow == 0U)
+    {
+        if (!esp_tcp_ring_push(ch))
+        {
+            s_tcp_ipd.overflow = 1U;
+            wifi_log("ERROR: TCP RX ring overflow, buffered=%u\r\n", esp_tcp_ring_count());
+        }
+    }
+
+    s_tcp_ipd.payload_pos++;
+    if (s_tcp_ipd.payload_pos >= s_tcp_ipd.payload_len)
+    {
+        s_parse_state = ESP_PARSE_LINE;
+        s_line_len    = 0U;
+        memset(&s_tcp_ipd, 0, sizeof(s_tcp_ipd));
+        return 1;
+    }
+
+    return 0;
+}
+
+static int try_parse_tcp_ipd_header(void)
+{
+    char *len_start;
+    char *payload_start;
+    int   payload_len;
+
+    s_line_buf[s_line_len] = '\0';
+    if (strncmp(s_line_buf, "+IPD,", strlen("+IPD,")) != 0)
+    {
+        return 0;
+    }
+
+    payload_start = strchr(s_line_buf, ':');
+    if (payload_start == NULL)
+    {
+        return 0;
+    }
+
+    len_start   = s_line_buf + strlen("+IPD,");
+    payload_len = atoi(len_start);
+    if (payload_len <= 0)
+    {
+        wifi_log("ERROR: Invalid +IPD payload length [%d]\r\n", payload_len);
+        s_line_len = 0U;
+        return 1;
+    }
+
+    memset(&s_tcp_ipd, 0, sizeof(s_tcp_ipd));
+    s_tcp_ipd.payload_len = (uint16_t)payload_len;
+    s_parse_state         = ESP_PARSE_TCP_PAYLOAD;
+    s_line_len            = 0U;
+    return 1;
+}
+
+#if ESP8266_MQTT_BACKEND_AT_ENABLE
 static int mqtt_payload_append_byte(uint8_t ch)
 {
     if (s_parse_payload_pos < ESP_MQTT_PAYLOAD_SIZE)
@@ -385,9 +518,9 @@ static int mqtt_payload_append_byte(uint8_t ch)
         {
             s_parse_mqtt_event.payload[s_parse_mqtt_event.payload_len] = '\0';
         }
-        wifi_dbg("MQTT subrecv payload done topic [%s], %u bytes\r\n",
-                 s_parse_mqtt_event.topic,
-                 s_parse_mqtt_event.payload_len);
+        wifi_trace("MQTT subrecv payload done topic [%s], %u bytes\r\n",
+                   s_parse_mqtt_event.topic,
+                   s_parse_mqtt_event.payload_len);
         mqtt_event_push(&s_parse_mqtt_event);
         s_parse_state = ESP_PARSE_LINE;
         s_line_len    = 0U;
@@ -442,7 +575,7 @@ static int try_parse_mqtt_subrecv_header(void)
     payload_len = atoi(len_start);
     if (payload_len < 0 || payload_len > (int)ESP_MQTT_PAYLOAD_SIZE)
     {
-        wifi_print("ERROR: MQTT payload too large (%d)\r\n", payload_len);
+        wifi_log("ERROR: MQTT payload too large (%d)\r\n", payload_len);
         s_line_len = 0U;
         return 0;
     }
@@ -473,6 +606,7 @@ static int try_parse_mqtt_subrecv_header(void)
     s_parse_state = ESP_PARSE_MQTT_PAYLOAD;
     return 1;
 }
+#endif
 
 static void esp_parse_line(void)
 {
@@ -493,11 +627,19 @@ static void esp_at_process(void)
 
     while (esp_ring_pop(&ch))
     {
+        if (s_parse_state == ESP_PARSE_TCP_PAYLOAD)
+        {
+            tcp_payload_append_byte(ch);
+            continue;
+        }
+
+#if ESP8266_MQTT_BACKEND_AT_ENABLE
         if (s_parse_state == ESP_PARSE_MQTT_PAYLOAD)
         {
             mqtt_payload_append_byte(ch);
             continue;
         }
+#endif
 
         esp_debug_append(ch);
 
@@ -505,6 +647,12 @@ static void esp_at_process(void)
         {
             at_cmd_handle_text(">");
             s_line_len = 0U;
+
+            if (s_cmd_ctx.active != 0U && s_cmd_ctx.state == AT_CMD_SUCCESS &&
+                strcmp(s_cmd_ctx.expect, ">") == 0)
+            {
+                return;
+            }
             continue;
         }
 
@@ -517,10 +665,17 @@ static void esp_at_process(void)
             s_line_len = 0U;
         }
 
+        if (try_parse_tcp_ipd_header())
+        {
+            continue;
+        }
+
+#if ESP8266_MQTT_BACKEND_AT_ENABLE
         if (try_parse_mqtt_subrecv_header())
         {
             continue;
         }
+#endif
 
         if (ch == '\n')
         {
@@ -555,11 +710,11 @@ static int send_atcmd_ex(char        *atcmd,
     /* check function input arguments validation */
     if (!atcmd || strlen(atcmd) <= 0)
     {
-        wifi_print("ERROR: Invalid input arguments\r\n");
+        wifi_log("ERROR: Invalid input arguments\r\n");
         return -1;
     }
 
-    wifi_dbg("\r\nStart send AT command: %s", atcmd);
+    wifi_trace("\r\nStart send AT command: %s", atcmd);
     clear_atcmd_buf();
     memset(&s_cmd_ctx, 0, sizeof(s_cmd_ctx));
     s_cmd_ctx.active        = 1U;
@@ -577,7 +732,7 @@ static int send_atcmd_ex(char        *atcmd,
 
         if (s_cmd_ctx.state == AT_CMD_SUCCESS)
         {
-            wifi_dbg("AT command Got expect reply '%s'\r\n", s_cmd_ctx.expect);
+            wifi_trace("AT command Got expect reply '%s'\r\n", s_cmd_ctx.expect);
             rv = 0;
             goto CleanUp;
         }
@@ -595,7 +750,7 @@ static int send_atcmd_ex(char        *atcmd,
 
 CleanUp:
     s_cmd_ctx.active = 0U;
-    wifi_dbg("<<<< AT command reply:\r\n%s", g_wifi_rxbuf);
+    wifi_trace("<<<< AT command reply:\r\n%s", g_wifi_rxbuf);
     return rv;
 }
 
@@ -607,11 +762,11 @@ int atcmd_send_data(unsigned char *data, int bytes, unsigned int timeout)
     /* check function input arguments validation */
     if (!data || bytes <= 0)
     {
-        wifi_print("ERROR: Invalid input arguments\r\n");
+        wifi_log("ERROR: Invalid input arguments\r\n");
         return -1;
     }
 
-    wifi_dbg("\r\nStart AT command send [%d] bytes data\n", bytes);
+    wifi_trace("\r\nStart AT command send [%d] bytes data\n", bytes);
     clear_atcmd_buf();
     memset(&s_cmd_ctx, 0, sizeof(s_cmd_ctx));
     s_cmd_ctx.active = 1U;
@@ -641,14 +796,15 @@ int atcmd_send_data(unsigned char *data, int bytes, unsigned int timeout)
     }
 
     s_cmd_ctx.state = AT_CMD_TIMEOUT;
-    wifi_print("ERROR: AT command send data timeout\r\n");
+    wifi_log("ERROR: AT command send data timeout\r\n");
 
 CleanUp:
     s_cmd_ctx.active = 0U;
-    wifi_dbg("<<<< AT command reply:\r\n%s", g_wifi_rxbuf);
+    wifi_trace("<<<< AT command reply:\r\n%s", g_wifi_rxbuf);
     return rv;
 }
 
+#if ESP8266_MQTT_BACKEND_AT_ENABLE
 static int atcmd_send_data_expect(unsigned char *data,
                                   int            bytes,
                                   char          *expect_reply,
@@ -660,11 +816,11 @@ static int atcmd_send_data_expect(unsigned char *data,
 
     if (!data || bytes <= 0)
     {
-        wifi_print("ERROR: Invalid input arguments\r\n");
+        wifi_log("ERROR: Invalid input arguments\r\n");
         return -1;
     }
 
-    wifi_dbg("\r\nStart AT command send [%d] bytes raw data\n", bytes);
+    wifi_trace("\r\nStart AT command send [%d] bytes raw data\n", bytes);
     clear_atcmd_buf();
     memset(&s_cmd_ctx, 0, sizeof(s_cmd_ctx));
     s_cmd_ctx.active = 1U;
@@ -693,13 +849,14 @@ static int atcmd_send_data_expect(unsigned char *data,
     }
 
     s_cmd_ctx.state = AT_CMD_TIMEOUT;
-    wifi_print("ERROR: AT command raw data expect '%s' timeout\r\n", expect);
+    wifi_log("ERROR: AT command raw data expect '%s' timeout\r\n", expect);
 
 CleanUp:
     s_cmd_ctx.active = 0U;
-    wifi_dbg("<<<< AT command reply:\r\n%s", g_wifi_rxbuf);
+    wifi_trace("<<<< AT command reply:\r\n%s", g_wifi_rxbuf);
     return rv;
 }
+#endif
 
 int esp8266_module_init(void)
 {
@@ -709,10 +866,10 @@ int esp8266_module_init(void)
     esp8266_driver_reset_state();
     ESP8266_UartStartReceive();
 
-    wifi_print("INFO: Reset ESP8266 module now...\r\n");
+    wifi_log("INFO: Reset ESP8266 module now...\r\n");
     if (send_atcmd("AT+RST\r\n", "ready", ESP_AT_RESET_TIMEOUT_MS))
     {
-        wifi_print("ERROR: ESP8266 reset ready timeout\r\n");
+        wifi_log("ERROR: ESP8266 reset ready timeout\r\n");
         return -1;
     }
 
@@ -720,7 +877,7 @@ int esp8266_module_init(void)
     {
         if (!send_atcmd("AT\r\n", EXPECT_OK, 500))
         {
-            wifi_print("INFO: Send AT to ESP8266 and got reply ok\r\n");
+            wifi_log("INFO: Send AT to ESP8266 and got reply ok\r\n");
             break;
         }
         HAL_Delay(100);
@@ -728,19 +885,19 @@ int esp8266_module_init(void)
 
     if (i >= 6)
     {
-        wifi_print("ERROR: Can't receive AT replay after reset\r\n");
+        wifi_log("ERROR: Can't receive AT replay after reset\r\n");
         return -2;
     }
 
     if (send_atcmd("AT+CWMODE=1\r\n", EXPECT_OK, 500))
     {
-        wifi_print("ERROR: Set ESP8266 work as Station mode failure\r\n");
+        wifi_log("ERROR: Set ESP8266 work as Station mode failure\r\n");
         return -3;
     }
 
     if (send_atcmd("AT+CWDHCP=1,1\r\n", EXPECT_OK, 500))
     {
-        wifi_print("ERROR: Enable ESP8266 Station mode DHCP failure\r\n");
+        wifi_log("ERROR: Enable ESP8266 Station mode DHCP failure\r\n");
         return -4;
     }
 
@@ -750,7 +907,7 @@ int esp8266_module_init(void)
 #if 0
     if (send_atcmd("AT+GMR\r\n", EXPECT_OK, 500))
     {
-        wifi_print("ERROR: AT+GMR check ESP8266 reversion failure\r\n");
+        wifi_log("ERROR: AT+GMR check ESP8266 reversion failure\r\n");
         return -5;
     }
 #endif
@@ -766,7 +923,7 @@ int esp8266_join_network(char *ssid, char *pwd)
 
     if (!ssid || !pwd)
     {
-        wifi_print("ERROR: Invalid input arguments\r\n");
+        wifi_log("ERROR: Invalid input arguments\r\n");
         return -1;
     }
 
@@ -774,24 +931,24 @@ int esp8266_join_network(char *ssid, char *pwd)
     snprintf(atcmd, sizeof(s_atcmd_buf), "AT+CWJAP=\"%s\",\"%s\"\r\n", ssid, pwd);
     if (send_atcmd(atcmd, EXPECT_OK, ESP_AT_JOIN_TIMEOUT_MS))
     {
-        wifi_print("ERROR: ESP8266 connect to '%s' failure\r\n", ssid);
+        wifi_log("ERROR: ESP8266 connect to '%s' failure\r\n", ssid);
         return -2;
     }
 
-    wifi_print("INFO: ESP8266 connect to '%s' ok\r\n", ssid);
+    wifi_log("INFO: ESP8266 connect to '%s' ok\r\n", ssid);
 
     /* check got IP address or not by netmask (255.)*/
     for (i = 0; i < 10; i++)
     {
         if (!esp8266_query_ip_status(ESP_AT_QUERY_TIMEOUT_MS))
         {
-            wifi_print("INFO: ESP8266 got IP address ok\r\n");
+            wifi_log("INFO: ESP8266 got IP address ok\r\n");
             return 0;
         }
         HAL_Delay(300);
     }
 
-    wifi_print("ERROR: ESP8266 assigned IP address failure\r\n");
+    wifi_log("ERROR: ESP8266 assigned IP address failure\r\n");
     return -3;
 }
 
@@ -799,7 +956,7 @@ int esp8266_wifi_disconnect(void)
 {
     if (send_atcmd("AT+CWQAP\r\n", EXPECT_OK, 1000))
     {
-        wifi_print("ERROR: ESP8266 WiFi disconnect failure\r\n");
+        wifi_log("ERROR: ESP8266 WiFi disconnect failure\r\n");
         return -1;
     }
 
@@ -810,19 +967,19 @@ int esp8266_scan_ap(char *ssid)
 {
     if (send_atcmd("AT+CWLAP\r\n", EXPECT_OK, 10000))
     {
-        wifi_print("ERROR: ESP8266 scan AP failure\r\n");
+        wifi_log("ERROR: ESP8266 scan AP failure\r\n");
         return -1;
     }
 
     if (ssid && strlen(ssid) > 0 && !strstr(g_wifi_rxbuf, ssid))
     {
-        wifi_print("ERROR: ESP8266 target AP '%s' not found\r\n", ssid);
+        wifi_log("ERROR: ESP8266 target AP '%s' not found\r\n", ssid);
         return -2;
     }
 
     if (ssid && strlen(ssid) > 0)
     {
-        wifi_print("INFO: ESP8266 target AP '%s' found\r\n", ssid);
+        wifi_log("INFO: ESP8266 target AP '%s' found\r\n", ssid);
     }
 
     return 0;
@@ -868,29 +1025,29 @@ int esp8266_get_ipaddr(char *ipaddr, char *gateway, int ipaddr_size)
 {
     if (!ipaddr || !gateway || ipaddr_size < 7)
     {
-        wifi_print("ERROR: Invalid input arguments\r\n");
+        wifi_log("ERROR: Invalid input arguments\r\n");
         return -1;
     }
 
     if (esp8266_query_ip_status(ESP_AT_QUERY_TIMEOUT_MS))
     {
-        wifi_print("ERROR: ESP8266 AT+CIPSTA command failure\r\n");
+        wifi_log("ERROR: ESP8266 AT+CIPSTA command failure\r\n");
         return -2;
     }
 
     if (util_parser_ipaddr(g_wifi_rxbuf, "ip:", ipaddr, ipaddr_size))
     {
-        wifi_print("ERROR: ESP8266 AT+CIPSTA parser IP address failure\r\n");
+        wifi_log("ERROR: ESP8266 AT+CIPSTA parser IP address failure\r\n");
         return -3;
     }
 
     if (util_parser_ipaddr(g_wifi_rxbuf, "gateway:", gateway, ipaddr_size))
     {
-        wifi_print("ERROR: ESP8266 AT+CIPSTA parser gateway failure\r\n");
+        wifi_log("ERROR: ESP8266 AT+CIPSTA parser gateway failure\r\n");
         return -4;
     }
 
-    wifi_print("INFO: ESP8266 got IP address[%s] gateway[%s] ok\r\n", ipaddr, gateway);
+    wifi_log("INFO: ESP8266 got IP address[%s] gateway[%s] ok\r\n", ipaddr, gateway);
     return 0;
 }
 
@@ -900,7 +1057,7 @@ int esp8266_ping_test(char *host)
 
     if (!host)
     {
-        wifi_print("ERROR: Invalid input arguments\r\n");
+        wifi_log("ERROR: Invalid input arguments\r\n");
         return -1;
     }
 
@@ -908,11 +1065,11 @@ int esp8266_ping_test(char *host)
     snprintf(atcmd, sizeof(s_atcmd_buf), "AT+PING=\"%s\"\r\n", host);
     if (send_atcmd(atcmd, EXPECT_OK, 3000))
     {
-        wifi_print("ERROR: ESP8266 ping test [%s] failure\r\n", host);
+        wifi_log("ERROR: ESP8266 ping test [%s] failure\r\n", host);
         return -2;
     }
 
-    wifi_print("INFO: ESP8266 ping test [%s] ok\r\n", host);
+    wifi_log("INFO: ESP8266 ping test [%s] ok\r\n", host);
     return 0;
 }
 
@@ -922,7 +1079,7 @@ int esp8266_sock_connect(char *servip, int port)
 
     if (!servip || port <= 0)
     {
-        wifi_print("ERROR: Invalid input arguments\r\n");
+        wifi_log("ERROR: Invalid input arguments\r\n");
         return -1;
     }
 
@@ -932,11 +1089,11 @@ int esp8266_sock_connect(char *servip, int port)
     snprintf(atcmd, sizeof(s_atcmd_buf), "AT+CIPSTART=\"TCP\",\"%s\",%d\r\n", servip, port);
     if (send_atcmd_ex(atcmd, "CONNECT", 1U, 3000))
     {
-        wifi_print("ERROR: ESP8266 socket connect to [%s:%d] failure\r\n", servip, port);
+        wifi_log("ERROR: ESP8266 socket connect to [%s:%d] failure\r\n", servip, port);
         return -2;
     }
 
-    wifi_print("INFO: ESP8266 socket connect to [%s:%d] ok\r\n", servip, port);
+    wifi_log("INFO: ESP8266 socket connect to [%s:%d] ok\r\n", servip, port);
     return 0;
 }
 
@@ -952,7 +1109,7 @@ int esp8266_sock_send(unsigned char *data, int bytes)
 
     if (!data || bytes <= 0)
     {
-        wifi_print("ERROR: Invalid input arguments\r\n");
+        wifi_log("ERROR: Invalid input arguments\r\n");
         return -1;
     }
 
@@ -960,13 +1117,13 @@ int esp8266_sock_send(unsigned char *data, int bytes)
     snprintf(atcmd, sizeof(s_atcmd_buf), "AT+CIPSEND=%d\r\n", bytes);
     if (send_atcmd(atcmd, ">", 500))
     {
-        wifi_print("ERROR: AT+CIPSEND command failure\r\n");
+        wifi_log("ERROR: AT+CIPSEND command failure\r\n");
         return 0;
     }
 
     if (atcmd_send_data((unsigned char *)data, bytes, 1000))
     {
-        wifi_print("ERROR: AT+CIPSEND send data failure\r\n");
+        wifi_log("ERROR: AT+CIPSEND send data failure\r\n");
         return 0;
     }
 
@@ -975,54 +1132,27 @@ int esp8266_sock_send(unsigned char *data, int bytes)
 
 int esp8266_sock_recv(unsigned char *buf, int size)
 {
-    char *data = NULL;
-    char *ptr  = NULL;
-    int   len;
-    int   rv;
-    int   bytes;
+    int     rv;
+    uint8_t ch;
 
     if (!buf || size <= 0)
     {
-        wifi_print("ERROR: Invalid input arguments\r\n");
+        wifi_log("ERROR: Invalid input arguments\r\n");
         return -1;
     }
 
     esp_at_process();
 
-    if (g_wifi_rxbytes <= 0)
+    rv = 0;
+    while (rv < size && esp_tcp_ring_pop(&ch))
     {
-        return 0;
+        buf[rv++] = ch;
     }
 
-    /* No data arrive or not integrated */
-    ptr = strstr(g_wifi_rxbuf, "+IPD,");
-    if (!ptr)
-    {
-        return 0;
-    }
-
-    data = strchr(ptr, ':');
-    if (!data)
-    {
-        return 0;
-    }
-
-    data++;
-    bytes = atoi(ptr + strlen("+IPD,"));
-    len   = g_wifi_rxbytes - (data - g_wifi_rxbuf);
-    if (len < bytes)
-    {
-        wifi_dbg("+IPD data not receive over, receive again later ...\r\n");
-        return 0;
-    }
-
-    memset(buf, 0, size);
-    rv = bytes > size ? size : bytes;
-    memcpy(buf, data, rv);
-    clear_atcmd_buf();
     return rv;
 }
 
+#if ESP8266_MQTT_BACKEND_AT_ENABLE
 int esp8266_mqtt_connect(char *host, int port, char *access_token)
 {
     char       *atcmd = s_atcmd_buf;
@@ -1030,7 +1160,7 @@ int esp8266_mqtt_connect(char *host, int port, char *access_token)
 
     if (!host || port <= 0 || !access_token)
     {
-        wifi_print("ERROR: Invalid input arguments\r\n");
+        wifi_log("ERROR: Invalid input arguments\r\n");
         return -1;
     }
 
@@ -1053,20 +1183,20 @@ int esp8266_mqtt_connect(char *host, int port, char *access_token)
              access_token);
     if (send_atcmd(atcmd, EXPECT_OK, 2000))
     {
-        wifi_print("ERROR: ESP8266 MQTT user config failure\r\n");
+        wifi_log("ERROR: ESP8266 MQTT user config failure\r\n");
         return -2;
     }
 
-    wifi_print("INFO: ESP8266 MQTT client id [%s]\r\n", client_id);
+    wifi_log("INFO: ESP8266 MQTT client id [%s]\r\n", client_id);
 
     snprintf(atcmd, sizeof(s_atcmd_buf), "AT+MQTTCONN=0,\"%s\",%d,0\r\n", host, port);
     if (send_atcmd_ex(atcmd, "+MQTTCONNECTED", 1U, 10000))
     {
-        wifi_print("ERROR: ESP8266 MQTT connect to [%s:%d] failure\r\n", host, port);
+        wifi_log("ERROR: ESP8266 MQTT connect to [%s:%d] failure\r\n", host, port);
         return -3;
     }
 
-    wifi_print("INFO: ESP8266 MQTT connect to [%s:%d] ok\r\n", host, port);
+    wifi_log("INFO: ESP8266 MQTT connect to [%s:%d] ok\r\n", host, port);
     HAL_Delay(200);
     return 0;
 }
@@ -1083,7 +1213,7 @@ int esp8266_mqtt_publish_raw(char *topic, unsigned char *data, int bytes)
 
     if (!topic || !data || bytes <= 0)
     {
-        wifi_print("ERROR: Invalid input arguments\r\n");
+        wifi_log("ERROR: Invalid input arguments\r\n");
         return -1;
     }
 
@@ -1091,17 +1221,17 @@ int esp8266_mqtt_publish_raw(char *topic, unsigned char *data, int bytes)
     snprintf(atcmd, sizeof(s_atcmd_buf), "AT+MQTTPUBRAW=0,\"%s\",%d,1,0\r\n", topic, bytes);
     if (send_atcmd(atcmd, ">", 2000))
     {
-        wifi_print("ERROR: ESP8266 MQTT publish raw command failure\r\n");
+        wifi_log("ERROR: ESP8266 MQTT publish raw command failure\r\n");
         return -2;
     }
 
     if (atcmd_send_data_expect(data, bytes, "+MQTTPUB:OK", 5000))
     {
-        wifi_print("ERROR: ESP8266 MQTT publish raw data failure\r\n");
+        wifi_log("ERROR: ESP8266 MQTT publish raw data failure\r\n");
         return -3;
     }
 
-    wifi_print("INFO: ESP8266 MQTT publish [%d] bytes to topic [%s] ok\r\n", bytes, topic);
+    wifi_trace("INFO: ESP8266 MQTT publish [%d] bytes to topic [%s] ok\r\n", bytes, topic);
     return bytes;
 }
 
@@ -1111,7 +1241,7 @@ int esp8266_mqtt_subscribe(char *topic, int qos)
 
     if (!topic || qos < 0 || qos > 1)
     {
-        wifi_print("ERROR: Invalid input arguments\r\n");
+        wifi_log("ERROR: Invalid input arguments\r\n");
         return -1;
     }
 
@@ -1119,11 +1249,11 @@ int esp8266_mqtt_subscribe(char *topic, int qos)
     snprintf(atcmd, sizeof(s_atcmd_buf), "AT+MQTTSUB=0,\"%s\",%d\r\n", topic, qos);
     if (send_atcmd(atcmd, EXPECT_OK, 2000))
     {
-        wifi_print("ERROR: ESP8266 MQTT subscribe [%s] failure\r\n", topic);
+        wifi_log("ERROR: ESP8266 MQTT subscribe [%s] failure\r\n", topic);
         return -2;
     }
 
-    wifi_print("INFO: ESP8266 MQTT subscribe [%s] ok\r\n", topic);
+    wifi_trace("INFO: ESP8266 MQTT subscribe [%s] ok\r\n", topic);
     return 0;
 }
 
@@ -1153,11 +1283,11 @@ static int esp8266_mqtt_wait_subrecv_event(char             *expect,
                 *out_event = evt;
             }
 
-            wifi_print(
+            wifi_trace(
                 "INFO: ESP8266 MQTT received topic [%s], %u bytes\r\n", evt.topic, evt.payload_len);
             if (print_payload)
             {
-                wifi_print("%.*s\r\n", evt.payload_len, (char *)evt.payload);
+                wifi_trace("%.*s\r\n", evt.payload_len, (char *)evt.payload);
             }
 
             if (!expect || strstr(evt.topic, expect) ||
@@ -1174,10 +1304,10 @@ static int esp8266_mqtt_wait_subrecv_event(char             *expect,
 
     if (s_parse_state == ESP_PARSE_MQTT_PAYLOAD)
     {
-        wifi_print("ERROR: MQTT subrecv payload incomplete topic [%s], %u/%u bytes\r\n",
-                   s_parse_mqtt_event.topic,
-                   s_parse_payload_pos,
-                   s_parse_mqtt_event.payload_len);
+        wifi_log("ERROR: MQTT subrecv payload incomplete topic [%s], %u/%u bytes\r\n",
+                 s_parse_mqtt_event.topic,
+                 s_parse_payload_pos,
+                 s_parse_mqtt_event.payload_len);
     }
 
     return -1;
@@ -1226,11 +1356,11 @@ int esp8266_thingsboard_request_firmware_info(void)
 
         if (esp8266_mqtt_publish_raw(request_topic, request, (int)(sizeof(request) - 1U)) <= 0)
         {
-            wifi_print("ERROR: ThingsBoard firmware info request publish failure\r\n");
+            wifi_log("ERROR: ThingsBoard firmware info request publish failure\r\n");
             return -3;
         }
 
-        wifi_print(
+        wifi_trace(
             "INFO: Waiting ThingsBoard firmware info response, request id %lu, attempt %u/%u\r\n",
             (unsigned long)request_id,
             attempt,
@@ -1241,25 +1371,25 @@ int esp8266_thingsboard_request_firmware_info(void)
         {
             if (thingsboard_parse_firmware_info() != 0)
             {
-                wifi_print("ERROR: ThingsBoard firmware info parse failure\r\n");
+                wifi_log("ERROR: ThingsBoard firmware info parse failure\r\n");
                 return -4;
             }
-            wifi_print("INFO: ThingsBoard firmware info found\r\n");
-            wifi_print("INFO: ThingsBoard firmware size %lu bytes, title [%s], version [%s]\r\n",
-                       (unsigned long)s_tb_fw_info.size,
-                       s_tb_fw_info.title,
-                       s_tb_fw_info.version);
+            wifi_log("INFO: ThingsBoard firmware info found\r\n");
+            wifi_log("INFO: ThingsBoard firmware size %lu bytes, title [%s], version [%s]\r\n",
+                     (unsigned long)s_tb_fw_info.size,
+                     s_tb_fw_info.title,
+                     s_tb_fw_info.version);
             return 0;
         }
 
         if (s_last_mqtt_valid)
         {
-            wifi_print("INFO: ThingsBoard firmware response without fw_title, topic [%s]\r\n",
+            wifi_trace("INFO: ThingsBoard firmware response without fw_title, topic [%s]\r\n",
                        s_last_mqtt_event.topic);
             return -4;
         }
 
-        wifi_print("INFO: ThingsBoard firmware info request timeout, attempt %u/%u\r\n",
+        wifi_trace("INFO: ThingsBoard firmware info request timeout, attempt %u/%u\r\n",
                    attempt,
                    ESP_TB_FW_INFO_RETRY);
         HAL_Delay(300);
@@ -1302,14 +1432,14 @@ int esp8266_thingsboard_request_firmware_chunk(
 
     if (!buf || !out_len || chunk_size == 0U || chunk_size > buf_size)
     {
-        wifi_print("ERROR: Invalid firmware chunk request arguments\r\n");
+        wifi_log("ERROR: Invalid firmware chunk request arguments\r\n");
         return -1;
     }
 
     if (chunk_size > ESP_MQTT_PAYLOAD_SIZE)
     {
-        wifi_print("ERROR: Firmware chunk size %lu exceeds MQTT payload buffer\r\n",
-                   (unsigned long)chunk_size);
+        wifi_log("ERROR: Firmware chunk size %lu exceeds MQTT payload buffer\r\n",
+                 (unsigned long)chunk_size);
         return -2;
     }
 
@@ -1333,17 +1463,17 @@ int esp8266_thingsboard_request_firmware_chunk(
 
     if (payload_len <= 0 || payload_len >= (int)sizeof(payload))
     {
-        wifi_print("ERROR: Firmware chunk request payload build failure\r\n");
+        wifi_log("ERROR: Firmware chunk request payload build failure\r\n");
         return -4;
     }
 
     if (esp8266_mqtt_publish_raw(topic, (unsigned char *)payload, payload_len) <= 0)
     {
-        wifi_print("ERROR: ThingsBoard firmware chunk request publish failure\r\n");
+        wifi_log("ERROR: ThingsBoard firmware chunk request publish failure\r\n");
         return -5;
     }
 
-    wifi_print("INFO: Waiting ThingsBoard firmware chunk %lu, request id %lu, size %lu\r\n",
+    wifi_trace("INFO: Waiting ThingsBoard firmware chunk %lu, request id %lu, size %lu\r\n",
                (unsigned long)chunk_index,
                (unsigned long)request_id,
                (unsigned long)chunk_size);
@@ -1356,21 +1486,22 @@ int esp8266_thingsboard_request_firmware_chunk(
 
     if (esp8266_mqtt_wait_subrecv_event(expect_topic, &evt, ESP_TB_FW_INFO_TIMEOUT_MS, 0U))
     {
-        wifi_print("ERROR: ThingsBoard firmware chunk %lu receive timeout\r\n",
-                   (unsigned long)chunk_index);
+        wifi_log("ERROR: ThingsBoard firmware chunk %lu receive timeout\r\n",
+                 (unsigned long)chunk_index);
         return -6;
     }
 
     if (evt.payload_len == 0U || evt.payload_len > buf_size)
     {
-        wifi_print("ERROR: Invalid ThingsBoard firmware chunk length %u\r\n", evt.payload_len);
+        wifi_log("ERROR: Invalid ThingsBoard firmware chunk length %u\r\n", evt.payload_len);
         return -7;
     }
 
     memcpy(buf, evt.payload, evt.payload_len);
     *out_len = evt.payload_len;
-    wifi_print("INFO: ThingsBoard firmware chunk %lu received, %u bytes\r\n",
+    wifi_trace("INFO: ThingsBoard firmware chunk %lu received, %u bytes\r\n",
                (unsigned long)chunk_index,
                evt.payload_len);
     return 0;
 }
+#endif
