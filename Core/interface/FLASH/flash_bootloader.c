@@ -47,7 +47,7 @@
  * linker places them in SRAM1/SRAM2; no fixed RAM address is required.
  * Their memory can be reused by the App after the bootloader jumps.
  * =================================================================== */
-#define ELF_BUF_SIZE (40U * 1024U)
+#define ELF_BUF_SIZE (15U * 1024U)
 
 /* One bitmap bit per 32-bit ELF word for fallback relocation scanning. */
 #define ELF_RELOC_SCRATCH_SIZE ((ELF_BUF_SIZE + 31U) / 32U)

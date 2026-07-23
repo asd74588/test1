@@ -1,5 +1,5 @@
 /**
- * elf_loader.c - ELF32 full-buffer parser and in-place relocator
+ * elf_loader.c — ELF32 整包解析与原地重定位实现
  */
 
 #include "elf_loader.h"
@@ -10,6 +10,7 @@
 #include <string.h>
 
 #define ELF_PREFIX "[elf] "
+/* 调试输出辅助函数。 */
 #if LOG_ELF_LOADER_ENABLE
 #define ELF_WARN(fmt, ...) printf(ELF_PREFIX "WARN: " fmt "\r\n", ##__VA_ARGS__)
 #define ELF_ERR(fmt, ...)  printf(ELF_PREFIX "ERROR: " fmt "\r\n", ##__VA_ARGS__)
@@ -24,12 +25,31 @@
 #define ELF_INFO(...) ((void)0)
 #endif
 
-#define MIN_U32(a, b) ((a) < (b) ? (a) : (b))
+/* 解析和重定位常量。 */
+#define ELF_ABSOLUTE_ADDRESS_THRESHOLD 0x10000000U
+#define ELF_SCATTER_DESTINATION_MIN    0x10000000U
+#define ELF_SCATTER_DESTINATION_MAX    0x40000000U
+#define ELF_SCATTER_MAX_LENGTH         0x10000U
 
+#define ELF_THUMB_REGISTER_COUNT         16U
+#define ELF_THUMB_MOV_PAIR_MAX_HALFWORDS 256U
+#define ELF_THUMB_MOV_MASK               0xFBF0U
+#define ELF_THUMB_MOVW_OPCODE            0xF240U
+#define ELF_THUMB_MOVT_OPCODE            0xF2C0U
+#define ELF_THUMB_LITERAL16_MASK         0xF800U
+#define ELF_THUMB_LITERAL16_OPCODE       0x4800U
+#define ELF_THUMB_LITERAL32_LDR_POS      0xF8DFU
+#define ELF_THUMB_LITERAL32_LDR_NEG      0xF85FU
+#define ELF_ARMCC_LEGACY_PC_REL_TYPE     102U
+
+/* ELF32 结构体布局必须与文件格式完全一致。 */
 typedef char elf_ehdr_size_check[(sizeof(elf32_ehdr) == 52U) ? 1 : -1];
 typedef char elf_shdr_size_check[(sizeof(elf32_shdr) == 40U) ? 1 : -1];
 typedef char elf_sym_size_check[(sizeof(elf32_sym) == 16U) ? 1 : -1];
+typedef char elf_rel_size_check[(sizeof(elf32_rel) == 8U) ? 1 : -1];
+typedef char elf_rela_size_check[(sizeof(elf32_rela) == 12U) ? 1 : -1];
 
+/* Thumb MOVW/MOVT 配对时暂存一条 MOVW 的信息。 */
 typedef struct
 {
     uint32_t file_offset;
@@ -40,6 +60,7 @@ typedef struct
     uint8_t  valid;
 } movw_pending_t;
 
+/* 基础边界、算术和非对齐访问辅助函数。 */
 static int range_valid(uint32_t total, uint32_t offset, uint32_t length)
 {
     return offset <= total && length <= total - offset;
@@ -87,6 +108,7 @@ static void write_u32(uint8_t *ptr, uint32_t value)
     memcpy(ptr, &value, sizeof(value));
 }
 
+/* section 元数据辅助函数。 */
 #if LOG_ELF_LOADER_ENABLE
 static const char *section_type_name(uint32_t type)
 {
@@ -221,16 +243,19 @@ static void mov_encode_imm16(uint16_t imm16, uint16_t *upper, uint16_t *lower)
     uint16_t imm3 = (imm16 >> 8) & 0x0007U;
     uint16_t imm8 = imm16 & 0x00FFU;
 
-    *upper = (uint16_t)((*upper & 0xFBF0U) | (i << 10) | imm4);
+    *upper = (uint16_t)((*upper & ELF_THUMB_MOV_MASK) | (i << 10) | imm4);
     *lower = (uint16_t)((*lower & 0x8F00U) | (imm3 << 12) | imm8);
 }
 
+/* Thumb 指令编码辅助函数。 */
 static int is_movw_or_movt_word(uint32_t value)
 {
     uint16_t upper = (uint16_t)(value & 0xFFFFU);
-    return (upper & 0xFBF0U) == 0xF240U || (upper & 0xFBF0U) == 0xF2C0U;
+    return (upper & ELF_THUMB_MOV_MASK) == ELF_THUMB_MOVW_OPCODE ||
+           (upper & ELF_THUMB_MOV_MASK) == ELF_THUMB_MOVT_OPCODE;
 }
 
+/* ELF 解析。 */
 int elf_parse(elf_ctx_t *ctx, uint8_t *buf, uint32_t file_size)
 {
     elf32_ehdr *ehdr;
@@ -250,8 +275,8 @@ int elf_parse(elf_ctx_t *ctx, uint8_t *buf, uint32_t file_size)
     ehdr      = (elf32_ehdr *)buf;
     ctx->ehdr = ehdr;
 
-    if (ehdr->e_ident[0] != 0x7FU || ehdr->e_ident[1] != 'E' || ehdr->e_ident[2] != 'L' ||
-        ehdr->e_ident[3] != 'F')
+    if (ehdr->e_ident[EI_MAG0] != 0x7FU || ehdr->e_ident[EI_MAG1] != 'E' ||
+        ehdr->e_ident[EI_MAG2] != 'L' || ehdr->e_ident[EI_MAG3] != 'F')
     {
         ELF_ERR("bad ELF magic");
         return ELF_ERR_MAGIC;
@@ -412,7 +437,8 @@ int elf_parse(elf_ctx_t *ctx, uint8_t *buf, uint32_t file_size)
                 return ELF_ERR_CAPACITY;
             }
             ctx->load_shdrs[ctx->load_count++] = section;
-            if (section->sh_addr < 0x10000000U && section->sh_addr < ctx->link_base)
+            if (section->sh_addr < ELF_ABSOLUTE_ADDRESS_THRESHOLD &&
+                section->sh_addr < ctx->link_base)
             {
                 ctx->link_base = section->sh_addr;
             }
@@ -436,6 +462,7 @@ int elf_parse(elf_ctx_t *ctx, uint8_t *buf, uint32_t file_size)
     return ELF_OK;
 }
 
+/* 重定位表处理。 */
 static int relocation_target_offset(const elf32_shdr *target,
                                     uint32_t          r_offset,
                                     uint32_t         *section_offset)
@@ -534,7 +561,7 @@ static int reloc_type_is_pc_relative(uint8_t type)
         case R_ARM_THM_JUMP6:
         case R_ARM_THM_ALU_PREL_11_0:
         case R_ARM_THM_PC12:
-        case 102U: /* Legacy ARMCC PC-relative relocation. */
+        case ELF_ARMCC_LEGACY_PC_REL_TYPE: /* ARMCC 旧版 PC 相对重定位。 */
             return 1;
         default:
             return 0;
@@ -560,7 +587,7 @@ static int relocate_from_tables(elf_ctx_t *ctx,
         uint32_t       entry_size  = rel_section->sh_entsize;
         uint32_t       entry_count;
         uint32_t       entry_index;
-        movw_pending_t pending[16];
+        movw_pending_t pending[ELF_THUMB_REGISTER_COUNT];
 
         if ((target->sh_flags & SHF_ALLOC) == 0U)
         {
@@ -656,13 +683,13 @@ static int relocate_from_tables(elf_ctx_t *ctx,
                     else if (pending[rd].valid != 0U && pending[rd].symbol == symbol)
                     {
                         result            = relocate_mov_pair(ctx,
-                                                   &pending[rd],
-                                                   file_offset,
-                                                   upper,
-                                                   lower,
-                                                   runtime_base,
-                                                   image_size,
-                                                   offset);
+                                                              &pending[rd],
+                                                              file_offset,
+                                                              upper,
+                                                              lower,
+                                                              runtime_base,
+                                                              image_size,
+                                                              offset);
                         pending[rd].valid = 0U;
                         if (result < 0)
                         {
@@ -709,9 +736,13 @@ static int relocate_from_tables(elf_ctx_t *ctx,
              fixed_words,
              fixed_mov_pairs,
              skipped);
+    (void)fixed_words;
+    (void)fixed_mov_pairs;
+    (void)skipped;
     return ELF_OK;
 }
 
+/* 无重定位表时的保守扫描。 */
 static void mark_literal_word(const elf32_shdr *section,
                               uint32_t          address,
                               uint8_t          *bitmap,
@@ -753,7 +784,7 @@ static void build_literal_bitmap(const elf_ctx_t  *ctx,
         uint32_t pc                 = (section->sh_addr + instruction_offset + 4U) & ~3U;
         uint16_t upper              = read_u16(data + instruction_offset);
 
-        if ((upper & 0xF800U) == 0x4800U)
+        if ((upper & ELF_THUMB_LITERAL16_MASK) == ELF_THUMB_LITERAL16_OPCODE)
         {
             uint32_t immediate = (uint32_t)(upper & 0x00FFU) * 4U;
             mark_literal_word(section, pc + immediate, bitmap, word_count);
@@ -761,12 +792,13 @@ static void build_literal_bitmap(const elf_ctx_t  *ctx,
             continue;
         }
 
-        if ((upper == 0xF8DFU || upper == 0xF85FU) && half_index + 1U < half_count)
+        if ((upper == ELF_THUMB_LITERAL32_LDR_POS || upper == ELF_THUMB_LITERAL32_LDR_NEG) &&
+            half_index + 1U < half_count)
         {
-            uint16_t lower = read_u16(data + instruction_offset + 2U);
-            uint32_t immediate =
-                upper == 0xF8DFU ? (uint32_t)(lower & 0x0FFFU) : (uint32_t)(lower & 0x00FFU);
-            if (upper == 0xF8DFU)
+            uint16_t lower     = read_u16(data + instruction_offset + 2U);
+            uint32_t immediate = upper == ELF_THUMB_LITERAL32_LDR_POS ? (uint32_t)(lower & 0x0FFFU)
+                                                                      : (uint32_t)(lower & 0x00FFU);
+            if (upper == ELF_THUMB_LITERAL32_LDR_POS)
             {
                 mark_literal_word(section, pc + immediate, bitmap, word_count);
             }
@@ -807,8 +839,9 @@ static int is_scatter_entry(const elf_ctx_t  *ctx,
 
     return address_in_region(source, ctx->link_base, image_size) &&
            address_in_region(function, ctx->link_base, image_size) && (source & 3U) == 0U &&
-           (function & 3U) == 0U && destination >= 0x10000000U && destination < 0x40000000U &&
-           length != 0U && length < 0x10000U && function != source;
+           (function & 3U) == 0U && destination >= ELF_SCATTER_DESTINATION_MIN &&
+           destination < ELF_SCATTER_DESTINATION_MAX && length != 0U &&
+           length < ELF_SCATTER_MAX_LENGTH && function != source;
 }
 
 static int relocate_scatter_entry(elf_ctx_t        *ctx,
@@ -845,7 +878,7 @@ static int relocate_mov_pairs_by_scan(elf_ctx_t        *ctx,
     uint8_t       *data       = ctx->buf + section->sh_offset;
     uint32_t       half_count = section->sh_size / 2U;
     uint32_t       half_index = 0U;
-    movw_pending_t pending[16];
+    movw_pending_t pending[ELF_THUMB_REGISTER_COUNT];
 
     memset(pending, 0, sizeof(pending));
 
@@ -858,7 +891,7 @@ static int relocate_mov_pairs_by_scan(elf_ctx_t        *ctx,
             uint16_t lower = read_u16(data + half_index * 2U + 2U);
             uint32_t rd    = (lower >> 8) & 0xFU;
 
-            if ((upper & 0xFBF0U) == 0xF240U)
+            if ((upper & ELF_THUMB_MOV_MASK) == ELF_THUMB_MOVW_OPCODE)
             {
                 pending[rd].file_offset = section->sh_offset + half_index * 2U;
                 pending[rd].half_index  = half_index;
@@ -866,17 +899,18 @@ static int relocate_mov_pairs_by_scan(elf_ctx_t        *ctx,
                 pending[rd].lower       = lower;
                 pending[rd].valid       = 1U;
             }
-            else if ((upper & 0xFBF0U) == 0xF2C0U && pending[rd].valid != 0U &&
-                     half_index - pending[rd].half_index <= 256U)
+            else if ((upper & ELF_THUMB_MOV_MASK) == ELF_THUMB_MOVT_OPCODE &&
+                     pending[rd].valid != 0U &&
+                     half_index - pending[rd].half_index <= ELF_THUMB_MOV_PAIR_MAX_HALFWORDS)
             {
                 int result        = relocate_mov_pair(ctx,
-                                               &pending[rd],
-                                               section->sh_offset + half_index * 2U,
-                                               upper,
-                                               lower,
-                                               runtime_base,
-                                               image_size,
-                                               offset);
+                                                      &pending[rd],
+                                                      section->sh_offset + half_index * 2U,
+                                                      upper,
+                                                      lower,
+                                                      runtime_base,
+                                                      image_size,
+                                                      offset);
                 pending[rd].valid = 0U;
                 if (result < 0)
                 {
@@ -954,8 +988,8 @@ static int relocate_by_scan(elf_ctx_t *ctx,
                 uint32_t value        = read_u32(ctx->buf + file_offset);
                 uint32_t word_address = section->sh_addr + word_index * 4U;
                 int      in_vectors   = section->sh_addr == ctx->link_base && word_index != 0U &&
-                                 word_address <= entry_address;
-                int in_literal_pool =
+                                        word_address <= entry_address;
+                int      in_literal_pool =
                     (scratch[word_index / 8U] & (uint8_t)(1U << (word_index % 8U))) != 0U;
                 int result;
 
@@ -1029,9 +1063,13 @@ static int relocate_by_scan(elf_ctx_t *ctx,
              fixed_words,
              fixed_scatter,
              fixed_mov_pairs);
+    (void)fixed_words;
+    (void)fixed_scatter;
+    (void)fixed_mov_pairs;
     return ELF_OK;
 }
 
+/* 公共重定位和查询接口。 */
 int elf_relocate(
     elf_ctx_t *ctx, int32_t offset, uint32_t app_max_size, uint8_t *scratch, uint32_t scratch_size)
 {
@@ -1082,7 +1120,7 @@ uint32_t elf_get_entry(const elf_ctx_t *ctx)
     }
 
     entry = ctx->ehdr->e_entry;
-    if (entry < 0x10000000U && !add_signed_offset(entry, ctx->offset, &entry))
+    if (entry < ELF_ABSOLUTE_ADDRESS_THRESHOLD && !add_signed_offset(entry, ctx->offset, &entry))
     {
         return 0U;
     }
@@ -1100,7 +1138,7 @@ int elf_get_section(const elf_ctx_t *ctx, uint32_t idx, elf_section_info_t *info
 
     section         = ctx->load_shdrs[idx];
     info->load_addr = section->sh_addr;
-    if (section->sh_addr < 0x10000000U &&
+    if (section->sh_addr < ELF_ABSOLUTE_ADDRESS_THRESHOLD &&
         !add_signed_offset(section->sh_addr, ctx->offset, &info->load_addr))
     {
         return ELF_ERR_RELOC;

@@ -38,6 +38,8 @@
 #include "esp8266.h"
 #include "net_cfg.h"
 #include "core_mqtt.h"
+#include "app_verify.h"
+#include "flash_bootloader.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -76,9 +78,8 @@
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-#if ESP8266_MQTT_BACKEND_AT_ENABLE
 static uint8_t spinor_lfs_mount(lfs_ctx_t *fs);
-#else
+#if 0
 static void    wifi_mqtt_smoke_test(void);
 #endif
 
@@ -89,9 +90,9 @@ static void    wifi_mqtt_smoke_test(void);
 
 lfs_ctx_t lfs_ctx;
 
-#if ESP8266_MQTT_BACKEND_AT_ENABLE
-extern const struct lfs_config my_lfs_config;
-extern spinor_info_t           spinor;
+extern const struct lfs_config      my_lfs_config;
+extern const struct lfs_file_config lfs_file_cfg;
+extern spinor_info_t                spinor;
 
 static uint8_t spinor_lfs_mount(lfs_ctx_t *fs)
 {
@@ -125,15 +126,434 @@ static uint8_t spinor_lfs_mount(lfs_ctx_t *fs)
 
     return 0;
 }
-#else
+
+#if 0
+static const char s_mqtt_firmware_path[] = "mqtt_fw.tmp";
+
+static int mqtt_json_get_u32(const uint8_t *json,
+                             uint16_t       json_len,
+                             const char    *key,
+                             uint32_t      *value)
+{
+    char     pattern[32];
+    uint32_t parsed_value;
+    uint16_t cursor;
+    uint16_t digit_start;
+    uint16_t pattern_len;
+    uint16_t start;
+    int      pattern_bytes;
+
+    if (json == NULL || key == NULL || value == NULL || json_len == 0U)
+    {
+        return -1;
+    }
+
+    pattern_bytes = snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+    if (pattern_bytes <= 0 || pattern_bytes >= (int)sizeof(pattern))
+    {
+        return -2;
+    }
+
+    pattern_len = (uint16_t)pattern_bytes;
+    for (start = 0U; start + pattern_len <= json_len; start++)
+    {
+        if (memcmp(&json[start], pattern, pattern_len) != 0)
+        {
+            continue;
+        }
+
+        cursor = (uint16_t)(start + pattern_len);
+        while (cursor < json_len && (json[cursor] == ' ' || json[cursor] == '\t'))
+        {
+            cursor++;
+        }
+
+        parsed_value = 0U;
+        digit_start  = cursor;
+        while (cursor < json_len && json[cursor] >= '0' && json[cursor] <= '9')
+        {
+            uint32_t digit = (uint32_t)(json[cursor] - '0');
+
+            if (parsed_value > (UINT32_MAX - digit) / 10U)
+            {
+                return -3;
+            }
+
+            parsed_value = parsed_value * 10U + digit;
+            cursor++;
+        }
+
+        if (cursor == digit_start)
+        {
+            return -4;
+        }
+
+        *value = parsed_value;
+        return 0;
+    }
+
+    return -5;
+}
+
+static int mqtt_json_get_string(const uint8_t *json,
+                                uint16_t       json_len,
+                                const char    *key,
+                                char          *value,
+                                uint16_t       value_size)
+{
+    char     pattern[32];
+    uint16_t cursor;
+    uint16_t pattern_len;
+    uint16_t start;
+    uint16_t value_len;
+    int      pattern_bytes;
+
+    if (json == NULL || key == NULL || value == NULL || value_size == 0U || json_len == 0U)
+    {
+        return -1;
+    }
+
+    pattern_bytes = snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+    if (pattern_bytes <= 0 || pattern_bytes >= (int)sizeof(pattern))
+    {
+        return -2;
+    }
+
+    pattern_len = (uint16_t)pattern_bytes;
+    for (start = 0U; start + pattern_len <= json_len; start++)
+    {
+        if (memcmp(&json[start], pattern, pattern_len) != 0)
+        {
+            continue;
+        }
+
+        cursor = (uint16_t)(start + pattern_len);
+        while (cursor < json_len && (json[cursor] == ' ' || json[cursor] == '\t'))
+        {
+            cursor++;
+        }
+
+        if (cursor >= json_len || json[cursor] != '"')
+        {
+            return -3;
+        }
+
+        cursor++;
+        value_len = 0U;
+        while (cursor < json_len && json[cursor] != '"')
+        {
+            if (value_len + 1U >= value_size)
+            {
+                value[0] = '\0';
+                return -4;
+            }
+
+            value[value_len++] = (char)json[cursor++];
+        }
+
+        if (cursor >= json_len)
+        {
+            value[0] = '\0';
+            return -5;
+        }
+
+        value[value_len] = '\0';
+        return 0;
+    }
+
+    value[0] = '\0';
+    return -6;
+}
+
+static int mqtt_wait_topic_message(const char   *expected_topic,
+                                   mqtt_rx_msg_t *message,
+                                   uint32_t       timeout_ms)
+{
+    uint32_t start_tick;
+    int      rv;
+
+    if (expected_topic == NULL || message == NULL || timeout_ms == 0U)
+    {
+        return -1;
+    }
+
+    start_tick = HAL_GetTick();
+    while (1)
+    {
+        while (mqtt_message_pop(message) > 0)
+        {
+            if (strcmp(message->topic, expected_topic) == 0)
+            {
+                return 1;
+            }
+
+            main_log("WiFi MQTT test: ignore unrelated topic=[%s]\r\n", message->topic);
+        }
+
+        if ((HAL_GetTick() - start_tick) >= timeout_ms)
+        {
+            return 0;
+        }
+
+        rv = mqtt_poll_once();
+        if (rv < 0)
+        {
+            return -2;
+        }
+
+        if (rv == 0)
+        {
+            HAL_Delay(1U);
+        }
+    }
+}
+
+static int mqtt_download_firmware_to_lfs(lfs_ctx_t    *fs,
+                                          mqtt_rx_msg_t *message,
+                                          uint32_t       firmware_size)
+{
+    static const char firmware_chunk_filter[] = "v2/fw/response/+/chunk/+";
+    static const char firmware_chunk_size[]   = "512";
+    static char       request_topic[64];
+    static char       response_topic[64];
+    lfs_soff_t        file_size;
+    lfs_ssize_t       written;
+    uint32_t          chunk_index;
+    uint32_t          expected_chunk_len;
+    uint32_t          request_id;
+    uint32_t          total_written;
+    uint16_t          preview_index;
+    uint16_t          preview_len;
+    int               err;
+    int               request_topic_len;
+    int               response_topic_len;
+    int               rv;
+
+    if (fs == NULL || message == NULL || fs->mounted == 0U || firmware_size == 0U)
+    {
+        return -1;
+    }
+
+    if (fs->file_open != 0U)
+    {
+        err = lfs_file_close(&fs->lfs, &fs->file);
+        fs->file_open = 0U;
+        if (err != 0)
+        {
+            main_log("WiFi MQTT test: close stale LFS file failed, err=%d\r\n", err);
+            return -2;
+        }
+    }
+
+    err = lfs_remove(&fs->lfs, s_mqtt_firmware_path);
+    if (err != 0 && err != LFS_ERR_NOENT)
+    {
+        main_log("WiFi MQTT test: remove stale %s failed, err=%d\r\n",
+                 s_mqtt_firmware_path,
+                 err);
+        return -2;
+    }
+
+    err = lfs_file_opencfg(&fs->lfs,
+                           &fs->file,
+                           s_mqtt_firmware_path,
+                           LFS_O_WRONLY | LFS_O_CREAT | LFS_O_TRUNC,
+                           &lfs_file_cfg);
+    if (err != 0)
+    {
+        main_log("WiFi MQTT test: open %s failed, err=%d\r\n", s_mqtt_firmware_path, err);
+        return -3;
+    }
+    fs->file_open = 1U;
+
+    rv = mqtt_subscribe_topic((char *)firmware_chunk_filter, Qos1, 2);
+    if (rv != 0)
+    {
+        main_log("WiFi MQTT test: subscribe firmware chunk failed, rv=%d\r\n", rv);
+        rv = -4;
+        goto DownloadFailed;
+    }
+
+    main_log("WiFi MQTT test: subscribe firmware chunk ok\r\n");
+    total_written = 0U;
+    chunk_index   = 0U;
+    request_id    = 2U;
+
+    while (total_written < firmware_size)
+    {
+        expected_chunk_len = firmware_size - total_written;
+        if (expected_chunk_len > MQTT_RX_PAYLOAD_MAX)
+        {
+            expected_chunk_len = MQTT_RX_PAYLOAD_MAX;
+        }
+
+        request_topic_len = snprintf(request_topic,
+                                     sizeof(request_topic),
+                                     "v2/fw/request/%lu/chunk/%lu",
+                                     (unsigned long)request_id,
+                                     (unsigned long)chunk_index);
+        response_topic_len = snprintf(response_topic,
+                                      sizeof(response_topic),
+                                      "v2/fw/response/%lu/chunk/%lu",
+                                      (unsigned long)request_id,
+                                      (unsigned long)chunk_index);
+        if (request_topic_len <= 0 || request_topic_len >= (int)sizeof(request_topic) ||
+            response_topic_len <= 0 || response_topic_len >= (int)sizeof(response_topic))
+        {
+            rv = -5;
+            goto DownloadFailed;
+        }
+
+        rv = mqtt_publish(request_topic, Qos1, (char *)firmware_chunk_size);
+        if (rv != 0)
+        {
+            main_log("WiFi MQTT test: chunk %lu request failed, rv=%d\r\n",
+                     (unsigned long)chunk_index,
+                     rv);
+            rv = -6;
+            goto DownloadFailed;
+        }
+
+        rv = mqtt_wait_topic_message(response_topic, message, 5000U);
+        if (rv <= 0)
+        {
+            main_log("WiFi MQTT test: chunk %lu response failed, rv=%d\r\n",
+                     (unsigned long)chunk_index,
+                     rv);
+            rv = -7;
+            goto DownloadFailed;
+        }
+
+        if (message->payload_len != (uint16_t)expected_chunk_len)
+        {
+            main_log("WiFi MQTT test: chunk %lu length mismatch, expected=%lu actual=%u\r\n",
+                     (unsigned long)chunk_index,
+                     (unsigned long)expected_chunk_len,
+                     (unsigned int)message->payload_len);
+            rv = -8;
+            goto DownloadFailed;
+        }
+
+        if (chunk_index == 0U)
+        {
+            main_log("WiFi MQTT test: chunk 0 first 16 bytes:");
+            preview_len = (message->payload_len < 16U) ? message->payload_len : 16U;
+            for (preview_index = 0U; preview_index < preview_len; preview_index++)
+            {
+                main_log(" %02X", (unsigned int)message->payload[preview_index]);
+            }
+            main_log("\r\n");
+        }
+
+        written = lfs_file_write(&fs->lfs, &fs->file, message->payload, message->payload_len);
+        if (written < 0 || (uint16_t)written != message->payload_len)
+        {
+            main_log("WiFi MQTT test: LFS write chunk %lu failed, ret=%d\r\n",
+                     (unsigned long)chunk_index,
+                     (int)written);
+            rv = -9;
+            goto DownloadFailed;
+        }
+
+        total_written += message->payload_len;
+        main_log("WiFi MQTT test: download progress %lu/%lu, chunk=%lu bytes=%u\r\n",
+                 (unsigned long)total_written,
+                 (unsigned long)firmware_size,
+                 (unsigned long)chunk_index,
+                 (unsigned int)message->payload_len);
+        chunk_index++;
+        request_id++;
+    }
+
+    err = lfs_file_sync(&fs->lfs, &fs->file);
+    if (err != 0)
+    {
+        main_log("WiFi MQTT test: LFS sync %s failed, err=%d\r\n",
+                 s_mqtt_firmware_path,
+                 err);
+        rv = -10;
+        goto DownloadFailed;
+    }
+
+    file_size = lfs_file_size(&fs->lfs, &fs->file);
+    if (file_size < 0 || (uint32_t)file_size != firmware_size)
+    {
+        main_log("WiFi MQTT test: LFS file size mismatch, expected=%lu actual=%ld\r\n",
+                 (unsigned long)firmware_size,
+                 (long)file_size);
+        rv = -11;
+        goto DownloadFailed;
+    }
+
+    err           = lfs_file_close(&fs->lfs, &fs->file);
+    fs->file_open = 0U;
+    if (err != 0)
+    {
+        int remove_err;
+
+        main_log("WiFi MQTT test: LFS close %s failed, err=%d\r\n",
+                 s_mqtt_firmware_path,
+                 err);
+        remove_err = lfs_remove(&fs->lfs, s_mqtt_firmware_path);
+        if (remove_err != 0 && remove_err != LFS_ERR_NOENT)
+        {
+            main_log("WiFi MQTT test: cleanup remove %s failed, err=%d\r\n",
+                      s_mqtt_firmware_path,
+                     remove_err);
+        }
+        return -12;
+    }
+
+    main_log("WiFi MQTT test: firmware saved to %s, bytes=%lu, chunks=%lu\r\n",
+              s_mqtt_firmware_path,
+             (unsigned long)total_written,
+             (unsigned long)chunk_index);
+    return 0;
+
+DownloadFailed:
+    if (fs->file_open != 0U)
+    {
+        err = lfs_file_close(&fs->lfs, &fs->file);
+        fs->file_open = 0U;
+        if (err != 0)
+        {
+            main_log("WiFi MQTT test: cleanup close %s failed, err=%d\r\n",
+                     s_mqtt_firmware_path,
+                     err);
+        }
+    }
+    err = lfs_remove(&fs->lfs, s_mqtt_firmware_path);
+    if (err != 0 && err != LFS_ERR_NOENT)
+    {
+        main_log("WiFi MQTT test: cleanup remove %s failed, err=%d\r\n",
+                 s_mqtt_firmware_path,
+                 err);
+    }
+    return rv;
+}
+
 static void wifi_mqtt_smoke_test(void)
 {
     const net_cfg_t *cfg;
-    static char      ip[32];
-    static char      gateway[32];
-    static char      client_id[64];
-    static char      telemetry[96];
-    int              rv;
+    static const char firmware_response_filter[] = "v1/devices/me/attributes/response/+";
+    static const char firmware_response_topic[]  = "v1/devices/me/attributes/response/1";
+    static const char firmware_request_topic[]   = "v1/devices/me/attributes/request/1";
+    static const char firmware_request_payload[] =
+        "{\"sharedKeys\":\"fw_title,fw_version,fw_size,fw_checksum,fw_checksum_algorithm\"}";
+    static char          ip[32];
+    static char          gateway[32];
+    static char          client_id[64];
+    static char          firmware_checksum[65];
+    static char          checksum_algorithm[16];
+    static char          calculated_checksum[65];
+    static mqtt_rx_msg_t rx_message;
+    uint32_t             firmware_size;
+    uint32_t             active_slot;
+    uint32_t             target_addr;
+    uint32_t             target_slot;
+    bootloader_load_status_t load_status;
+    firmware_verify_status_t verify_status;
+    int                  rv;
 
     cfg = net_cfg_get();
     if (net_cfg_is_valid(cfg) == 0)
@@ -198,36 +618,179 @@ static void wifi_mqtt_smoke_test(void)
              cfg->mqtt_host,
              (unsigned int)cfg->mqtt_port);
 
-    rv = mqtt_subscribe_topic("v1/devices/me/attributes", Qos0, 1);
+    rv = mqtt_subscribe_topic((char *)firmware_response_filter, Qos1, 1);
     if (rv != 0)
     {
-        main_log("WiFi MQTT test: subscribe attributes failed, rv=%d\r\n", rv);
+        main_log("WiFi MQTT test: subscribe firmware response failed, rv=%d\r\n", rv);
         goto ExitMqtt;
     }
 
-    main_log("WiFi MQTT test: subscribe attributes ok\r\n");
+    main_log("WiFi MQTT test: subscribe firmware response ok\r\n");
 
-    memset(telemetry, 0, sizeof(telemetry));
-    snprintf(
-        telemetry, sizeof(telemetry), "{\"fw_test\":1,\"tick\":%lu}", (unsigned long)HAL_GetTick());
-
-    rv = mqtt_publish("v1/devices/me/telemetry", Qos0, telemetry);
+    rv = mqtt_publish(
+        (char *)firmware_request_topic, Qos1, (char *)firmware_request_payload);
     if (rv != 0)
     {
-        main_log("WiFi MQTT test: publish telemetry failed, rv=%d\r\n", rv);
+        main_log("WiFi MQTT test: firmware attributes request failed, rv=%d\r\n", rv);
         goto ExitMqtt;
     }
 
-    main_log("WiFi MQTT test: publish telemetry ok\r\n");
-
-    rv = mqtt_pingreq();
-    if (rv != 0)
+    main_log("WiFi MQTT test: firmware attributes request published\r\n");
+    rv = mqtt_wait_topic_message(firmware_response_topic, &rx_message, 5000U);
+    if (rv <= 0)
     {
-        main_log("WiFi MQTT test: pingreq failed, rv=%d\r\n", rv);
+        main_log("WiFi MQTT test: firmware attributes response failed, rv=%d\r\n", rv);
         goto ExitMqtt;
     }
 
-    main_log("WiFi MQTT test: pingreq sent\r\n");
+    main_log("WiFi MQTT test: firmware attributes received, qos=%u, bytes=%u\r\n",
+             (unsigned int)rx_message.qos,
+             (unsigned int)rx_message.payload_len);
+    main_log("WiFi MQTT test: firmware attributes=%.*s\r\n",
+             (int)rx_message.payload_len,
+             (char *)rx_message.payload);
+
+    rv = mqtt_json_get_u32(
+        rx_message.payload, rx_message.payload_len, "fw_size", &firmware_size);
+    if (rv != 0 || firmware_size == 0U)
+    {
+        main_log("WiFi MQTT test: parse fw_size failed, rv=%d\r\n", rv);
+        goto ExitMqtt;
+    }
+
+    memset(firmware_checksum, 0, sizeof(firmware_checksum));
+    memset(checksum_algorithm, 0, sizeof(checksum_algorithm));
+
+    rv = mqtt_json_get_string(rx_message.payload,
+                              rx_message.payload_len,
+                              "fw_checksum",
+                              firmware_checksum,
+                              sizeof(firmware_checksum));
+    if (rv != 0)
+    {
+        main_log("WiFi MQTT test: parse fw_checksum failed, rv=%d\r\n", rv);
+        goto ExitMqtt;
+    }
+
+    rv = mqtt_json_get_string(rx_message.payload,
+                              rx_message.payload_len,
+                              "fw_checksum_algorithm",
+                              checksum_algorithm,
+                              sizeof(checksum_algorithm));
+    if (rv != 0 || strcmp(checksum_algorithm, "SHA256") != 0)
+    {
+        main_log("WiFi MQTT test: unsupported checksum algorithm [%s], rv=%d\r\n",
+                 checksum_algorithm,
+                 rv);
+        goto ExitMqtt;
+    }
+
+    main_log("WiFi MQTT test: firmware download begin, size=%lu\r\n",
+             (unsigned long)firmware_size);
+    rv = mqtt_download_firmware_to_lfs(&lfs_ctx, &rx_message, firmware_size);
+    if (rv != 0)
+    {
+        main_log("WiFi MQTT test: firmware download failed, rv=%d\r\n", rv);
+        goto ExitMqtt;
+    }
+
+    memset(calculated_checksum, 0, sizeof(calculated_checksum));
+    main_log("WiFi MQTT test: SHA256 verify begin, file=%s bytes=%lu\r\n",
+             s_mqtt_firmware_path,
+             (unsigned long)firmware_size);
+    verify_status = verify_lfs_file_sha256(&lfs_ctx,
+                                           s_mqtt_firmware_path,
+                                           firmware_checksum,
+                                           firmware_size,
+                                           calculated_checksum,
+                                           sizeof(calculated_checksum));
+    if (verify_status != FIRMWARE_VERIFY_OK)
+    {
+        int remove_err;
+
+        main_log("WiFi MQTT test: SHA256 verify failed, ret=%d\r\n", verify_status);
+        main_log("WiFi MQTT test: SHA256 expected=%s\r\n", firmware_checksum);
+        if (calculated_checksum[0] != '\0')
+        {
+            main_log("WiFi MQTT test: SHA256 actual  =%s\r\n", calculated_checksum);
+        }
+
+        remove_err = lfs_remove(&lfs_ctx.lfs, s_mqtt_firmware_path);
+        if (remove_err != 0 && remove_err != LFS_ERR_NOENT)
+        {
+            main_log("WiFi MQTT test: remove invalid %s failed, err=%d\r\n",
+                     s_mqtt_firmware_path,
+                     remove_err);
+        }
+        goto ExitMqtt;
+    }
+
+    main_log("WiFi MQTT test: SHA256 verify ok, checksum=%s\r\n", calculated_checksum);
+
+    main_log("WiFi MQTT test: firmware package verify begin, file=%s\r\n",
+             s_mqtt_firmware_path);
+    verify_status = verify_firmware(s_mqtt_firmware_path);
+    if (verify_status != FIRMWARE_VERIFY_OK)
+    {
+        int remove_err;
+
+        main_log("WiFi MQTT test: firmware package verify failed, ret=%d\r\n", verify_status);
+        remove_err = lfs_remove(&lfs_ctx.lfs, s_mqtt_firmware_path);
+        if (remove_err != 0 && remove_err != LFS_ERR_NOENT)
+        {
+            main_log("WiFi MQTT test: remove invalid %s failed, err=%d\r\n",
+                     s_mqtt_firmware_path,
+                     remove_err);
+        }
+        goto ExitMqtt;
+    }
+
+    main_log("WiFi MQTT test: firmware package verify ok\r\n");
+
+    active_slot = Read_Flag(EE_VAR_ACTIVE_SLOT);
+    if (active_slot != SLOT_A && active_slot != SLOT_B)
+    {
+        main_log("WiFi MQTT test: active slot flag invalid [%lu], use slot A for test\r\n",
+                 (unsigned long)active_slot);
+        active_slot = SLOT_A;
+    }
+
+    target_slot = OPPOSITE_SLOT(active_slot);
+    target_addr = (target_slot == SLOT_B) ? APP_B_START_ADDR : APP_A_START_ADDR;
+    main_log("WiFi MQTT test: target load begin, active=%s target=%s addr=0x%08lX\r\n",
+             SLOT_NAME(active_slot),
+             SLOT_NAME(target_slot),
+             (unsigned long)target_addr);
+
+    load_status = bootloader_load_target((uint8_t)target_slot, s_mqtt_firmware_path);
+    if (load_status != BOOTLOADER_LOAD_OK)
+    {
+        main_log("WiFi MQTT test: target load failed, ret=%d\r\n", load_status);
+        goto ExitMqtt;
+    }
+
+    if (Verify_APP_Integrity_Flash(target_addr) == 0)
+    {
+        main_log("WiFi MQTT test: target slot %s integrity verify failed\r\n",
+                 SLOT_NAME(target_slot));
+        goto ExitMqtt;
+    }
+
+    main_log("WiFi MQTT test: target slot %s load and integrity verify ok\r\n",
+             SLOT_NAME(target_slot));
+    main_log("WiFi MQTT test: target slot not committed, disconnect network before temporary jump\r\n");
+
+    mqtt_disconnect();
+    esp8266_wifi_disconnect();
+
+    main_log("WiFi MQTT test: temporary jump to slot %s @ 0x%08lX\r\n",
+             SLOT_NAME(target_slot),
+             (unsigned long)target_addr);
+    if (Jump_To_App_Flash(&lfs_ctx, target_addr) == 0)
+    {
+        main_log("WiFi MQTT test: temporary jump failed\r\n");
+    }
+    return;
 
 ExitMqtt:
     mqtt_disconnect();
@@ -276,27 +839,22 @@ int main(void)
     EE_Init();
     cmox_initialize(NULL);
 
-#if ESP8266_MQTT_BACKEND_AT_ENABLE
+    memset(&lfs_ctx, 0, sizeof(lfs_ctx_t));
+    if (spinor_lfs_mount(&lfs_ctx) != 0U)
+    {
+        main_log("LittleFS mount failed\r\n");
+        Error_Handler();
+    }
+
     {
         ota_ctx_t      ctx;
         transfer_cfg_t transfer_cfg;
 
-        memset(&lfs_ctx, 0, sizeof(lfs_ctx_t));
         thingsboard_ota_bind_transport(&ctx, &transfer_cfg, &lfs_ctx);
-
-        if (spinor_lfs_mount(&lfs_ctx) != 0U)
-        {
-            main_log("LittleFS mount failed\r\n");
-            Error_Handler();
-        }
 
         main_log("Starting ThingsBoard OTA state machine...\r\n");
         ota_run(&ctx);
     }
-#else
-    main_log("Starting WiFi MQTT smoke test...\r\n");
-    wifi_mqtt_smoke_test();
-#endif
     /* USER CODE END 2 */
 
     /* Infinite loop */

@@ -1,10 +1,36 @@
 #ifndef CORE_MQTT_H_
 #define CORE_MQTT_H_
 
-#include "MQTTPacket.h"
-#include "transport.h"
+#include <stdint.h>
 
-#define MQTT_KEEP_ALIVE_TIMEOUT_SECONDS (60U)
+#include "MQTTPacket.h"
+
+#define MQTT_KEEP_ALIVE_TIMEOUT_SECONDS 60U
+#define MQTT_RX_TOPIC_MAX 128U
+#define MQTT_RX_PAYLOAD_MAX 512U
+#define MQTT_PACKET_BUF_SIZE 672U
+
+typedef enum
+{
+    MQTT_WAIT_RESULT_IDLE = 0,
+    MQTT_WAIT_RESULT_SUCCESS,
+    MQTT_WAIT_RESULT_REJECTED,
+    MQTT_WAIT_RESULT_TIMEOUT,
+    MQTT_WAIT_RESULT_TRANSPORT_ERROR,
+    MQTT_WAIT_RESULT_PROTOCOL_ERROR,
+} mqtt_wait_result_t;
+
+typedef struct
+{
+    uint16_t packet_id;
+    uint16_t topic_len;
+    uint16_t payload_len;
+    uint8_t qos;
+    uint8_t dup;
+    uint8_t retained;
+    char topic[MQTT_RX_TOPIC_MAX + 1U];
+    uint8_t payload[MQTT_RX_PAYLOAD_MAX];
+} mqtt_rx_msg_t;
 
 enum
 {
@@ -13,22 +39,16 @@ enum
     Qos2,
 };
 
-/* MQTT 连接 Broker 函数 */
 int mqtt_connect(char *host, int port, char *clientid, char *username, char *passwd);
-
-/* MQTT 断开 Broker 连接函数 */
 int mqtt_disconnect(void);
-
-/* MQTT 订阅主题函数 */
 int mqtt_subscribe_topic(char *topic, int qos, int msgid);
-
-/* MQTT 取消主题订阅函数 */
 int mqtt_unsubscribe_topic(char *topic, int msgid);
-
-/* MQTT 发布消息函数 */
 int mqtt_publish(char *topic, int qos, char *payload);
-
-/* MQTT 保持连接心跳包函数 */
 int mqtt_pingreq(void);
+
+int mqtt_poll_once(void);
+int mqtt_poll(uint32_t timeout_ms);
+int mqtt_message_available(void);
+int mqtt_message_pop(mqtt_rx_msg_t *message);
 
 #endif /* CORE_MQTT_H_ */
